@@ -1,388 +1,37 @@
 # traceseal-observe
 
-Signed execution receipts for AI model calls and tool invocations.
+**Every model and tool call your AI agent makes — signed, timestamped, third-party verifiable.**
+One line of code. Hand the receipts to your auditor.
 
-Part of the [Traceseal](https://traceseal.io) trust infrastructure for AI agents.
+---
 
-## What it does
+## The question your auditor is about to ask
 
-When your AI agent calls a model API (Anthropic, OpenAI, Google, any provider), `traceseal-observe` wraps the call and produces a signed execution receipt. The receipt records:
+> *"Prove what your AI agent did yesterday. Which model, which prompt, what did it send to which provider, what came back. Not a screenshot — something I can verify independently."*
 
-- **Provider and model** — what was called
-- **Input hash** — SHA-256 of the request payload (not the payload itself — privacy preserving)
-- **Output hash** — SHA-256 of the response
-- **Timing** — wall-clock latency in milliseconds
-- **Token usage** — input and output tokens, when the provider reports them
-- **Operator signature** — ed25519 signature over everything above
+Today, the honest answer is "trust our logs." Tomorrow, under the EU AI Act, the NIS2 directive, the UK AI Bill, and half the compliance frameworks your customers are writing into their procurement forms, "trust our logs" won't cut it.
 
-The receipt is in the same format as Traceseal skill execution receipts. Any third party can verify it with `pip install traceseal-verify` — no access to your machine needed.
+`traceseal-observe` is the cryptographic primitive that makes the question answerable. Every model call, every tool call, every data-flow leaving your system produces a signed JSON receipt. Anyone — your auditor, your regulator, your customer — can verify it with a one-line command, on any machine, with no access to yours.
 
-## Install
-
-```bash
-pip install traceseal-observe
-```
-
-## Quick start
-
-### Using the generic `observe_model_call`
+## One minute
 
 ```python
-from traceseal_observe import OperatorKey, observe_model_call
-
-# Load your operator key (or generate one)
-key = OperatorKey.load_from_file("~/.traceseal/keys/my-operator.key")
-
-# Wrap your model call
-response, receipt = observe_model_call(
-    provider="anthropic",
-    model="claude-sonnet-4-20250514",
-    api_endpoint="https://api.anthropic.com/v1/messages",
-    operator_key=key,
-    call=lambda: client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": "Hello"}],
-    ),
-    serialize_request=lambda: {
-        "model": "claude-sonnet-4-20250514",
-        "messages": [{"role": "user", "content": "Hello"}],
-    },
-)
-
-# Save the receipt
-from pathlib import Path
-Path("receipt.json").write_text(receipt.to_json())
-```
-
-### Using provider-specific wrappers
-
-```python
-from anthropic import Anthropic
 from traceseal_observe import OperatorKey, observe_anthropic
+from anthropic import Anthropic
 
-client = Anthropic()
 key = OperatorKey.load_from_file("~/.traceseal/keys/my-operator.key")
+client = Anthropic()
 
 response, receipt = observe_anthropic(
     client,
-    {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1000,
-        "messages": [{"role": "user", "content": "Hello"}],
-    },
+    {"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "Hi"}]},
     key,
 )
 
-print(f"Response: {response.content[0].text}")
-print(f"Receipt: {receipt.receipt_hash}")
+receipt.to_json()  # shareable, signed, verifiable
 ```
 
-Same pattern with `observe_openai`:
-
-```python
-from openai import OpenAI
-from traceseal_observe import observe_openai
-
-client = OpenAI()
-response, receipt = observe_openai(
-    client,
-    {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]},
-    key,
-)
-```
-
-## Tool call receipts
-
-Beyond model calls, `traceseal-observe` produces receipts for tool/function invocations across four transports: Python functions, MCP tools, HTTP APIs, and shell commands.
-
-### Python function decorator
-
-```python
-from traceseal_observe import OperatorKey, observe_tool_fn
-
-key = OperatorKey.load_from_file("~/.traceseal/keys/my-operator.key")
-
-# Sink mode: preserves original function signature, receipts go to a callback
-receipts = []
-
-@observe_tool_fn(operator_key=key, receipt_sink=receipts.append)
-def search_web(query: str) -> list[dict]:
-    return [{"url": "https://example.com", "title": "Example"}]
-
-results = search_web("traceseal")  # original signature preserved
-# receipts[-1] contains the signed receipt
-```
-
-Tuple mode (returns `(result, receipt)`):
-
-```python
-@observe_tool_fn(operator_key=key)
-def search_web(query: str) -> list[dict]:
-    return [{"url": "https://example.com", "title": "Example"}]
-
-results, receipt = search_web("traceseal")
-```
-
-### MCP tool calls
-
-```python
-from traceseal_observe import observe_mcp_tool
-
-result, receipt = observe_mcp_tool(
-    server_name="filesystem",
-    tool_name="read_file",
-    arguments={"path": "/etc/hosts"},
-    operator_key=key,
-    call=lambda: mcp_client.call_tool("read_file", {"path": "/etc/hosts"}),
-)
-# receipt.execution["tool_name"] == "filesystem/read_file"
-# receipt.execution["transport"] == "mcp"
-```
-
-### HTTP API tools (not model calls)
-
-For calling non-model HTTP APIs — WordPress, SendGrid, GitHub, anything that isn't a model API:
-
-```python
-import requests
-from traceseal_observe import observe_http_tool
-
-result, receipt = observe_http_tool(
-    tool_name="wordpress_publish",
-    url="https://britfarmers.com/wp-json/wp/v2/posts",
-    method="POST",
-    operator_key=key,
-    call=lambda: requests.post(url, json=body, headers=auth),
-    request_body={"title": "...", "content": "..."},
-    headers={"Authorization": "Bearer ..."},  # values NOT hashed (prevents token leakage)
-)
-```
-
-Header values are deliberately excluded from the input hash — only the header key names are included. This prevents authentication tokens from appearing in receipt hashes.
-
-### Shell/subprocess tools
-
-```python
-from traceseal_observe import observe_shell_tool
-
-result, receipt = observe_shell_tool(
-    tool_name="git_commit",
-    command=["git", "commit", "-m", "update"],
-    operator_key=key,
-    cwd="/path/to/repo",
-    env={"GIT_AUTHOR_NAME": "Tim"},  # env VALUES not hashed, only keys
-)
-# result is a subprocess.CompletedProcess
-# receipt records command, exit code, and SHA-256 of stdout/stderr
-```
-
-Environment variable values are excluded from the hash — only variable names are included. This prevents secrets (API keys in env) from appearing in receipts.
-
-## Receipt types
-
-All receipts produced by `traceseal-observe` follow [RECEIPT-SPEC.md v1.0](https://traceseal.io/spec) with a `receipt_type` discriminator:
-
-| Receipt type | Source | Key fields |
-|--------------|--------|-----------|
-| `"skill"` | Traceseal skill execution (from `traceseal` package) | `skill_name`, `skill_manifest_hash`, `sandbox_profile_hash` |
-| `"model"` | `observe_model_call`, `observe_anthropic`, `observe_openai` | `provider`, `model`, `api_endpoint`, `input_tokens`, `output_tokens` |
-| `"tool"` | `observe_tool*` (this module) | `tool_name`, `transport`, `endpoint` |
-
-All three verify with the same `traceseal-verify` command.
-
-## Orchestration receipts
-
-For multi-step agent workflows, `WorkflowObserver` chains child receipts (model calls, tool calls, skill executions) into a single signed orchestration receipt. Children are referenced by hash — the parent stays small and composable.
-
-### Basic pattern
-
-```python
-from traceseal_observe import (
-    OperatorKey,
-    WorkflowObserver,
-    observe_anthropic,
-    observe_http_tool,
-)
-
-key = OperatorKey.load_from_file("~/.traceseal/keys/my-operator.key")
-
-with WorkflowObserver(
-    workflow_name="publish-article",
-    workflow_version="1.0",
-    operator_key=key,
-    workflow_input={"topic": "AI agent trust"},  # hashed, not stored
-) as wf:
-    # Step 1: research via Claude
-    research, r1 = observe_anthropic(client, research_request, key)
-    wf.add_step("research", r1)
-
-    # Step 2: draft via Claude
-    draft, r2 = observe_anthropic(client, draft_request, key)
-    wf.add_step("draft", r2)
-
-    # Step 3: publish via HTTP
-    result, r3 = observe_http_tool(
-        tool_name="wordpress_publish",
-        url="https://example.com/posts",
-        method="POST",
-        operator_key=key,
-        call=lambda: requests.post(...),
-    )
-    wf.add_step("publish", r3)
-
-    # Record the final output (hashed, not stored)
-    wf.set_final_output({"post_id": result["id"]})
-
-# wf.receipt is the signed orchestration receipt
-# wf.child_receipts is the list of child receipts in order
-Path("workflow.json").write_text(wf.receipt.to_json())
-```
-
-### Offline bundling
-
-The orchestration receipt references children by hash. For offline portability, bundle the parent + all children into a single tarball:
-
-```python
-from traceseal_observe import bundle_workflow
-
-bundle_workflow(wf.receipt, wf.child_receipts, "workflow.tar.gz")
-```
-
-The bundle layout:
-
-```
-workflow.tar.gz
-├── orchestration.json       # The parent receipt
-├── MANIFEST.json            # Maps step names to filenames
-└── children/
-    ├── <receipt_hash>.json  # Each child named by its hash
-    └── ...
-```
-
-### Bundle verification
-
-A third party receives `workflow.tar.gz` and verifies the entire chain:
-
-```python
-from traceseal_observe import verify_workflow_bundle
-
-report = verify_workflow_bundle("workflow.tar.gz")
-
-if report["ok"]:
-    print(f"Workflow '{report['workflow_name']}' verified")
-    print(f"  parent signature OK: {report['parent_ok']}")
-    print(f"  {report['step_count']} child receipts all verified")
-```
-
-Tampering with any child receipt breaks the chain — the child's hash no longer matches the parent's claim, and verification fails with the specific step that broke.
-
-### What an orchestration receipt proves
-
-The operator attests:
-
-> "This workflow ran these N steps in this order. Each step produced a receipt that hashes to this value. The workflow started at this time, ended at this time, and produced output with this hash."
-
-A verifier with only the orchestration receipt can verify the signature and the ordering. A verifier with the full bundle can verify every child signature too — proving the entire workflow end-to-end without access to the operator's machine.
-
-## Data flow receipts
-
-For compliance and privacy auditing, `observe_data_flow` wraps outbound HTTP calls and records:
-
-- **Destination** — host and URL (query string stripped for privacy)
-- **Payload hashes** — request and response body content hashes
-- **Payload size** — bytes sent and received
-- **PII fingerprint** — heuristic scan for emails, phone numbers, credit card shapes, JWTs, API keys, etc.
-- **Declared vs undeclared** — whether the destination was on the allow list
-- **Status and timing** — HTTP status code and latency
-
-### The compliance question it answers
-
-> *"Did you send user data to OpenAI between 2:00 PM and 4:00 PM yesterday?"*
-
-Today's answer: "trust me, we didn't" or "let me check our logs."
-
-With data flow receipts: a cryptographic record of every outbound HTTP call, signed and third-party verifiable.
-
-### Basic usage
-
-```python
-import requests
-from traceseal_observe import OperatorKey, observe_data_flow
-
-key = OperatorKey.load_from_file("~/.traceseal/keys/my-operator.key")
-
-declared_destinations = ["api.anthropic.com", "api.mailgun.com"]
-
-response, receipt = observe_data_flow(
-    url="https://api.anthropic.com/v1/messages",
-    method="POST",
-    operator_key=key,
-    call=lambda: requests.post(url, json=body, headers=auth),
-    request_body=body,
-    declared_allow_list=declared_destinations,
-)
-
-# receipt.execution includes:
-#   destination_host, destination_url (query-stripped), method
-#   request_payload_hash, response_payload_hash
-#   payload_bytes, response_bytes
-#   pii_fingerprint (e.g. {"email": 2})
-#   destination_declared ("true"/"false")
-#   status_code, ok
-```
-
-### PII fingerprinting
-
-The library scans request payloads for patterns that look like PII and records the counts (not the values). Detected patterns include:
-
-| Pattern | Detects |
-|---------|---------|
-| `email` | Standard email addresses |
-| `phone_us`, `phone_uk` | Phone number shapes |
-| `credit_card` | Visa/MC/Amex/Discover-shaped numbers |
-| `ssn` | US SSN format |
-| `jwt` | JWT tokens |
-| `aws_access_key` | AKIA/ASIA-prefixed AWS keys |
-| `github_token` | `ghp_`, `ghs_`, `gho_`-prefixed tokens |
-| `api_key_generic` | `sk_`, `pk_`, `api_`-prefixed credentials |
-
-Only counts are recorded — the actual matched strings are not stored in the receipt. This is deliberately privacy-preserving: you can share receipts without leaking the PII they flagged.
-
-A payload that scores zero on all patterns is NOT proven PII-free — only that no known pattern matched. The fingerprint is a best-effort heuristic.
-
-### Undeclared destination flagging
-
-Pass `declared_allow_list` to record whether each outbound call went to an expected destination. A call to an undeclared host produces a receipt with `destination_declared: "false"` — a compliance flag that a regulator can check.
-
-The request still happens (Traceseal doesn't block the call — blocking is a separate layer). What changes is that the call is cryptographically *recorded* as having violated the declared policy.
-
-### Compliance summaries
-
-For multi-call workflows, aggregate receipts into a compliance summary:
-
-```python
-from traceseal_observe import summarize_data_flows
-
-summary = summarize_data_flows(all_receipts)
-# {
-#     "total_calls": 42,
-#     "destinations": {"api.anthropic.com": 15, "api.mailgun.com": 27},
-#     "undeclared_calls": 0,
-#     "pii_summary": {"email": 27},
-#     "total_payload_bytes": 152934,
-#     "failed_calls": 1,
-# }
-```
-
-This is the data a compliance officer wants to see: "we made 42 outbound calls to these 2 destinations, we sent 27 emails (detected), zero calls went to undeclared hosts, one call failed."
-
-
-
-
-## Verifying a receipt
-
-From any machine, with no access to the operator's keys or audit log:
+Your auditor runs:
 
 ```bash
 pip install traceseal-verify
@@ -392,82 +41,57 @@ traceseal-verify receipt.json
 ```
 [OK] receipt.json
   operator:  ed25519:9dae521400bb39e17e74d8bc1222c45d
-
-The operator attests this execution occurred as described.
 ```
 
-## What receipts prove
+That's the whole loop. No API keys exchanged. No access to your machine. No shared infrastructure.
 
-The operator attests:
+## What gets signed
 
-> "I called model X via this API endpoint with this input hash at this time, and received a response with this output hash."
+| Receipt type | What it proves |
+|---|---|
+| **Model call** | which provider, which model, hash of prompt, hash of response, tokens, latency, operator signature |
+| **Tool call** | which tool, transport (python / MCP / HTTP / shell), input/output hash, exit code, operator signature |
+| **Data flow** | outbound HTTP destination, payload hashes, PII pattern count, allow-list match — the signed answer to *"did you send user data to OpenAI between 2pm and 4pm yesterday?"* |
+| **Workflow** | ordered chain of child receipt hashes + wall-clock times, forming a single signed trace of a multi-step run |
 
-Third parties can verify:
+All four formats verify with the same `traceseal-verify` tool.
 
-- The signature is valid
-- The receipt hasn't been tampered with
-- The operator's public key is the one that signed it
+## Integrations
 
-## What receipts do NOT prove
+- **Anthropic SDK** — `observe_anthropic(client, request, key)`
+- **OpenAI SDK** — `observe_openai(client, request, key)`
+- **Any model provider** — `observe_model_call(...)` with your own serializer
+- **LangChain / LangGraph** — [`traceseal-langchain`](https://github.com/traceseal/traceseal-langchain): one callback handler, receipts for every node
+- **MCP tools** — `observe_mcp_tool(...)`
+- **HTTP APIs and shell tools** — `observe_http_tool(...)`, `observe_shell_tool(...)` — with secret redaction built in (header values and env values are excluded from hashes)
 
-Be honest about what this library does and doesn't do:
+## Privacy
 
-- It does **not** prove the provider actually returned what the operator claims. A compromised or malicious operator could fabricate a receipt for a call that didn't happen, or record a different response than what was received.
-- It does **not** prove the model is genuinely the version the operator requested. Providers can route requests to different model versions internally; the receipt records what the operator *claims* was called.
-- It does **not** prove the provider's data handling practices (whether the input was logged, used for training, etc.). That's a contractual question, not a technical one.
+Receipts contain **hashes of inputs and outputs, not the values.** You can send a receipt to your auditor without leaking the prompt your user typed. If the auditor needs to verify a specific value, you provide it separately and they recompute the hash.
 
-The receipt is an **operator attestation**, not a zero-knowledge proof. It's the strongest trust primitive the operator can produce without provider cooperation.
+Data-flow receipts add a **PII fingerprint** — count of email/phone/credit-card/JWT/API-key-shaped patterns detected in the payload. Counts only. No values. A signed answer to "did this request contain PII" without the request being in the receipt.
 
-When providers start offering response signing (where they sign every API response with their own key), the receipt format can include a `provider_attestation` field alongside the operator's. That would close the trust gap and make receipts end-to-end verifiable.
+## What receipts prove, and what they don't
 
-## Integration patterns
+Be honest about the trust model.
 
-### Pattern 1: Wrap every model call
+**Prove:** the holder of this ed25519 key signed this exact payload at this time.
+**Don't prove:** that the provider actually returned what you recorded. A compromised operator could fabricate a receipt. This is an *operator attestation*, not a zero-knowledge proof of execution. The guarantee is: the same guarantee your audit logs give you today, but cryptographically portable and tamper-evident.
 
-Every time your agent calls a model, wrap it and save the receipt. Accumulate an audit trail.
+When providers start signing their responses (the obvious next step — we have a proposal out with Anthropic), the receipt format is designed to carry a `provider_attestation` field alongside yours, closing the loop.
 
-### Pattern 2: Chain with skill execution
+## Install
 
-A Traceseal skill execution receipt (from the full `traceseal` package) can reference the receipt hashes of the model calls that happened inside it. This creates an orchestration chain: "this skill ran, and during it, these model calls were made."
-
-### Pattern 3: Forward receipts to the transparency log
-
-Receipts can be pushed to `log.traceseal.io` (or your own hosted log) for an append-only, publicly-verifiable history of agent activity.
-
-## Receipt format
-
-Receipts follow [RECEIPT-SPEC.md v1.0](https://traceseal.io/spec) with a `receipt_type: "model"` discriminator in the execution section:
-
-```json
-{
-  "receipt_version": "1.0",
-  "execution": {
-    "receipt_type": "model",
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-20250514",
-    "api_endpoint": "https://api.anthropic.com/v1/messages",
-    "started_at": "2026-04-15T12:00:00Z",
-    "wall_time_ms": 843,
-    "input_hash": "sha256:...",
-    "output_hash": "sha256:...",
-    "ok": "true",
-    "exit_code": 0,
-    "input_tokens": 8,
-    "output_tokens": 15
-  },
-  "provenance": {
-    "provider_attestation": "none",
-    "provenance_version": "1.0"
-  },
-  "attestation": {
-    "operator_fingerprint": "ed25519:...",
-    "operator_public_key": "...",
-    "attested_at": "2026-04-15T12:00:01Z",
-    "signature": "..."
-  }
-}
+```bash
+pip install traceseal-observe                   # the signing library
+pip install traceseal-verify                    # the verifier (one-command audit)
+pip install traceseal-langchain                 # LangChain / LangGraph callback
 ```
+
+## Spec
+
+The receipt format is open and language-agnostic. Anyone can implement a verifier in any language from the [Execution Receipt Specification](https://traceseal.io/spec) without touching Traceseal source code.
 
 ## License
 
-Apache 2.0.
+Apache 2.0 — no barriers to signing, no barriers to verification.
