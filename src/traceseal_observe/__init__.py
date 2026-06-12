@@ -34,7 +34,7 @@ trust primitive the operator can produce without provider cooperation.
 
 from __future__ import annotations
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 import hashlib
 import json
@@ -50,6 +50,22 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 RECEIPT_VERSION = "1.0"
+
+# Matches a URL query string so credentials passed as query params
+# (?api_key=..., ?token=..., &sig=...) never get baked into a signed,
+# publicly-shareable receipt's error_message. Errors from HTTP libraries
+# routinely embed the full request URL.
+_QUERY_STRING_RE = __import__("re").compile(r"\?[^\s\"']*")
+
+
+def _redact_error(message: str, limit: int = 200) -> str:
+    """Scrub URL query strings from an exception message and bound its length.
+
+    Receipt error messages are signed and shareable, so a leaked
+    ?api_key=... in a library exception would become a published credential.
+    """
+    scrubbed = _QUERY_STRING_RE.sub("?<redacted>", message)
+    return scrubbed[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +260,34 @@ class Receipt:
 def _signed_payload(execution: dict, provenance: dict) -> bytes:
     """The canonical bytes that the operator signs."""
     return canonical_dumps({"execution": execution, "provenance": provenance})
+
+
+def _check_receipt_signature(receipt: Receipt, label: str) -> None:
+    """Raise ValueError unless the receipt's Ed25519 signature is valid.
+
+    Used to fail closed when loading receipts from an untrusted bundle.
+    """
+    from cryptography.exceptions import InvalidSignature
+
+    att = receipt.attestation
+    pubkey_hex = att.get("operator_public_key", "")
+    signature_hex = att.get("signature", "")
+    # Ed25519: 32-byte key (64 hex chars), 64-byte signature (128 hex chars).
+    # Bound lengths before decoding so a hostile bundle can't force a huge
+    # bytes.fromhex() allocation.
+    if len(pubkey_hex) != 64:
+        raise ValueError(f"{label}: operator_public_key is {len(pubkey_hex)} hex chars, expected 64")
+    if len(signature_hex) != 128:
+        raise ValueError(f"{label}: signature is {len(signature_hex)} hex chars, expected 128")
+    try:
+        pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex))
+        pk.verify(bytes.fromhex(signature_hex), _signed_payload(receipt.execution, receipt.provenance))
+    except InvalidSignature:
+        raise ValueError(f"{label}: signature verification failed — receipt may be tampered")
+    except ValueError:
+        raise
+    except Exception as e:  # malformed key material, etc.
+        raise ValueError(f"{label}: signature check error: {type(e).__name__}")
 
 
 def _now_iso() -> str:
@@ -466,7 +510,7 @@ def observe_model_call(
             wall_time_ms=wall_time_ms,
             ok=False,
             exit_code=1,
-            error_message=f"{type(exc).__name__}: {str(exc)[:200]}",
+            error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
         )
         receipt = sign_model_call(record, operator_key)
         return None, receipt
@@ -757,7 +801,7 @@ def observe_tool(
             wall_time_ms=wall_time_ms,
             ok=False,
             exit_code=1,
-            error_message=f"{type(exc).__name__}: {str(exc)[:200]}",
+            error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
             tool_version=tool_version,
             endpoint=endpoint,
         )
@@ -1087,7 +1131,7 @@ def observe_shell_tool(
             wall_time_ms=wall_time_ms,
             ok=False,
             exit_code=1,
-            error_message=f"{type(exc).__name__}: {str(exc)[:200]}",
+            error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
             tool_version=tool_version,
             endpoint=" ".join(command[:2]),
         )
@@ -1501,6 +1545,7 @@ def bundle_workflow(
 
 def unbundle_workflow(
     bundle_path: Path | str,
+    verify: bool = True,
 ) -> tuple[Receipt, list[Receipt], dict]:
     """Load a workflow bundle created by bundle_workflow().
 
@@ -1513,9 +1558,15 @@ def unbundle_workflow(
     The returned child_receipts are in the same order as the parent's
     steps list, so child_receipts[i] corresponds to steps[i].
 
+    By default (``verify=True``) every receipt's Ed25519 signature is
+    checked before it is returned. The manifest hash check alone is not
+    sufficient: an attacker who rewrites a child can recompute its hash to
+    match the manifest, but cannot forge the operator signature. Pass
+    ``verify=False`` only when the caller verifies the receipts itself.
+
     Raises:
-        ValueError: If the bundle is malformed or any child's hash
-            doesn't match the parent's claim.
+        ValueError: If the bundle is malformed, any child's hash doesn't
+            match the parent's claim, or (verify=True) any signature is invalid.
     """
     import tarfile
 
@@ -1551,6 +1602,8 @@ def unbundle_workflow(
         provenance=orch_data["provenance"],
         attestation=orch_data["attestation"],
     )
+    if verify:
+        _check_receipt_signature(orch_receipt, "orchestration receipt")
 
     # Reconstruct child receipts in workflow order using the manifest
     child_receipts: list[Receipt] = []
@@ -1572,6 +1625,8 @@ def unbundle_workflow(
                 f"{child.receipt_hash} does not match manifest claim "
                 f"{entry['receipt_hash']}"
             )
+        if verify:
+            _check_receipt_signature(child, f"step '{entry['step_name']}'")
         child_receipts.append(child)
 
     return orch_receipt, child_receipts, manifest_data
@@ -2049,7 +2104,7 @@ def observe_data_flow(
             pii_fingerprint=pii,
             destination_declared=destination_declared,
             declared_allow_list=declared_allow_list or [],
-            error_message=f"{type(exc).__name__}: {str(exc)[:200]}",
+            error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
         )
         return None, sign_data_flow(record, operator_key)
 
