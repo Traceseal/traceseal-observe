@@ -12,6 +12,10 @@ verifiers what kind of execution was receipted:
   - "skill"  — a signed skill ran in a sandbox (traceseal)
   - "model"  — an AI model API was called (this library)
   - "tool"   — a tool/function was invoked (this library)
+  - "model_resolution" — Open Registry resolver evidence (additive profile)
+  - "model_resolution_cosignature" — offline or fresh resolution witness
+  - "model_identity_observation" — bounded cross-registry identity evidence
+  - "model_identity_cosignature" — fresh independent source witness
 
 Third-party verifiers check the signature regardless of type. The type
 discriminator is for downstream consumers who want to filter or
@@ -34,7 +38,7 @@ trust primitive the operator can produce without provider cooperation.
 
 from __future__ import annotations
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 import hashlib
 import json
@@ -222,6 +226,14 @@ class ModelCallRecord:
     output_tokens: int | None = None
     """Optional: output tokens generated, when the provider reports them."""
 
+    tools_offered_hash: str = ""
+    """Optional: tool_definitions_hash() of the full tool definitions offered
+    to the model on this call. Commits to names, descriptions and schemas, so
+    a silently altered tool shows up as a different hash."""
+
+    tools_offered_count: int | None = None
+    """Optional: how many tool definitions were offered."""
+
 
 @dataclass
 class Receipt:
@@ -281,6 +293,9 @@ def _check_receipt_signature(receipt: Receipt, label: str) -> None:
         raise ValueError(f"{label}: signature is {len(signature_hex)} hex chars, expected 128")
     try:
         pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex))
+        expected_fingerprint = public_key_fingerprint(pk)
+        if att.get("operator_fingerprint") != expected_fingerprint:
+            raise ValueError(f"{label}: operator fingerprint does not match public key")
         pk.verify(bytes.fromhex(signature_hex), _signed_payload(receipt.execution, receipt.provenance))
     except InvalidSignature:
         raise ValueError(f"{label}: signature verification failed — receipt may be tampered")
@@ -290,12 +305,76 @@ def _check_receipt_signature(receipt: Receipt, label: str) -> None:
         raise ValueError(f"{label}: signature check error: {type(e).__name__}")
 
 
+def verify_receipt_signature(receipt: Receipt, label: str = "receipt") -> None:
+    """Public fail-closed signature check for an in-memory TraceSeal receipt.
+
+    Application integrations and witnesses should use this stable entry point
+    rather than depending on the package's underscored implementation helper.
+    """
+    _check_receipt_signature(receipt, label)
+
+
 def _now_iso() -> str:
     return (
         datetime.now(timezone.utc)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
+    )
+
+
+def sign_execution_receipt(
+    execution: dict[str, Any],
+    provenance: dict[str, Any],
+    operator_key: OperatorKey,
+) -> Receipt:
+    """Sign an explicit receipt body with TraceSeal's canonical v1 envelope.
+
+    This is the public additive integration seam for domain-specific receipt
+    discriminators. TraceSeal still owns canonical JSON, Ed25519, key identity,
+    attestation time, and the receipt envelope; callers own truthful domain
+    evidence construction. Input mappings are copied before signing so later
+    caller mutation cannot silently alter the returned receipt object.
+    """
+    if not isinstance(execution, dict) or not isinstance(provenance, dict):
+        raise ValueError("execution and provenance must be JSON objects")
+    receipt_type = execution.get("receipt_type")
+    if not isinstance(receipt_type, str) or not receipt_type:
+        raise ValueError("execution.receipt_type is required")
+    try:
+        execution_copy = json.loads(canonical_dumps(execution))
+        provenance_copy = json.loads(canonical_dumps(provenance))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("receipt body is not canonical JSON") from exc
+
+    # Domain profile validation happens before signing.  Historical receipts
+    # without a profile marker remain valid; profile 1.1 opts into strict,
+    # signed UTC time and ordering rules.
+    attested_at = _now_iso()
+    from traceseal_observe.signed_time import (
+        SignedTimeProfileError,
+        validate_signed_time_profile,
+    )
+
+    try:
+        validate_signed_time_profile(
+            execution_copy, {"attested_at": attested_at}
+        )
+    except SignedTimeProfileError as exc:
+        raise ValueError(exc.code) from None
+
+    payload = _signed_payload(execution_copy, provenance_copy)
+    signature = operator_key.sign(payload)
+    return Receipt(
+        receipt_version=RECEIPT_VERSION,
+        execution=execution_copy,
+        provenance=provenance_copy,
+        attestation={
+            "operator_fingerprint": operator_key.fingerprint,
+            "operator_public_key": operator_key.public_key_hex,
+            "attested_at": attested_at,
+            "signature": signature.hex(),
+        },
     )
 
 
@@ -323,6 +402,10 @@ def sign_model_call(
         execution["input_tokens"] = record.input_tokens
     if record.output_tokens is not None:
         execution["output_tokens"] = record.output_tokens
+    if record.tools_offered_hash:
+        execution["tools_offered_hash"] = record.tools_offered_hash
+    if record.tools_offered_count is not None:
+        execution["tools_offered_count"] = record.tools_offered_count
 
     # Provenance for model calls is weaker than for skills —
     # we don't have a publisher signature over the model's code.
@@ -368,6 +451,7 @@ def observe_model_call(
     serialize_request: Callable[[], Any] | None = None,
     serialize_response: Callable[[Any], Any] | None = None,
     extract_status_code: Callable[[Any], int | None] | None = None,
+    tools: list[dict] | None = None,
 ) -> tuple[Any, Receipt]:
     """Wrap a model API call, producing a signed receipt alongside the response.
 
@@ -389,6 +473,8 @@ def observe_model_call(
         serialize_response: Optional function that canonicalizes the response
             before hashing. Useful when the response is a complex object
             (like an SDK response class) that doesn't JSON-serialize cleanly.
+        tools: Optional list of the full tool definitions offered to the
+            model. Recorded as tools_offered_hash + tools_offered_count.
 
     Returns:
         (response, receipt) — the response from `call()` plus a signed Receipt.
@@ -427,6 +513,11 @@ def observe_model_call(
         input_hash = sha256_of(serialize_request())
     else:
         input_hash = "sha256:empty"
+
+    # Hash the offered tools before the call, so a failed call still
+    # records what the model was offered.
+    tools_offered_hash = tool_definitions_hash(tools) if tools is not None else ""
+    tools_offered_count = len(tools) if tools is not None else None
 
     try:
         response = call()
@@ -494,6 +585,8 @@ def observe_model_call(
             error_message=error_msg,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            tools_offered_hash=tools_offered_hash,
+            tools_offered_count=tools_offered_count,
         )
 
         return response, sign_model_call(record, operator_key)
@@ -511,6 +604,8 @@ def observe_model_call(
             ok=False,
             exit_code=1,
             error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
+            tools_offered_hash=tools_offered_hash,
+            tools_offered_count=tools_offered_count,
         )
         receipt = sign_model_call(record, operator_key)
         return None, receipt
@@ -548,6 +643,7 @@ def observe_anthropic(
         serialize_response=lambda r: r.model_dump() if hasattr(r, "model_dump") else dict(r),
         extract_input_tokens=lambda r: getattr(r.usage, "input_tokens", None) if hasattr(r, "usage") else None,
         extract_output_tokens=lambda r: getattr(r.usage, "output_tokens", None) if hasattr(r, "usage") else None,
+        tools=request.get("tools"),
     )
 
 
@@ -577,12 +673,49 @@ def observe_openai(
         serialize_response=lambda r: r.model_dump() if hasattr(r, "model_dump") else dict(r),
         extract_input_tokens=lambda r: getattr(r.usage, "prompt_tokens", None) if hasattr(r, "usage") else None,
         extract_output_tokens=lambda r: getattr(r.usage, "completion_tokens", None) if hasattr(r, "usage") else None,
+        tools=request.get("tools"),
     )
 
 
 # ---------------------------------------------------------------------------
 # TOOL CALL RECEIPTS (Module 2)
 # ---------------------------------------------------------------------------
+
+
+def _require_strict_json(value: Any, label: str) -> None:
+    """Raise ValueError unless value is plain JSON (no NaN, sets, bytes or
+    arbitrary objects, which sha256_of would otherwise hash via str())."""
+    try:
+        encoded = json.dumps(value, allow_nan=False, sort_keys=True)
+        # Non-string keys and tuples are coerced silently by json.dumps, so
+        # {1: 2} and {"1": 2} would hash the same; require an exact round trip.
+        if json.loads(encoded) != value:
+            raise ValueError
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError(f"{label} must be plain JSON") from None
+
+
+def tool_definitions_hash(tools: list[dict]) -> str:
+    """Hash the full set of tool definitions offered to a model.
+
+    Each definition is hashed whole — name, description and input schema —
+    so a tool whose description or schema was quietly changed produces a
+    different hash, not just a renamed one. Definitions are sorted by their
+    canonical bytes first, so the hash does not depend on list order. Works
+    for any provider's shape (Anthropic, OpenAI, MCP).
+    """
+    if not isinstance(tools, list):
+        raise ValueError("tools must be a list of tool definitions")
+    encoded = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ValueError("each tool definition must be a JSON object")
+        _require_strict_json(tool, "tool definition")
+        encoded.append(canonical_dumps(tool))
+    if len(set(encoded)) != len(encoded):
+        raise ValueError("duplicate tool definition")
+    encoded.sort()
+    return sha256_of([json.loads(item) for item in encoded])
 
 
 @dataclass
@@ -632,6 +765,10 @@ class ToolCallRecord:
     """Optional: for HTTP tools, the URL. For MCP, the server name.
     For shell, the command. For Python, the module.function path."""
 
+    tool_definition_hash: str = ""
+    """Optional: sha256_of() the tool's own definition (name, description,
+    input schema) as it stood when called."""
+
 
 def sign_tool_call(
     record: ToolCallRecord,
@@ -656,6 +793,8 @@ def sign_tool_call(
         execution["tool_version"] = record.tool_version
     if record.endpoint:
         execution["endpoint"] = record.endpoint
+    if record.tool_definition_hash:
+        execution["tool_definition_hash"] = record.tool_definition_hash
 
     # Provenance for tool calls: by default weak (no publisher signature
     # over the tool). Tools can be upgraded to signed provenance by
@@ -700,6 +839,7 @@ def observe_tool(
     endpoint: str = "",
     serialize_input: Callable[[], Any] | None = None,
     serialize_output: Callable[[Any], Any] | None = None,
+    tool_definition: dict | None = None,
 ) -> tuple[Any, Receipt]:
     """Wrap a tool invocation, producing a signed receipt alongside the result.
 
@@ -724,6 +864,8 @@ def observe_tool(
         serialize_input: Optional function returning canonical input. Overrides
             `args` if provided.
         serialize_output: Optional function canonicalizing the output before hashing.
+        tool_definition: Optional tool definition (name, description, input
+            schema). Recorded as tool_definition_hash.
 
     Returns:
         (result, receipt) — tool result plus signed Receipt.
@@ -741,6 +883,9 @@ def observe_tool(
             transport="python",
         )
     """
+    tool_definition_hash = (
+        sha256_of(tool_definition) if tool_definition is not None else ""
+    )
     started_at = _now_iso()
     t_start = time.monotonic()
 
@@ -787,6 +932,7 @@ def observe_tool(
             exit_code=0,
             tool_version=tool_version,
             endpoint=endpoint,
+            tool_definition_hash=tool_definition_hash,
         )
         return result, sign_tool_call(record, operator_key)
 
@@ -804,6 +950,7 @@ def observe_tool(
             error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
             tool_version=tool_version,
             endpoint=endpoint,
+            tool_definition_hash=tool_definition_hash,
         )
         return None, sign_tool_call(record, operator_key)
 
@@ -2163,3 +2310,127 @@ def summarize_data_flows(receipts: list[Receipt]) -> dict:
         "total_payload_bytes": total_bytes,
         "failed_calls": failed,
     }
+
+
+# ---------------------------------------------------------------------------
+# OUTCOME RECEIPTS
+# ---------------------------------------------------------------------------
+#
+# A receipt records a call at the moment it ran. What the call led to — a
+# payment settling, a deploy rolling back — is often only known later. An
+# outcome receipt is a separate signed record, made whenever the outcome is
+# known, that commits to the original receipt's hash. It may be signed by a
+# different key from the original (e.g. the downstream system that saw the
+# result). It records what the signer claims happened; it does not prove it.
+
+OUTCOME_VERSION = "1.0"
+OUTCOME_STATUSES = frozenset(
+    {"succeeded", "failed", "partial", "reversed", "unknown"}
+)
+_UTC_SECONDS_RE = __import__("re").compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+
+
+def _require_receipt_shape(receipt: Any, label: str) -> None:
+    """Fail closed with ValueError on structurally malformed receipts."""
+    if not isinstance(receipt, Receipt):
+        raise ValueError(f"{label}: not a Receipt")
+    for section in ("execution", "provenance", "attestation"):
+        if not isinstance(getattr(receipt, section), dict):
+            raise ValueError(f"{label}: {section} must be a JSON object")
+    for key in ("operator_public_key", "signature", "operator_fingerprint"):
+        if not isinstance(receipt.attestation.get(key), str):
+            raise ValueError(f"{label}: attestation.{key} must be a string")
+
+
+def _parse_utc_seconds(value: Any, label: str) -> datetime:
+    if not isinstance(value, str) or _UTC_SECONDS_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be UTC RFC 3339 seconds, e.g. 2026-10-20T12:00:00Z")
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def sign_outcome(
+    subject: Receipt,
+    *,
+    status: str,
+    outcome: Any,
+    operator_key: OperatorKey,
+    observed_at: str | None = None,
+) -> Receipt:
+    """Sign an outcome receipt that points back to an earlier receipt.
+
+    Args:
+        subject: The receipt whose outcome is being recorded. Its signature
+            is checked first; a tampered subject is refused.
+        status: One of OUTCOME_STATUSES.
+        outcome: The outcome evidence. Only its hash is recorded; pass None
+            when there is nothing to hash.
+        operator_key: The key signing the outcome. Need not be the key that
+            signed the subject.
+        observed_at: When the outcome was observed (UTC seconds). Defaults to
+            now. Must not be earlier than the subject's attested_at.
+    """
+    _require_receipt_shape(subject, "subject")
+    verify_receipt_signature(subject, "subject")
+    subject_type = subject.execution.get("receipt_type")
+    if subject_type == "outcome":
+        raise ValueError("an outcome receipt cannot be the subject of another outcome")
+    if not isinstance(status, str) or status not in OUTCOME_STATUSES:
+        raise ValueError(f"status must be one of {sorted(OUTCOME_STATUSES)}")
+    if outcome is not None:
+        _require_strict_json(outcome, "outcome")
+    observed = observed_at if observed_at is not None else _now_iso()
+    observed_dt = _parse_utc_seconds(observed, "observed_at")
+    subject_attested = subject.attestation.get("attested_at")
+    if isinstance(subject_attested, str) and _UTC_SECONDS_RE.fullmatch(subject_attested):
+        if observed_dt < _parse_utc_seconds(subject_attested, "subject attested_at"):
+            raise ValueError("observed_at is earlier than the subject receipt")
+
+    execution = {
+        "receipt_type": "outcome",
+        "outcome_version": OUTCOME_VERSION,
+        "subject_receipt_hash": subject.receipt_hash,
+        "subject_receipt_type": subject_type if isinstance(subject_type, str) else "",
+        "subject_operator_fingerprint": subject.attestation.get("operator_fingerprint", ""),
+        "outcome_status": status,
+        "outcome_hash": "sha256:empty" if outcome is None else sha256_of(outcome),
+        "observed_at": observed,
+    }
+    provenance = {
+        "provider_attestation": "none",
+        "provenance_version": "1.0",
+    }
+    return sign_execution_receipt(execution, provenance, operator_key)
+
+
+def verify_outcome(outcome: Receipt, subject: Receipt) -> None:
+    """Raise ValueError unless `outcome` is a valid outcome for `subject`.
+
+    Checks both signatures, the outcome fields, and that the outcome commits
+    to exactly this subject receipt. Which keys to trust is the caller's
+    policy decision; this only checks the cryptographic and structural link.
+    """
+    _require_receipt_shape(outcome, "outcome")
+    _require_receipt_shape(subject, "subject")
+    verify_receipt_signature(outcome, "outcome")
+    verify_receipt_signature(subject, "subject")
+    ex = outcome.execution
+    if ex.get("receipt_type") != "outcome":
+        raise ValueError("outcome: receipt_type is not 'outcome'")
+    if ex.get("outcome_version") != OUTCOME_VERSION:
+        raise ValueError("outcome: unsupported outcome_version")
+    status = ex.get("outcome_status")
+    if not isinstance(status, str) or status not in OUTCOME_STATUSES:
+        raise ValueError("outcome: invalid outcome_status")
+    observed = _parse_utc_seconds(ex.get("observed_at"), "outcome observed_at")
+    if ex.get("subject_receipt_hash") != subject.receipt_hash:
+        raise ValueError("outcome: does not refer to this subject receipt")
+    if ex.get("subject_receipt_type") != subject.execution.get("receipt_type", ""):
+        raise ValueError("outcome: subject receipt type mismatch")
+    subject_attested = subject.attestation.get("attested_at")
+    if isinstance(subject_attested, str) and _UTC_SECONDS_RE.fullmatch(subject_attested):
+        if observed < _parse_utc_seconds(subject_attested, "subject attested_at"):
+            raise ValueError("outcome: observed_at is earlier than the subject receipt")
+    if ex.get("subject_operator_fingerprint") != subject.attestation.get("operator_fingerprint"):
+        raise ValueError("outcome: subject operator fingerprint mismatch")

@@ -65,6 +65,55 @@ versions.
 A JSON object describing what was executed. All fields are REQUIRED
 unless marked optional.
 
+This section defines the `skill` execution profile. Additive domain profiles
+MAY set `execution.receipt_type` to another documented discriminator while
+retaining the same v1 envelope, canonical encoding and signature algorithm.
+For backwards compatibility, an absent discriminator means `skill`. A verifier
+that understands a domain profile MUST apply that profile's semantic rules;
+the base TraceSeal verifier establishes envelope and signature integrity
+without claiming those domain semantics.
+
+The additive `model_resolution` and `model_resolution_cosignature` profiles are
+defined in [MODEL-RESOLUTION-RECEIPTS.md](MODEL-RESOLUTION-RECEIPTS.md).
+The additive `outcome` profile, and the optional tool-definition hash fields on
+`model` and `tool` receipts, are defined in
+[OUTCOME-RECEIPTS.md](OUTCOME-RECEIPTS.md).
+The additive `model_identity_observation` and `model_identity_cosignature`
+profiles are defined in
+[MODEL-IDENTITY-RECEIPTS.md](MODEL-IDENTITY-RECEIPTS.md).
+Optional publisher artefact evidence committed by the identity profiles is
+defined separately in
+[PUBLISHER-ATTESTATIONS.md](PUBLISHER-ATTESTATIONS.md). Publisher signatures
+are not TraceSeal operator envelopes; they reuse canonical JSON and Ed25519
+while retaining a distinct authorisation claim.
+Repository-scoped binding and its additive publisher key-history profile are
+defined in [PUBLISHER-BINDINGS.md](PUBLISHER-BINDINGS.md) and
+[PUBLISHER-KEY-HISTORY.md](PUBLISHER-KEY-HISTORY.md). New identity receipts may
+commit the current fingerprint, deterministic history root and current key
+status as one optional signed tuple; old receipts remain unchanged.
+Phase 2A.5 adds a second optional all-or-nothing identity tuple committing
+ordered publisher-history log entry hashes, a portable log-evidence root, the
+publisher-history log root and `checkpoint_witnessed_unforked` status. It is
+permitted only with the matching publisher key-history tuple. Identity
+cosignatures additionally declare `log_evidence_offline_verified` or the
+reserved `live_log_checkpoint_reobserved` witness method. These fields commit
+evidence checked under the existing TraceSeal checkpoint/C2SP witness formats;
+they do not change the v1 receipt envelope.
+
+Phase 2B.0 uses the existing `model_resolution` and
+`model_resolution_cosignature` types with the additive signed discriminator
+`policy_selection_version: "1.0"`. That strict profile commits the policy,
+normalised candidate set, complete rule/preference evaluation and final
+selected-or-no-eligible decision. Its witness method is
+`policy_decision_rederivation`; unknown or incomplete 1.0 fields are invalid,
+while historical resolution receipts without the discriminator remain valid.
+
+Domain profiles MAY declare `execution.receipt_profile_version`. Phase 2A
+resolution and identity profile `1.1` adds a strict UTC RFC3339-seconds time
+claim inside `execution`, so the existing signature covers it. Historical
+receipts without that marker retain their original profile semantics; a
+declared but malformed or unsupported profile MUST NOT fall back to legacy.
+
 |Field                 |Type   |Description                                                                                                                                                |
 |----------------------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|
 |`skill_name`          |string |The name of the skill that was executed.                                                                                                                   |
@@ -175,6 +224,11 @@ Read `attestation.operator_public_key` (hex-encoded raw ed25519 public
 key, 32 bytes). Decode it. If the key is malformed, the receipt is
 INVALID.
 
+Derive the key fingerprint from those exact decoded bytes and compare it with
+`attestation.operator_fingerprint`. If they differ, the receipt is INVALID.
+The fingerprint is outside the signed payload, so trusting it without this
+derivation would allow an attacker to relabel a valid public key.
+
 ### Step 4: Reconstruct the signed payload
 
 Construct the JSON object:
@@ -204,7 +258,18 @@ If verification fails, the receipt is INVALID — either the payload was
 tampered with after signing, or the signature was not produced by the
 claimed operator key.
 
-### Step 6: Receipt is VALID
+### Step 6: Understood domain-profile validation
+
+After the envelope signature verifies, a verifier that understands the
+declared domain profile validates its semantic requirements. For Phase 2A
+profile `1.1`, the required signed time must be exactly
+`YYYY-MM-DDTHH:MM:SSZ`, its witness method must match the profile, and signed
+time ordering must be consistent with `attestation.attested_at`. A malformed
+new profile is INVALID even though its cryptographic envelope may be valid.
+Historical profiles without `receipt_profile_version` remain valid under their
+original rules.
+
+### Step 7: Receipt is VALID
 
 If all checks pass, the receipt is cryptographically valid. The
 verifier can conclude:
@@ -336,6 +401,12 @@ the same operator) can detect replayed or out-of-order receipts by
 checking the hash chain. A verifier without audit log access cannot
 detect replays; they can only verify that the receipt is internally
 consistent.
+
+Phase 2A profile `1.1` cryptographically binds `execution.observed_at`, or the
+appropriate witness `verified_at`/`reobserved_at`, as a signer claim. This is
+not trusted wall-clock time and does not itself provide replay prevention or
+ordering. `attestation.attested_at` retains its historical v1 envelope
+semantics outside the signed payload.
 
 ### 6.4 Privacy
 

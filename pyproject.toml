@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "traceseal-observe"
-version = "1.3.2"
+version = "1.4.0"
 description = "Signed execution receipts for AI model calls and tool invocations"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -17,6 +17,14 @@ classifiers = [
     "Topic :: Security :: Cryptography",
 ]
 dependencies = ["cryptography>=41.0"]
+
+[project.scripts]
+traceseal-resolution = "traceseal_observe.resolution:main"
+traceseal-identity = "traceseal_observe.identity:main"
+publisher-attest = "traceseal_observe.publisher:main"
+publisher-bind = "traceseal_observe.binding:main"
+publisher-key = "traceseal_observe.history:main"
+traceseal-selection = "traceseal_observe.selection:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
