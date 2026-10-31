@@ -175,6 +175,9 @@ class TestRetentionAndShredding:
 
 
 class TestDisclosure:
+    @pytest.fixture(autouse=True)
+    def _needs_hpke(self):
+        pytest.importorskip("cryptography.hazmat.primitives.hpke")
     def test_x25519_disclosure(self, vault):
         auditor = X25519PrivateKey.generate()
         digest = vault.put({"prompt": "refund order o-1"}, domain="d")

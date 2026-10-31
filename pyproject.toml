@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Security :: Cryptography",
 ]
-dependencies = ["cryptography>=41.0"]
+dependencies = ["cryptography>=42.0"]
 
 [project.scripts]
 traceseal-resolution = "traceseal_observe.resolution:main"
@@ -28,10 +28,12 @@ traceseal-selection = "traceseal_observe.selection:main"
 traceseal-chain = "traceseal_observe.chain:main"
 traceseal-trace = "traceseal_observe.trace:main"
 traceseal-report = "traceseal_observe.report:main"
+traceseal-keys = "traceseal_observe.directory:main"
 
 [project.optional-dependencies]
 timestamp = ["asn1crypto>=1.5"]
 otel = ["opentelemetry-api>=1.20"]
+disclosure = ["cryptography>=47.0"]
 dev = [
     "pytest>=7.0",
     "asn1crypto>=1.5",

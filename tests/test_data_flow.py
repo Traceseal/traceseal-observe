@@ -428,3 +428,20 @@ class TestDataFlowCrossCompat:
         result = verify_receipt(receipt.to_dict())
         assert result.ok is True
         assert result.operator_fingerprint == key.fingerprint
+
+
+class TestEuPiiPatterns:
+    def test_iban_validated_and_not_double_counted(self):
+        assert fingerprint_pii("IBAN DE89 3704 0044 0532 0130 00") == {"iban": 1}
+        assert fingerprint_pii("GB82WEST12345698765432") == {"iban": 1}
+        assert "iban" not in fingerprint_pii("DE89 3704 0044 0532 0130 01")  # bad checksum
+
+    def test_international_phone(self):
+        assert fingerprint_pii("call +49 30 1234567 or +33 6 12 34 56 78") == {"phone_intl": 2}
+        assert "phone_intl" not in fingerprint_pii("+1 415 555 2671")
+        assert "phone_intl" not in fingerprint_pii("+44 7911 123456")
+
+    def test_ipv4(self):
+        assert fingerprint_pii("from 192.168.1.20") == {"ipv4": 1}
+        assert fingerprint_pii("999.1.1.1") == {}
+        assert fingerprint_pii("version 1.2.3.4.5") == {}

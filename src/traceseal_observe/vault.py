@@ -509,7 +509,7 @@ def _suite_for(key: Any):
         from cryptography.hazmat.primitives import hpke
         from cryptography.hazmat.primitives.asymmetric import x25519
     except ImportError:  # pragma: no cover
-        raise VaultError("sealed disclosure needs a cryptography release with HPKE") from None
+        raise VaultError('sealed disclosure needs cryptography>=47 (pip install "traceseal-observe[disclosure]")') from None
     if isinstance(key, (x25519.X25519PublicKey, x25519.X25519PrivateKey)):
         return hpke.Suite(hpke.KEM.X25519, hpke.KDF.HKDF_SHA256, hpke.AEAD.AES_256_GCM), \
             "DHKEM(X25519)-HKDF-SHA256-AES-256-GCM"

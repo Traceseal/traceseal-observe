@@ -2643,7 +2643,36 @@ _PII_PATTERNS = {
     "github_token": re.compile(
         r"\b(?:ghp|ghs|gho)_[A-Za-z0-9]{20,}\b"
     ),
+    # EU-relevant identifiers. Matches are validated (below) to keep false
+    # positives down.
+    "iban": re.compile(
+        r"\b[A-Z]{2}[0-9]{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b"
+    ),
+    "phone_intl": re.compile(
+        # E.164 numbers outside +1 / +44, which phone_us / phone_uk cover.
+        r"(?<![\w+])\+(?!1|44)[2-9][0-9]{0,2}(?:[ .-]?[0-9]){6,12}\b"
+    ),
+    "ipv4": re.compile(
+        r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9]|\.[0-9])"
+    ),
 }
+
+
+def _valid_iban(candidate: str) -> bool:
+    """ISO 13616 / ISO 7064 mod-97 check."""
+    value = candidate.replace(" ", "")
+    if not 15 <= len(value) <= 34:
+        return False
+    rearranged = value[4:] + value[:4]
+    digits = "".join(str(int(ch, 36)) for ch in rearranged)
+    return int(digits) % 97 == 1
+
+
+def _valid_ipv4(candidate: str) -> bool:
+    return all(0 <= int(part) <= 255 for part in candidate.split("."))
+
+
+_PII_VALIDATORS = {"iban": _valid_iban, "ipv4": _valid_ipv4}
 
 
 def fingerprint_pii(payload: Any) -> dict[str, int]:
@@ -2674,8 +2703,20 @@ def fingerprint_pii(payload: Any) -> dict[str, int]:
         text = str(payload)
 
     findings: dict[str, int] = {}
+    # A valid IBAN is counted once, as an IBAN: mask it so its digits are
+    # not counted again by the card/phone patterns.
+    ibans = [m for m in _PII_PATTERNS["iban"].finditer(text) if _valid_iban(m.group())]
+    if ibans:
+        findings["iban"] = len(ibans)
+        for m in reversed(ibans):
+            text = text[: m.start()] + " " * (m.end() - m.start()) + text[m.end():]
     for name, pattern in _PII_PATTERNS.items():
+        if name == "iban":
+            continue
         matches = pattern.findall(text)
+        validator = _PII_VALIDATORS.get(name)
+        if validator is not None:
+            matches = [m for m in matches if validator(m)]
         if matches:
             findings[name] = len(matches)
 
