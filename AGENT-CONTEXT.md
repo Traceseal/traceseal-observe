@@ -12,8 +12,9 @@ A receipt proves *what* happened. Audits and incident reviews also ask:
 
 This profile adds one optional signed object, `execution.context`, to
 operational receipts (`model`, `tool`, `data_flow`, `orchestration`,
-`outcome`). It sits inside `execution`, so the existing signature covers
-it. Model receipts also gain `requested_tool_calls`.
+`outcome`, `oversight`, `policy_decision`, `incident`, `erasure`,
+`evidence_pack`). It sits inside `execution`, so the existing signature
+covers it. Model receipts also gain `requested_tool_calls`.
 
 ## 1. Recording it
 

@@ -81,7 +81,11 @@ are defined in [RECEIPT-CHAINS.md](RECEIPT-CHAINS.md), including the chained
 described in [TRUSTED-TIME.md](TRUSTED-TIME.md). The optional signed
 `execution.context` object (agent, principal commitment, authorisation,
 trace ids, causal links) and `requested_tool_calls` on model receipts are
-defined in [AGENT-CONTEXT.md](AGENT-CONTEXT.md).
+defined in [AGENT-CONTEXT.md](AGENT-CONTEXT.md). The `oversight` and
+`policy_decision` profiles are defined in
+[HUMAN-OVERSIGHT.md](HUMAN-OVERSIGHT.md); `erasure` in
+[EVIDENCE-VAULT.md](EVIDENCE-VAULT.md); `incident` and `evidence_pack` in
+[EVIDENCE-PACKS.md](EVIDENCE-PACKS.md).
 The additive `model_resolution` and `model_resolution_cosignature` profiles are
 defined in [MODEL-RESOLUTION-RECEIPTS.md](MODEL-RESOLUTION-RECEIPTS.md).
 The additive `outcome` profile, and the optional tool-definition hash fields on

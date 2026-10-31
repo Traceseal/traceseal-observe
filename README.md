@@ -1,373 +1,266 @@
 # traceseal-observe
 
-**Every model and tool call your AI agent makes — signed, timestamped, third-party verifiable.**
-One line of code. Hand the receipts to your auditor.
+**Verifiable evidence of what your AI agents did.** Every model call, tool
+call, data flow, human decision and policy check becomes a signed,
+hash-chained, timestamped receipt. Anyone (your auditor, your regulator,
+your customer) can verify it on their own machine, without access to yours.
 
 ---
 
 ## The question your auditor is about to ask
 
-> *"Prove what your AI agent did yesterday. Which model, which prompt, what did it send to which provider, what came back. Not a screenshot — something I can verify independently."*
+> *"Prove what your AI agent did between 2pm and 4pm yesterday. Which
+> model, on whose behalf, who approved it, what data left the system, and
+> show me nothing is missing. Not a screenshot: something I can verify
+> independently."*
 
-Today, the honest answer is "trust our logs." Tomorrow, under the EU AI Act, the NIS2 directive, the UK AI Bill, and half the compliance frameworks your customers are writing into their procurement forms, "trust our logs" won't cut it.
-
-`traceseal-observe` is the cryptographic primitive that makes the question answerable. Every model call, every tool call, every data-flow leaving your system produces a signed JSON receipt. Anyone — your auditor, your regulator, your customer — can verify it with a one-line command, on any machine, with no access to yours.
+The EU AI Act (record-keeping, human oversight, log retention, incident
+reporting), GDPR, NIS2, DORA and the procurement questionnaires that
+follow them all ask versions of this question. "Trust our logs" doesn't
+answer it. Signed, chained, independently timestamped receipts do.
 
 ## One minute
 
-```python
-from traceseal_observe import OperatorKey, observe_anthropic
-from anthropic import Anthropic
+```bash
+pip install traceseal-observe
+```
 
-key = OperatorKey.load_from_file("~/.traceseal/keys/my-operator.key")
-client = Anthropic()
+```python
+from anthropic import Anthropic
+from traceseal_observe import OperatorKey, ReceiptChain, observe_anthropic
+
+key = OperatorKey.load_from_file("~/.traceseal/keys/operator.key")
+chain = ReceiptChain.open("/var/lib/agent/chain", key, "support-agent")
 
 response, receipt = observe_anthropic(
-    client,
-    {"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "Hi"}]},
-    key,
+    Anthropic(),
+    {"model": "claude-sonnet-5-5", "max_tokens": 512,
+     "messages": [{"role": "user", "content": "Hi"}]},
+    chain.signer,
 )
-
-receipt.to_json()  # shareable, signed, verifiable
+receipt.to_json()            # signed, chained, shareable
+checkpoint = chain.checkpoint()
 ```
 
 Your auditor runs:
 
 ```bash
 pip install traceseal-verify
-traceseal-verify receipt.json
+traceseal-verify receipts/*.json            # signatures, fingerprints, chain links
+traceseal-chain verify receipts/*.json --checkpoint checkpoint.txt
 ```
 
-```
-[OK] receipt.json
-  operator:  ed25519:9dae521400bb39e17e74d8bc1222c45d
-```
+No API keys exchanged, no access to your systems, no shared infrastructure.
 
-That's the whole loop. No API keys exchanged. No access to your machine. No shared infrastructure.
+## What you get
 
-## What gets signed
+| Capability | What it gives you | Docs |
+|---|---|---|
+| **Signed receipts** | model calls (requested *and* served model, tokens, tool calls requested), tool calls, outbound data flows, workflows, outcomes | [RECEIPT-SPEC](RECEIPT-SPEC.md), [OUTCOME-RECEIPTS](OUTCOME-RECEIPTS.md) |
+| **Streaming** | streamed responses hashed chunk by chunk; sync and async | [RECEIPT-CHAINS §2](RECEIPT-CHAINS.md) |
+| **Completeness** | hash-chained receipts, RFC 6962 checkpoints in C2SP format, inclusion and consistency proofs; gaps, forks and truncation detected | [RECEIPT-CHAINS](RECEIPT-CHAINS.md) |
+| **Trusted time** | RFC 3161 / eIDAS timestamps on checkpoints; provable time windows | [TRUSTED-TIME](TRUSTED-TIME.md) |
+| **Who, for whom, why** | signed agent identity, principal (privacy-preserving), tenant, session, W3C trace ids, authorisation scopes and expiry, causal links from model request to tool action | [AGENT-CONTEXT](AGENT-CONTEXT.md) |
+| **Human oversight** | approve / reject / modify / stop / resume receipts, reviewer countersignatures, review timing; verifier enforces required approvals | [HUMAN-OVERSIGHT](HUMAN-OVERSIGHT.md) |
+| **Policy decisions** | every guardrail or filter decision, bound to the policy version | [HUMAN-OVERSIGHT §2](HUMAN-OVERSIGHT.md) |
+| **Evidence vault** | encrypted payload escrow under the receipt hashes; crypto-shredding with signed erasure receipts; retention floors, legal holds; HPKE disclosure to auditors (post-quantum option) | [EVIDENCE-VAULT](EVIDENCE-VAULT.md) |
+| **Incidents** | incident receipts with statutory deadlines (AI Act Art. 73, GDPR Art. 33, NIS2 Art. 23) and late-report detection | [EVIDENCE-PACKS](EVIDENCE-PACKS.md) |
+| **Evidence packs** | one command verifies everything, maps it to obligations, writes a signed, self-checking pack | [EVIDENCE-PACKS](EVIDENCE-PACKS.md) |
+| **Zero-code capture** | an HTTP transport for any SDK that receipts every request, and can block undeclared destinations | [CAPTURE](CAPTURE.md) |
+| **OpenTelemetry** | GenAI semantic-convention attributes and receipt hashes on your existing traces | [CAPTURE](CAPTURE.md) |
+| **Production keys** | KMS/HSM signers, chained key rotation, compromise handling, published operator key directory | [KEY-MANAGEMENT](KEY-MANAGEMENT.md) |
+| **Model provenance** | Open Registry resolution, cross-registry identity, publisher attestations, bindings and key history | [below](#model-provenance-open-registry) |
 
-| Receipt type | What it proves |
-|---|---|
-| **Model call** | which provider, which model was requested and which the provider reported serving, response id, stop reason, hash of prompt, hash of response (including streamed responses), tokens, latency, optional hash of the full tool definitions offered, operator signature |
-| **Tool call** | which tool, transport (python / MCP / HTTP / shell), input/output hash, exit code, optional hash of the tool's definition, operator signature |
-| **Outcome** | a later signed claim about what a call led to (succeeded / failed / partial / reversed / unknown), committing to the original receipt's hash; may be signed by a different key |
-| **Data flow** | outbound HTTP destination, payload hashes, PII pattern count, allow-list match — the signed answer to *"did you send user data to OpenAI between 2pm and 4pm yesterday?"* |
-| **Workflow** | ordered chain of child receipt hashes + wall-clock times, forming a single signed trace of a multi-step run |
-| **Model resolution** | Open Registry's deterministic candidate, policy and source-decision hashes, without the raw repository identity |
-| **Resolution witness** | a different key independently re-derived a supplied resolution bundle and confirmed its signed hash chain |
-| **Fresh resolution witness** | a different key independently contacted Hugging Face and confirmed the signed public revision within a declared time gap |
-| **Model identity observation** | a bounded registry-neutral identity over four locally SHA-256-hashed files observed at Hugging Face and ModelScope |
-| **Model identity witness** | a different key freshly re-observed both sources and confirmed only selected-file equivalence |
-| **Publisher artefact authorisation** | a separate publisher key authorised one exact canonical model identity/equivalence statement |
-| **Publisher repository binding** | the publisher key signed an exact provider/account/repository subject retrieved from that provider namespace at a pinned revision |
-| **Publisher key history** | planned rotation was authorised by the old key and accepted by the new key, or a revocation was supplied/re-observed with its exact assurance method |
-| **Publisher history publication** | exact binding/rotation/revocation commitments were included beneath a TraceSeal checkpoint carrying a valid C2SP witness cosignature |
-
-All formats verify with the same `traceseal-verify` tool.
-
-The additive resolution discriminators use the same v1 envelope and ordinary
-verifier; they do not introduce another signature format. Their narrower trust
-claims and offline operator commands are specified in
-`MODEL-RESOLUTION-RECEIPTS.md`.
-
-Outcome receipts and tool-definition hashes are specified in
-`OUTCOME-RECEIPTS.md`:
+## A complete agent turn
 
 ```python
-from traceseal_observe import sign_outcome, verify_outcome
+from traceseal_observe import (Authorization, Principal, agent_context, caused_by,
+                               observe_anthropic, observe_tool, observe_policy, sign_oversight)
 
-outcome = sign_outcome(tool_receipt, status="reversed",
-                       outcome={"refund_id": "re_123"}, operator_key=key)
-verify_outcome(outcome, tool_receipt)
-```
-
-New Phase 2A receipts declare domain profile `1.1` and put strict UTC
-`observed_at`, `verified_at` or `reobserved_at` claims inside signed
-`execution`. Historical receipts without the profile marker remain valid.
-These are signed clock claims, not trusted timestamps or replay prevention.
-
-## Proving nothing is missing: receipt chains
-
-A signature proves a receipt is authentic. It can't prove you didn't leave
-the awkward ones out. Sign through a `ReceiptChain` and every receipt carries
-a signed sequence number and the hash of the receipt before it. Checkpoints
-are RFC 6962 Merkle roots in the C2SP signed-note format, so they can be
-cosigned by standard transparency-log witnesses.
-
-```python
-from traceseal_observe import ReceiptChain
-
-chain = ReceiptChain.open("/var/lib/agent/chain", key, "support-agent")
-response, receipt = observe_anthropic(client, request, chain.signer)
-
-checkpoint = chain.checkpoint()   # send it somewhere you don't control
-```
-
-```bash
-traceseal-chain verify receipts/*.json --checkpoint checkpoint.txt \
-    --window-start 2026-10-01T14:00:00Z --window-end 2026-10-01T16:00:00Z
-```
-
-```
-[FAIL] chain support-agent  operator ed25519:9dae521400bb39e17e74d8bc1222c45d
-  receipts: 40  seq 1..42  from genesis: True
-  GAP: seq 17..18 missing
-  checkpoint: verified=True anchored=False size=42 witnesses=0
-```
-
-Deleted, inserted, replaced and forked receipts are detected. Truncated tails
-are detected relative to any checkpoint someone else holds. Inclusion proofs
-let you disclose one time window without disclosing the rest. See
-[RECEIPT-CHAINS.md](RECEIPT-CHAINS.md).
-
-## Who did it, for whom, and why
-
-```python
-with agent_context(agent_id="support-bot", agent_version="2.3.1",
-                   principal=Principal.user(user.id, pepper=PEPPER),
+with agent_context(agent_id="support-bot", agent_version="2.3.1", session_id=session_id,
+                   principal=Principal.user(user_id, pepper=PEPPER),
                    authorization=Authorization(scopes=["refunds:write"], grant=oauth_claims)):
-    response, model_receipt = observe_anthropic(client, request, key)
-    with caused_by(model_receipt, tool_call_id=call.id):
-        result, tool_receipt = observe_tool("issue_refund", key, run, args=call.input)
+    response, model_receipt = observe_anthropic(client, request, signer)
+
+    for call in response.content:
+        if call.type != "tool_use":
+            continue
+        _, policy = observe_policy("spend-limit", check_limit, call.input, signer, stage="tool_call")
+        approval = sign_oversight(decision="approved", operator_key=signer,
+                                  reviewer=Principal.user(reviewer_id, pepper=PEPPER),
+                                  subjects=[model_receipt], tool_call_ids=[call.id],
+                                  presented=review_screen, review_started_at=opened_at)
+        with caused_by(model_receipt, policy, approval, tool_call_id=call.id):
+            result, tool_receipt = observe_tool(call.name, signer, lambda: run(call), args=call.input)
+
+    vault.put_for(model_receipt, "input_hash", request, domain=f"tenant:{tenant}")
 ```
-
-Every receipt in the block carries a signed context: agent, principal
-(a keyed commitment, never the raw user id), tenant, session, W3C trace
-ids, and authorisation scopes and expiry. Model receipts sign the tool
-calls the model requested. `traceseal-trace verify` then reports:
-- tool calls the model never asked for;
-- arguments the agent changed;
-- requested calls that never ran;
-- actions with no model behind them;
-- actions outside their scope or after their authorisation expired.
-
-See [AGENT-CONTEXT.md](AGENT-CONTEXT.md).
-
-## Trusted time and production keys
-
-```python
-from traceseal_observe import RemoteOperatorKey
-from traceseal_observe.timestamp import timestamp_checkpoint
-
-key = RemoteOperatorKey("prod", public_key=kms_public_key, sign_fn=kms_sign)  # KMS / HSM
-chain = ReceiptChain.open("/var/lib/agent/chain", key, "support-agent")
-token = timestamp_checkpoint(chain.checkpoint(), "https://tsa.example/")      # RFC 3161
-chain.rotate_key(next_key)                                                    # dual-signed
-```
-
-- **RFC 3161 / eIDAS timestamps** on checkpoints. One token pins every
-  receipt before it, and lets an auditor prove a time window from the TSA's
-  clock instead of yours. Verified against OpenSSL's TSA. Install with
-  `pip install "traceseal-observe[timestamp]"`. See
-  [TRUSTED-TIME.md](TRUSTED-TIME.md).
-- **KMS/HSM signing** through `RemoteOperatorKey`. Every remote signature
-  is checked before use.
-- **Key rotation and compromise** as chained, dual-signed receipts.
-  Verifiers follow handovers and flag receipts signed by a key declared
-  compromised. See [KEY-MANAGEMENT.md](KEY-MANAGEMENT.md).
-
-## Streaming
-
-```python
-from traceseal_observe import observe_anthropic_stream
-
-with observe_anthropic_stream(client, request, key) as stream:
-    for event in stream:          # events pass through unchanged
-        ...
-receipt = stream.receipt          # signed when the stream ends or is closed
-```
-
-The receipt hashes every chunk received and records whether the stream
-completed. `observe_openai_stream` and the generic `observe_model_stream` work
-the same way.
-
-## Open Registry resolution evidence
-
-After Open Registry has produced a deterministic evidence bundle, sign and
-witness it outside the long-running gateway:
 
 ```bash
-traceseal-resolution sign \
-  --evidence resolution-evidence.json \
-  --key resolver.key \
-  --output resolution.receipt.json \
-  --observed-at 2026-08-30T06:30:00Z
-
-traceseal-resolution witness \
-  --evidence resolution-evidence.json \
-  --receipt resolution.receipt.json \
-  --key independent-witness.key \
-  --output resolution.cosignature.json
+traceseal-trace verify receipts/*.json --require-approval issue_refund \
+    --require-policy issue_refund=spend-limit --require-scope issue_refund=refunds:write
 ```
 
-Both outputs verify with `traceseal-verify`. The witness command is offline,
-recomputes the complete Open Registry evidence chain, refuses the original
-signer's key, and writes nothing on semantic or signature failure.
+The verifier reports each of these as an error:
+- a tool call the model never requested;
+- arguments that differ from what the model asked for, or from what the
+  reviewer approved;
+- an action after a human rejected or stopped it;
+- an action despite a policy *deny*;
+- an action outside its scope, or after its authorisation expired.
 
-Phase 2A.1 adds a separately labelled networked witness without changing that
-offline claim:
+## Receipt types
 
-```bash
-traceseal-resolution witness-reobserve \
-  --evidence resolution-evidence.json \
-  --receipt resolution.receipt.json \
-  --model hf-internal-testing/tiny-random-gpt2 \
-  --key independent-witness.key \
-  --output resolution.reobserved.cosignature.json
-```
+All receipts share one envelope (`RECEIPT-SPEC.md` v1.0: canonical JSON,
+Ed25519) and verify with `traceseal-verify`.
 
-It verifies the original receipt, then uses a fresh non-caching client to the
-fixed public Hugging Face origin. A changed revision is `source_changed`; the
-historical operator receipt remains cryptographically valid.
+| `receipt_type` | Records |
+|---|---|
+| `model` | provider, requested and served model, endpoint, prompt/response hashes, tokens, stop reason, tool definitions offered, tool calls requested, stream completeness |
+| `tool` | tool name, transport (python / MCP / HTTP / shell), input/output hashes, exit status, tool definition hash |
+| `data_flow` | destination host and URL, request/response hashes and sizes, PII-pattern counts, allow-list match |
+| `orchestration` | ordered child receipt hashes for a workflow |
+| `outcome` | a later claim about what an action led to (succeeded / failed / reversed …) |
+| `oversight` | a human decision, with reviewer, what was shown, rationale hash, timing, optional reviewer signature |
+| `policy_decision` | an automated control's decision, bound to the policy's hash |
+| `incident` | an incident stage, with affected receipts and statutory deadlines |
+| `erasure` | a crypto-shredding event, committing to what was destroyed |
+| `evidence_pack` | the operator's signature over an evidence pack manifest |
+| `chain_key_rotation` | a dual-signed handover of a chain to a new key |
+| `model_resolution`, `model_identity_observation`, and their `*_cosignature` witnesses | Open Registry model provenance (below) |
 
-Bounded Hugging Face + ModelScope evidence produced by Open Registry is signed
-and freshly witnessed with `traceseal-identity sign` and
-`traceseal-identity witness`. The exact claim is
-`selected_files_equivalent`, never full-model equivalence. See
-`MODEL-IDENTITY-RECEIPTS.md`.
+Operational receipts can carry a signed `context` (agent, principal,
+authorisation, trace, causes) and chain fields (`chain_id`, `chain_seq`,
+`chain_prev_hash`, `chained_at`).
 
-Phase 2A.2 adds a separate offline publisher authorisation without putting a
-publisher key into Open Registry or conflating it with an operator receipt:
+## Command-line tools
 
-```bash
-publisher-attest sign \
-  --identity canonical-identity.json \
-  --huggingface-observation huggingface.observation.json \
-  --modelscope-observation modelscope.observation.json \
-  --key demo-publisher.key \
-  --issued-at 2026-08-30T08:00:00Z \
-  --output publisher-attestation.json
+| Command | For |
+|---|---|
+| `traceseal-verify` | (separate package) verify any receipt's signature and fingerprint; check chain links across files |
+| `traceseal-chain verify / timestamp / timestamp-verify` | completeness, checkpoints, proofs, trusted time windows |
+| `traceseal-trace verify / find-principal` | causality, authorisation, oversight and policy; GDPR access lookups |
+| `traceseal-report build / verify-pack` | evidence packs with control mapping |
+| `traceseal-keys publish / verify` | operator key directory |
+| `traceseal-resolution`, `traceseal-identity`, `traceseal-selection`, `publisher-attest`, `publisher-bind`, `publisher-key` | model provenance |
 
-publisher-attest verify \
-  --identity canonical-identity.json \
-  --huggingface-observation huggingface.observation.json \
-  --modelscope-observation modelscope.observation.json \
-  publisher-attestation.json
-```
+## Mapping to obligations
 
-The publisher fingerprint is the full SHA-256 of the raw Ed25519 public key.
-The signed statement binds canonical ID, selected-file equivalence root and a
-strict issuance-time claim. It does not prove a platform account controls the
-key, and it makes no full-model, safety or licence claim. Optional publisher
-commitments in `traceseal-identity` receipts are independently re-verified by
-the identity witness. See `PUBLISHER-ATTESTATIONS.md`.
+Informational, not legal advice. `traceseal-report` produces this mapping
+from your actual receipts, with the problems it found.
 
-Phase 2A.3 adds a read-only repository-scoped account-binding profile. The
-publisher generates one signed document offline and deliberately publishes the
-exact bytes at `.well-known/open-registry/publisher.json`; TraceSeal never
-uploads it:
-
-```bash
-publisher-bind generate \
-  --provider huggingface \
-  --account example-org \
-  --repository example-org/model \
-  --key demo-publisher.key \
-  --issued-at 2026-08-30T09:00:00Z \
-  --output publisher.json
-
-publisher-bind verify \
-  --provider huggingface \
-  --repository example-org/model \
-  --output publisher-binding-evidence.json
-```
-
-The verify path uses a fixed trusted origin and immutable provider revision.
-Provider/account/repository are signed, so copying a valid document into
-another repository or provider does not create a matching binding. The result
-is `publisher_key_platform_bound`, not provider-native key verification or
-account-wide authority. Identity receipts can commit the binding root, and a
-fresh witness refetches the provider document before countersigning. See
-`PUBLISHER-BINDINGS.md`.
-
-Phase 2A.4 keeps that exact v1 binding valid and adds a strict history wrapper
-at the same path. Planned rotation is a two-step handover: K1 signs a proposal
-and K2 signs acceptance of the identical canonical bytes. Self-revocation is
-signed by the affected key; platform revocation is a deliberately weaker,
-unsigned-by-that-key document whose platform-control assurance exists only
-after fresh pinned retrieval.
-
-```bash
-publisher-key rotate-propose \
-  --old-key k1.key --new-public-key '<64-lowercase-hex-public-key>' \
-  --provider huggingface --account example-org \
-  --repository example-org/model --output proposal.json
-
-publisher-key rotate-accept \
-  --proposal proposal.json --new-key k2.key --output rotation.json
-
-publisher-key assemble \
-  --binding k1-binding.json --binding k2-binding.json \
-  --rotation rotation.json --provider huggingface \
-  --repository example-org/model --output publisher-history.json
-```
-
-The verifier derives one bounded linear chain, rejects cycles/forks and keeps
-`publisher_signature_valid` separate from `active`, `superseded` or `revoked`
-key status. Identity receipts may commit the resulting history root; the witness
-either re-derives supplied documents or freshly refetches the providers. No
-command uploads. See `PUBLISHER-KEY-HISTORY.md`.
-
-Phase 2A.5 derives governed publisher-history log events from that already-
-verified history and commits only hashes, scope commitments and predecessor
-roots. An isolated TraceSeal log can append them, issue RFC 6962 inclusion
-proofs and assemble a witnessed evidence bundle. `traceseal-identity` accepts
-that bundle with `--publisher-history-log-evidence`, verifies the TraceSeal log
-signature plus C2SP cosignature and refuses publisher forks. Nothing publishes
-to `log.traceseal.io` automatically; production publication remains a separate
-operator decision.
-
-Phase 2B.0 signs deterministic Open Registry source-policy decisions without
-changing the TraceSeal v1 envelope. `traceseal-selection sign` commits the
-policy, candidate set, explicit requirement outcomes, preference trace and
-selected-or-no-eligible decision. `traceseal-selection witness` independently
-reruns the Python policy evaluator and countersigns only an exact match. This is
-offline supplied-evidence re-derivation, not fresh provider observation.
-
-## Integrations
-
-- **Anthropic SDK** — `observe_anthropic(client, request, key)`
-- **OpenAI SDK** — `observe_openai(client, request, key)`
-- **Any model provider** — `observe_model_call(...)` with your own serializer
-- **Streaming** — `observe_anthropic_stream`, `observe_openai_stream`, `observe_model_stream(...)`
-- **Completeness** — `ReceiptChain(...).signer` works with every observer above; `verify_chain(...)` / `traceseal-chain verify`
-- **Trusted time** — `traceseal_observe.timestamp`: `timestamp_checkpoint`, `verify_timestamp_token`; `traceseal-chain timestamp`
-- **KMS / HSM** — `RemoteOperatorKey(name, public_key=..., sign_fn=...)`; rotation via `ReceiptChain.rotate_key`
-- **Context and causality** — `agent_context(...)`, `caused_by(receipt, tool_call_id=...)`; `traceseal-trace verify` / `find-principal`
-- **LangChain / LangGraph** — [`traceseal-langchain`](https://github.com/traceseal/traceseal-langchain): one callback handler, receipts for every node
-- **MCP tools** — `observe_mcp_tool(...)`
-- **Tool definitions** — `observe_model_call(..., tools=...)` and `observe_tool(..., tool_definition=...)`; the Anthropic and OpenAI wrappers pick up `tools` from the request
-- **Outcomes** — `sign_outcome(receipt, status=..., outcome=..., operator_key=...)`, checked with `verify_outcome(outcome, receipt)`
-- **HTTP APIs and shell tools** — `observe_http_tool(...)`, `observe_shell_tool(...)` — with secret redaction built in (header values and env values are excluded from hashes)
+| Obligation | Evidence |
+|---|---|
+| EU AI Act Art. 12: record-keeping | chained receipts, checkpoints, trusted time |
+| Art. 12(2)–(3): identify situations, inputs, persons | signed context, input/output hashes |
+| Art. 14 / 26(2): human oversight | oversight receipts, required-approval checks, reviewer signatures |
+| Art. 19 / 26(6): keep logs ≥ 6 months | vault retention floors, chains, checkpoints |
+| Art. 26(5): monitoring | causality checks, unprompted actions, changed arguments, policy decisions |
+| Art. 72 / 73: post-market monitoring, serious incidents | outcome and incident receipts, deadline tracking |
+| GDPR Art. 5, 25: minimisation | hashes not values, principal commitments |
+| GDPR Art. 15 / 17: access, erasure | principal lookups, crypto-shredding with erasure receipts |
+| GDPR Art. 30, 33: records, breach notification | data-flow receipts, incident deadlines |
+| NIS2 Art. 23, DORA | incident receipts and timelines |
+| ISO/IEC 42001, NIST AI RMF | event logging, monitoring, incident response evidence |
 
 ## Privacy
 
-Receipts contain **hashes of inputs and outputs, not the values.** You can send a receipt to your auditor without leaking the prompt your user typed. If the auditor needs to verify a specific value, you provide it separately and they recompute the hash.
+Receipts contain **hashes, not values**. Principals are keyed commitments,
+never raw user ids. Data-flow receipts carry **counts** of PII-shaped
+patterns: emails, phone numbers (US, UK, international), cards, IBANs,
+IPv4 addresses, US SSNs, credentials. Payloads you need to keep live
+encrypted in the evidence vault, erasable per user or tenant.
 
-Data-flow receipts add a **PII fingerprint** — count of email/phone/credit-card/JWT/API-key-shaped patterns detected in the payload. Counts only. No values. A signed answer to "did this request contain PII" without the request being in the receipt.
+Hashes of low-entropy values (`"yes"`, a short code) can be guessed by
+brute force. Bear that in mind before publishing receipts, rather than
+sharing them with an auditor.
 
 ## What receipts prove, and what they don't
 
-Be honest about the trust model.
+**Prove:**
+- The holder of an Ed25519 key signed this exact record.
+- With a chain: no receipt was removed, inserted or replaced, up to the
+  newest checkpoint someone else holds.
+- With a timestamp: the receipts existed by the TSA's time.
+- With a reviewer countersignature: the reviewer, not just the operator,
+  made that decision.
 
-**Prove:** the holder of this ed25519 key signed this exact payload at this time. With a receipt chain: that no receipt in the chain was removed, inserted or replaced, up to the latest checkpoint held by someone else.
-**Don't prove:** that the provider actually returned what you recorded. A compromised operator could fabricate a receipt. This is an *operator attestation*, not a zero-knowledge proof of execution. The guarantee is: the same guarantee your audit logs give you today, but cryptographically portable and tamper-evident.
+**Don't prove:**
+- That the provider really returned what the operator recorded, or that
+  the operator recorded everything. Receipts are *operator attestations*,
+  and an operator dishonest at the time of the action can leave it out of
+  the chain altogether. What they defend against is after-the-fact
+  tampering: logs altered once someone wants something to disappear.
+  `provider_attestation` is reserved for provider-signed responses when
+  providers offer them.
+- Attributions such as the user or the scope are what the operator
+  signed, not facts the library can check.
 
-When providers start signing their responses (the obvious next step — we have a proposal out with Anthropic), the receipt format is designed to carry a `provider_attestation` field alongside yours, closing the loop.
+Further limits:
+- Operator fingerprints in the v1 envelope are truncated to 128 bits.
+  Newer profiles use the full SHA-256.
+- `attestation.attested_at` sits outside the v1 signed payload. Chained
+  receipts sign `chained_at` instead.
+
+## Model provenance (Open Registry)
+
+Separate from agent actions, TraceSeal signs and witnesses evidence about
+*which model* you ran. Each profile is additive to the v1 envelope and has
+its own document:
+
+- **Resolution** (`traceseal-resolution sign / witness / witness-reobserve`):
+  Open Registry's deterministic candidate, policy and source-decision
+  hashes, independently re-derived or freshly re-observed by a witness key.
+  [MODEL-RESOLUTION-RECEIPTS](MODEL-RESOLUTION-RECEIPTS.md)
+- **Identity** (`traceseal-identity sign / witness`): a bounded
+  identity over locally hashed files observed at Hugging Face and
+  ModelScope. The claim is `selected_files_equivalent`, never
+  full-model equivalence. [MODEL-IDENTITY-RECEIPTS](MODEL-IDENTITY-RECEIPTS.md)
+- **Publisher attestation** (`publisher-attest`): a publisher key authorises
+  one canonical identity. [PUBLISHER-ATTESTATIONS](PUBLISHER-ATTESTATIONS.md)
+- **Repository binding** (`publisher-bind`): the publisher key bound to a
+  provider/account/repository at a pinned revision.
+  [PUBLISHER-BINDINGS](PUBLISHER-BINDINGS.md)
+- **Key history** (`publisher-key`): dual-signed rotation and revocation,
+  optionally published under a witnessed TraceSeal log checkpoint.
+  [PUBLISHER-KEY-HISTORY](PUBLISHER-KEY-HISTORY.md)
+- **Selection** (`traceseal-selection sign / witness`): deterministic
+  source-policy decisions, re-run and countersigned by a witness.
+
+Nothing in this package uploads or publishes on your behalf.
+
+## Integrations
+
+- **Anthropic**: `observe_anthropic`, `observe_anthropic_stream`, and
+  `aobserve_*` for `AsyncAnthropic`.
+- **OpenAI**: `observe_openai`, `observe_openai_stream`, and `aobserve_*`.
+- **Any provider**: `observe_model_call` / `observe_model_stream` /
+  `aobserve_model_call`.
+- **Any SDK, zero code**: `capture.ReceiptTransport` / `AsyncReceiptTransport`
+  (httpx or httpx2).
+- **Tools**: `observe_tool`, `observe_tool_fn`, `observe_mcp_tool`,
+  `observe_http_tool`, `observe_shell_tool`, `aobserve_tool`.
+- **LangChain / LangGraph**: [`traceseal-langchain`](https://github.com/traceseal/traceseal-langchain).
+- **OpenTelemetry**: `traceseal_observe.otel`.
 
 ## Install
 
 ```bash
-pip install traceseal-observe                   # the signing library
-pip install traceseal-verify                    # the verifier (one-command audit)
-pip install traceseal-langchain                 # LangChain / LangGraph callback
+pip install traceseal-observe                      # core: one dependency (cryptography>=42)
+pip install "traceseal-observe[timestamp]"         # RFC 3161 tokens (asn1crypto)
+pip install "traceseal-observe[disclosure]"        # HPKE sealed disclosure (cryptography>=47)
+pip install "traceseal-observe[otel]"              # OpenTelemetry export
+pip install traceseal-verify                       # the auditor's verifier
 ```
 
-## Spec
+Python 3.9+. CI covers 3.9 to 3.13 and the minimum `cryptography`.
 
-The receipt format is open and language-agnostic. Anyone can implement a verifier in any language from the [Execution Receipt Specification](https://traceseal.io/spec) without touching Traceseal source code.
+## Spec and changes
+
+The receipt format is open and language-agnostic: see
+[RECEIPT-SPEC.md](RECEIPT-SPEC.md) and the profile documents linked above.
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-Apache 2.0 — no barriers to signing, no barriers to verification.
+Apache 2.0: no barriers to signing, no barriers to verification.

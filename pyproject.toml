@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "traceseal-observe"
-version = "1.4.0"
-description = "Signed execution receipts for AI model calls and tool invocations"
+version = "1.5.0"
+description = "Verifiable, hash-chained, timestamped evidence of what AI agents did: signed receipts for model calls, tools, data flows, human oversight and compliance"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
-keywords = ["ai", "agents", "observability", "receipts", "ed25519", "traceseal", "anthropic", "openai"]
+keywords = ["ai", "agents", "observability", "receipts", "ed25519", "traceseal", "anthropic", "openai", "audit", "compliance", "eu-ai-act", "gdpr", "transparency-log", "rfc3161"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: Apache Software License",

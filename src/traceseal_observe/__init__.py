@@ -10,12 +10,17 @@ The `execution` section uses a `receipt_type` discriminator to tell
 verifiers what kind of execution was receipted:
 
   - "skill"  — a signed skill ran in a sandbox (traceseal)
-  - "model"  — an AI model API was called (this library)
-  - "tool"   — a tool/function was invoked (this library)
-  - "model_resolution" — Open Registry resolver evidence (additive profile)
-  - "model_resolution_cosignature" — offline or fresh resolution witness
-  - "model_identity_observation" — bounded cross-registry identity evidence
-  - "model_identity_cosignature" — fresh independent source witness
+  - "model" / "tool" / "data_flow" / "orchestration" / "outcome"
+             — agent actions (this library)
+  - "oversight" / "policy_decision" — human and automated decisions
+  - "incident" / "erasure" / "evidence_pack" — compliance records
+  - "chain_key_rotation" — handover of a receipt chain to a new key
+  - "model_resolution", "model_identity_observation" and their
+    "*_cosignature" witnesses — Open Registry model provenance
+
+Operational receipts may also carry a signed `context` (agent, principal,
+authorisation, trace, causes; see context.py) and chain fields (see
+chain.py).
 
 Third-party verifiers check the signature regardless of type. The type
 discriminator is for downstream consumers who want to filter or
@@ -38,7 +43,7 @@ trust primitive the operator can produce without provider cooperation.
 
 from __future__ import annotations
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import hashlib
 import json
@@ -257,7 +262,7 @@ class ModelCallRecord:
     """The provider identifier. E.g. "anthropic", "openai", "google"."""
 
     model: str
-    """The model string as requested by the operator. E.g. "claude-sonnet-4-20250514"."""
+    """The model string as requested by the operator. E.g. "claude-sonnet-5-5"."""
 
     api_endpoint: str
     """The HTTP endpoint called. E.g. "https://api.anthropic.com/v1/messages"."""
@@ -958,7 +963,7 @@ def observe_model_call(
         client = Anthropic()
 
         request_body = {
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-5-5",
             "max_tokens": 1000,
             "messages": [{"role": "user", "content": "Hello"}],
         }
@@ -1300,7 +1305,7 @@ def observe_anthropic(
         client = Anthropic()
         response, receipt = observe_anthropic(
             client,
-            {"model": "claude-sonnet-4-20250514", "max_tokens": 1000,
+            {"model": "claude-sonnet-5-5", "max_tokens": 1000,
              "messages": [{"role": "user", "content": "Hello"}]},
             my_key,
         )

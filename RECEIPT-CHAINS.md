@@ -40,9 +40,11 @@ signature covers them:
 the whole receipt, attestation included. So each link also commits to the
 previous receipt's otherwise-unsigned `attested_at`.
 
-Only the operational types `model`, `tool`, `data_flow`, `orchestration` and
-`outcome` are chained, plus the chain's own `chain_key_rotation` (§1.6). Domain-profile receipts (resolution, identity,
-selection) have strict field sets. A chained signer refuses to sign them
+Only operational types are chained: `model`, `tool`, `data_flow`,
+`orchestration`, `outcome`, `oversight`, `policy_decision`, `incident`,
+`erasure` and `evidence_pack`, plus the chain's own `chain_key_rotation`
+(§1.6). Domain-profile receipts (resolution, identity, selection) have
+strict field sets. A chained signer refuses to sign them
 rather than leave them silently outside the chain.
 
 ### 1.3 Merkle tree and checkpoints
