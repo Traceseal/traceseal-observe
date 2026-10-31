@@ -25,6 +25,7 @@ publisher-attest = "traceseal_observe.publisher:main"
 publisher-bind = "traceseal_observe.binding:main"
 publisher-key = "traceseal_observe.history:main"
 traceseal-selection = "traceseal_observe.selection:main"
+traceseal-chain = "traceseal_observe.chain:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]

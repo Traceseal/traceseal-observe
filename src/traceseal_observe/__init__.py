@@ -234,6 +234,34 @@ class ModelCallRecord:
     tools_offered_count: int | None = None
     """Optional: how many tool definitions were offered."""
 
+    served_model: str = ""
+    """Optional: the model identifier the provider reported in its response
+    (e.g. a dated snapshot behind an alias). Signed next to the requested
+    `model` so requested-vs-served differences are visible. This is what the
+    provider said, recorded by the operator; it is not provider-signed."""
+
+    response_id: str = ""
+    """Optional: the provider's response/message id, for cross-referencing
+    the provider's own logs and invoices."""
+
+    stop_reason: str = ""
+    """Optional: why generation stopped (stop_reason / finish_reason)."""
+
+    system_fingerprint: str = ""
+    """Optional: provider backend fingerprint when reported (OpenAI)."""
+
+    response_mode: str = ""
+    """"" for a single response, "stream" for a streamed response. For
+    streams, output_hash is sha256_of(list of serialized chunks in order)."""
+
+    stream_chunk_count: int | None = None
+    """For streams: how many chunks were received."""
+
+    stream_complete: bool | None = None
+    """For streams: True if the stream ran to its end, False if it was
+    closed early or failed part-way (output_hash then covers only the chunks
+    actually received)."""
+
 
 @dataclass
 class Receipt:
@@ -363,12 +391,41 @@ def sign_execution_receipt(
     except SignedTimeProfileError as exc:
         raise ValueError(exc.code) from None
 
-    payload = _signed_payload(execution_copy, provenance_copy)
-    signature = operator_key.sign(payload)
+    if (
+        getattr(operator_key, "chain", None) is not None
+        and receipt_type not in CHAINABLE_RECEIPT_TYPES
+    ):
+        # Domain profiles (resolution, identity, selection...) have strict
+        # field sets and are not agent actions. Refuse rather than silently
+        # signing outside the chain the caller asked for.
+        raise ValueError(
+            f"receipt_type {receipt_type!r} is not chainable; sign it with the "
+            "base OperatorKey, not a chained signer"
+        )
+    return _sign_receipt_body(
+        execution_copy, provenance_copy, operator_key, attested_at
+    )
+
+
+# Operational receipt types that describe what an agent did. Only these are
+# appended to a ReceiptChain (see traceseal_observe.chain).
+CHAINABLE_RECEIPT_TYPES = frozenset(
+    {"model", "tool", "data_flow", "orchestration", "outcome"}
+)
+
+
+def _sign_unchained(
+    execution: dict[str, Any],
+    provenance: dict[str, Any],
+    operator_key: OperatorKey,
+    attested_at: str,
+) -> Receipt:
+    """Sign a finished receipt body with the v1 envelope. No chain logic."""
+    signature = operator_key.sign(_signed_payload(execution, provenance))
     return Receipt(
         receipt_version=RECEIPT_VERSION,
-        execution=execution_copy,
-        provenance=provenance_copy,
+        execution=execution,
+        provenance=provenance,
         attestation={
             "operator_fingerprint": operator_key.fingerprint,
             "operator_public_key": operator_key.public_key_hex,
@@ -376,6 +433,26 @@ def sign_execution_receipt(
             "signature": signature.hex(),
         },
     )
+
+
+def _sign_receipt_body(
+    execution: dict[str, Any],
+    provenance: dict[str, Any],
+    operator_key: OperatorKey,
+    attested_at: str | None = None,
+) -> Receipt:
+    """Single signing path for every operational receipt.
+
+    If the key is a chained signer (ReceiptChain.signer), the chain adds its
+    signed sequence fields and records the receipt; otherwise this is a plain
+    v1 signature.
+    """
+    if attested_at is None:
+        attested_at = _now_iso()
+    chain = getattr(operator_key, "chain", None)
+    if chain is not None:
+        return chain._append(execution, provenance, attested_at)
+    return _sign_unchained(execution, provenance, operator_key, attested_at)
 
 
 def sign_model_call(
@@ -406,6 +483,16 @@ def sign_model_call(
         execution["tools_offered_hash"] = record.tools_offered_hash
     if record.tools_offered_count is not None:
         execution["tools_offered_count"] = record.tools_offered_count
+    for name in _RESPONSE_META_FIELDS:
+        value = getattr(record, name)
+        if value:
+            execution[name] = value
+    if record.response_mode:
+        execution["response_mode"] = record.response_mode
+    if record.stream_chunk_count is not None:
+        execution["stream_chunk_count"] = record.stream_chunk_count
+    if record.stream_complete is not None:
+        execution["stream_complete"] = "true" if record.stream_complete else "false"
 
     # Provenance for model calls is weaker than for skills —
     # we don't have a publisher signature over the model's code.
@@ -416,22 +503,133 @@ def sign_model_call(
         "provenance_version": "1.0",
     }
 
-    payload = _signed_payload(execution, provenance)
-    signature = operator_key.sign(payload)
+    return _sign_receipt_body(execution, provenance, operator_key)
 
-    attestation = {
-        "operator_fingerprint": operator_key.fingerprint,
-        "operator_public_key": operator_key.public_key_hex,
-        "attested_at": _now_iso(),
-        "signature": signature.hex(),
-    }
 
-    return Receipt(
-        receipt_version=RECEIPT_VERSION,
-        execution=execution,
-        provenance=provenance,
-        attestation=attestation,
+# ---------------------------------------------------------------------------
+# Response metadata and stream detection
+# ---------------------------------------------------------------------------
+
+_RESPONSE_META_FIELDS = (
+    "served_model",
+    "response_id",
+    "stop_reason",
+    "system_fingerprint",
+)
+_MAX_META_LEN = 256
+
+
+def _clean_response_metadata(meta: Any) -> dict[str, Any]:
+    """Keep only known metadata keys with sane values.
+
+    Strings must be non-empty and at most 256 characters (longer values are
+    dropped, not truncated, so a signed value is never a silent prefix).
+    Token counts must be non-negative ints.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in _RESPONSE_META_FIELDS:
+        value = meta.get(key)
+        if isinstance(value, str) and 0 < len(value) <= _MAX_META_LEN:
+            out[key] = value
+    for key in ("input_tokens", "output_tokens"):
+        value = meta.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[key] = value
+    return out
+
+
+def _first_choice_finish_reason(serialized: dict) -> Any:
+    choices = serialized.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return choices[0].get("finish_reason")
+    return None
+
+
+def _default_response_metadata(serialized: Any) -> dict[str, Any]:
+    """Best-effort metadata from a serialized (dict) provider response.
+
+    Covers the Anthropic Messages shape (model, id, stop_reason) and the
+    OpenAI Chat Completions shape (model, id, system_fingerprint,
+    choices[0].finish_reason). Unknown shapes yield {}.
+    """
+    if not isinstance(serialized, dict):
+        return {}
+    stop = serialized.get("stop_reason")
+    if stop is None:
+        stop = _first_choice_finish_reason(serialized)
+    return _clean_response_metadata(
+        {
+            "served_model": serialized.get("model"),
+            "response_id": serialized.get("id"),
+            "stop_reason": stop,
+            "system_fingerprint": serialized.get("system_fingerprint"),
+        }
     )
+
+
+def _default_chunk_metadata(chunk: Any) -> dict[str, Any]:
+    """Best-effort metadata from one serialized streaming chunk.
+
+    Anthropic events: message_start carries model/id/input usage,
+    message_delta carries stop_reason and cumulative output_tokens.
+    OpenAI chunks carry id/model/system_fingerprint on every chunk,
+    finish_reason on the last choice chunk, and usage on the final chunk
+    when the request set stream_options={"include_usage": True}.
+    """
+    if not isinstance(chunk, dict):
+        return {}
+    meta: dict[str, Any] = {}
+    kind = chunk.get("type")
+    if kind == "message_start" and isinstance(chunk.get("message"), dict):
+        message = chunk["message"]
+        meta["served_model"] = message.get("model")
+        meta["response_id"] = message.get("id")
+        usage = message.get("usage")
+        if isinstance(usage, dict):
+            meta["input_tokens"] = usage.get("input_tokens")
+            meta["output_tokens"] = usage.get("output_tokens")
+    elif kind == "message_delta":
+        delta = chunk.get("delta")
+        if isinstance(delta, dict):
+            meta["stop_reason"] = delta.get("stop_reason")
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            meta["output_tokens"] = usage.get("output_tokens")
+    elif kind is None:
+        meta["served_model"] = chunk.get("model")
+        meta["response_id"] = chunk.get("id")
+        meta["system_fingerprint"] = chunk.get("system_fingerprint")
+        meta["stop_reason"] = _first_choice_finish_reason(chunk)
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            meta["input_tokens"] = usage.get("prompt_tokens")
+            meta["output_tokens"] = usage.get("completion_tokens")
+    return _clean_response_metadata(meta)
+
+
+def _is_stream_response(response: Any) -> bool:
+    """True if `response` is an iterator/stream rather than a finished value.
+
+    Pydantic models are iterable (they yield fields), so anything with
+    model_dump/to_dict is treated as a finished response.
+    """
+    if response is None or isinstance(
+        response, (dict, list, tuple, str, bytes, bytearray)
+    ):
+        return False
+    if hasattr(response, "model_dump") or hasattr(response, "to_dict"):
+        return False
+    return any(
+        hasattr(response, attr) for attr in ("__next__", "__anext__", "__aiter__")
+    )
+
+
+_STREAM_NOT_OBSERVED = (
+    "streaming response not observed: output was not hashed; "
+    "use observe_model_stream()"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +650,7 @@ def observe_model_call(
     serialize_response: Callable[[Any], Any] | None = None,
     extract_status_code: Callable[[Any], int | None] | None = None,
     tools: list[dict] | None = None,
+    extract_response_metadata: Callable[[Any], dict] | None = None,
 ) -> tuple[Any, Receipt]:
     """Wrap a model API call, producing a signed receipt alongside the response.
 
@@ -475,10 +674,20 @@ def observe_model_call(
             (like an SDK response class) that doesn't JSON-serialize cleanly.
         tools: Optional list of the full tool definitions offered to the
             model. Recorded as tools_offered_hash + tools_offered_count.
+        extract_response_metadata: Optional function called with the raw
+            response, returning a dict with any of served_model, response_id,
+            stop_reason, system_fingerprint. If None, these are read from
+            the serialized response when it has the Anthropic or OpenAI
+            shape. Values the provider reported are signed as-is.
 
     Returns:
         (response, receipt) — the response from `call()` plus a signed Receipt.
         If `call()` raised, response is None and the receipt has ok=False.
+
+        If `call()` returned a stream (an iterator) and no serialize_response
+        was given, the stream is returned untouched and the receipt has
+        ok=False with an error saying the output was not observed. Use
+        observe_model_stream() for streamed calls.
 
     Example (Anthropic):
         from anthropic import Anthropic
@@ -523,6 +732,27 @@ def observe_model_call(
         response = call()
         wall_time_ms = int((time.monotonic() - t_start) * 1000)
 
+        if serialize_response is None and _is_stream_response(response):
+            # Hashing str(stream) would sign a meaningless value (an object
+            # repr). Record honestly that the output was not observed and
+            # hand the unconsumed stream back to the caller.
+            record = ModelCallRecord(
+                provider=provider,
+                model=model,
+                api_endpoint=api_endpoint,
+                input_hash=input_hash,
+                output_hash="sha256:empty",
+                started_at=started_at,
+                wall_time_ms=wall_time_ms,
+                ok=False,
+                exit_code=1,
+                error_message=_STREAM_NOT_OBSERVED,
+                tools_offered_hash=tools_offered_hash,
+                tools_offered_count=tools_offered_count,
+                response_mode="stream",
+            )
+            return response, sign_model_call(record, operator_key)
+
         # Serialize and hash the response
         if serialize_response is not None:
             serialized = serialize_response(response)
@@ -538,6 +768,16 @@ def observe_model_call(
                 serialized = str(response)
 
         output_hash = sha256_of(serialized)
+
+        try:
+            if extract_response_metadata is not None:
+                response_meta = _clean_response_metadata(
+                    extract_response_metadata(response)
+                )
+            else:
+                response_meta = _default_response_metadata(serialized)
+        except Exception:
+            response_meta = {}
 
         # Extract token counts if available
         try:
@@ -587,6 +827,10 @@ def observe_model_call(
             output_tokens=output_tokens,
             tools_offered_hash=tools_offered_hash,
             tools_offered_count=tools_offered_count,
+            served_model=response_meta.get("served_model", ""),
+            response_id=response_meta.get("response_id", ""),
+            stop_reason=response_meta.get("stop_reason", ""),
+            system_fingerprint=response_meta.get("system_fingerprint", ""),
         )
 
         return response, sign_model_call(record, operator_key)
@@ -612,6 +856,284 @@ def observe_model_call(
 
 
 # ---------------------------------------------------------------------------
+# Streaming model calls
+# ---------------------------------------------------------------------------
+
+
+def _default_serialize_chunk(chunk: Any) -> Any:
+    if isinstance(chunk, (dict, list, str, int, float, bool)) or chunk is None:
+        return chunk
+    if isinstance(chunk, bytes):
+        return chunk.decode("utf-8", errors="replace")
+    if hasattr(chunk, "model_dump"):
+        return chunk.model_dump()
+    if hasattr(chunk, "to_dict"):
+        return chunk.to_dict()
+    return str(chunk)
+
+
+class ObservedModelStream:
+    """A pass-through iterator over a streamed model response.
+
+    Iterate it exactly as you would the provider's stream: every chunk is
+    yielded unchanged. As chunks pass, they are serialized and hashed
+    incrementally (nothing is buffered except small metadata). The receipt is
+    signed once, when the stream ends, fails, or is closed early:
+
+      - ran to the end      -> stream_complete "true"
+      - closed / abandoned  -> stream_complete "false", ok "true"
+      - raised mid-stream   -> stream_complete "false", ok "false"; the
+                               exception is re-raised to the caller
+
+    output_hash equals sha256_of([serialized chunk, ...]) over the chunks
+    actually received, so anyone holding the chunks can recompute it.
+
+    Use as a context manager so an early `break` still produces a receipt:
+
+        with observe_anthropic_stream(client, request, key) as stream:
+            for event in stream:
+                ...
+        receipt = stream.receipt
+
+    Reading `.receipt` before the stream has finished raises RuntimeError.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        model: str,
+        api_endpoint: str,
+        operator_key: OperatorKey,
+        input_hash: str,
+        started_at: str,
+        t_start: float,
+        tools_offered_hash: str,
+        tools_offered_count: int | None,
+        serialize_chunk: Callable[[Any], Any],
+        chunk_metadata: Callable[[Any], dict],
+    ):
+        self._provider = provider
+        self._model = model
+        self._api_endpoint = api_endpoint
+        self._operator_key = operator_key
+        self._input_hash = input_hash
+        self._started_at = started_at
+        self._t_start = t_start
+        self._tools_offered_hash = tools_offered_hash
+        self._tools_offered_count = tools_offered_count
+        self._serialize_chunk = serialize_chunk
+        self._chunk_metadata = chunk_metadata
+        self._hasher = hashlib.sha256(b"[")
+        self._count = 0
+        self._meta: dict[str, Any] = {}
+        self._iterator: Any = None
+        self._raw: Any = None
+        self._receipt: Receipt | None = None
+        self.error: BaseException | None = None
+        """Set if the call or the stream raised."""
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def _start(self, call: Callable[[], Any]) -> None:
+        try:
+            self._raw = call()
+            self._iterator = iter(self._raw)
+        except Exception as exc:
+            self.error = exc
+            self._sign(complete=False, ok=False, error=exc, output_observed=False)
+
+    def __iter__(self) -> ObservedModelStream:
+        return self
+
+    def __next__(self) -> Any:
+        if self._receipt is not None or self._iterator is None:
+            raise StopIteration
+        try:
+            chunk = next(self._iterator)
+        except StopIteration:
+            self._sign(complete=True, ok=True)
+            raise
+        except Exception as exc:
+            self.error = exc
+            self._sign(complete=False, ok=False, error=exc)
+            raise
+        self._observe(chunk)
+        return chunk
+
+    def close(self) -> None:
+        """Stop early. Closes the provider stream and signs the receipt."""
+        if self._receipt is not None:
+            return
+        closer = getattr(self._raw, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
+        self._sign(complete=False, ok=True)
+
+    def __enter__(self) -> ObservedModelStream:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if self._receipt is None:
+            if exc_type is not None:
+                self.error = exc_val
+                closer = getattr(self._raw, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
+                self._sign(complete=False, ok=False, error=exc_val)
+            else:
+                self.close()
+        return False
+
+    # -- state -------------------------------------------------------------
+
+    @property
+    def finished(self) -> bool:
+        return self._receipt is not None
+
+    @property
+    def response(self) -> Any:
+        """The provider's raw stream object (None if the call failed)."""
+        return self._raw
+
+    @property
+    def chunk_count(self) -> int:
+        return self._count
+
+    @property
+    def receipt(self) -> Receipt:
+        if self._receipt is None:
+            raise RuntimeError(
+                "stream not finished: iterate it to the end, call close(), "
+                "or use it as a context manager"
+            )
+        return self._receipt
+
+    # -- internals ---------------------------------------------------------
+
+    def _observe(self, chunk: Any) -> None:
+        try:
+            serialized = self._serialize_chunk(chunk)
+            encoded = json.dumps(
+                serialized, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        except Exception:
+            serialized = str(chunk)
+            encoded = json.dumps(serialized, ensure_ascii=False).encode("utf-8")
+        if self._count:
+            self._hasher.update(b",")
+        self._hasher.update(encoded)
+        self._count += 1
+        try:
+            update = _clean_response_metadata(self._chunk_metadata(serialized))
+        except Exception:
+            update = {}
+        self._meta.update(update)
+
+    def _sign(
+        self,
+        *,
+        complete: bool,
+        ok: bool,
+        error: BaseException | None = None,
+        output_observed: bool = True,
+    ) -> None:
+        if self._receipt is not None:
+            return
+        wall_time_ms = int((time.monotonic() - self._t_start) * 1000)
+        if output_observed:
+            hasher = self._hasher.copy()
+            hasher.update(b"]")
+            output_hash = f"sha256:{hasher.hexdigest()}"
+        else:
+            output_hash = "sha256:empty"
+        record = ModelCallRecord(
+            provider=self._provider,
+            model=self._model,
+            api_endpoint=self._api_endpoint,
+            input_hash=self._input_hash,
+            output_hash=output_hash,
+            started_at=self._started_at,
+            wall_time_ms=wall_time_ms,
+            ok=ok,
+            exit_code=0 if ok else 1,
+            error_message=(
+                _redact_error(f"{type(error).__name__}: {error}") if error else ""
+            ),
+            input_tokens=self._meta.get("input_tokens"),
+            output_tokens=self._meta.get("output_tokens"),
+            tools_offered_hash=self._tools_offered_hash,
+            tools_offered_count=self._tools_offered_count,
+            served_model=self._meta.get("served_model", ""),
+            response_id=self._meta.get("response_id", ""),
+            stop_reason=self._meta.get("stop_reason", ""),
+            system_fingerprint=self._meta.get("system_fingerprint", ""),
+            response_mode="stream",
+            stream_chunk_count=self._count,
+            stream_complete=complete,
+        )
+        self._receipt = sign_model_call(record, self._operator_key)
+
+
+def observe_model_stream(
+    provider: str,
+    model: str,
+    api_endpoint: str,
+    operator_key: OperatorKey,
+    call: Callable[[], Any],
+    *,
+    serialize_request: Callable[[], Any] | None = None,
+    serialize_chunk: Callable[[Any], Any] | None = None,
+    chunk_metadata: Callable[[Any], dict] | None = None,
+    tools: list[dict] | None = None,
+) -> ObservedModelStream:
+    """Wrap a streaming model API call. Returns an ObservedModelStream.
+
+    Args:
+        call: zero-arg callable that starts the stream and returns an
+            iterable of chunks (e.g. an SDK Stream object).
+        serialize_request: returns the request for input_hash.
+        serialize_chunk: canonicalizes one chunk for hashing. Defaults to
+            model_dump()/to_dict() for SDK objects, values as-is for JSON.
+        chunk_metadata: called with each *serialized* chunk, returns a dict
+            with any of served_model, response_id, stop_reason,
+            system_fingerprint, input_tokens, output_tokens. Later values
+            overwrite earlier ones. Defaults to Anthropic/OpenAI shapes.
+        tools: tool definitions offered, as for observe_model_call.
+
+    If `call()` itself raises, the returned stream is already finished, yields
+    nothing, has `.error` set and a failed receipt — the same no-raise
+    contract as observe_model_call.
+    """
+    started_at = _now_iso()
+    t_start = time.monotonic()
+    input_hash = (
+        sha256_of(serialize_request()) if serialize_request is not None else "sha256:empty"
+    )
+    stream = ObservedModelStream(
+        provider=provider,
+        model=model,
+        api_endpoint=api_endpoint,
+        operator_key=operator_key,
+        input_hash=input_hash,
+        started_at=started_at,
+        t_start=t_start,
+        tools_offered_hash=tool_definitions_hash(tools) if tools is not None else "",
+        tools_offered_count=len(tools) if tools is not None else None,
+        serialize_chunk=serialize_chunk or _default_serialize_chunk,
+        chunk_metadata=chunk_metadata or _default_chunk_metadata,
+    )
+    stream._start(call)
+    return stream
+
+
+# ---------------------------------------------------------------------------
 # Provider-specific convenience wrappers
 # ---------------------------------------------------------------------------
 
@@ -633,6 +1155,11 @@ def observe_anthropic(
             my_key,
         )
     """
+    if request.get("stream"):
+        raise ValueError(
+            "request has stream=True; use observe_anthropic_stream() so the "
+            "streamed output is actually hashed"
+        )
     return observe_model_call(
         provider="anthropic",
         model=request.get("model", "unknown"),
@@ -663,6 +1190,11 @@ def observe_openai(
             my_key,
         )
     """
+    if request.get("stream"):
+        raise ValueError(
+            "request has stream=True; use observe_openai_stream() so the "
+            "streamed output is actually hashed"
+        )
     return observe_model_call(
         provider="openai",
         model=request.get("model", "unknown"),
@@ -673,6 +1205,55 @@ def observe_openai(
         serialize_response=lambda r: r.model_dump() if hasattr(r, "model_dump") else dict(r),
         extract_input_tokens=lambda r: getattr(r.usage, "prompt_tokens", None) if hasattr(r, "usage") else None,
         extract_output_tokens=lambda r: getattr(r.usage, "completion_tokens", None) if hasattr(r, "usage") else None,
+        tools=request.get("tools"),
+    )
+
+
+def observe_anthropic_stream(
+    client: Any,
+    request: dict,
+    operator_key: OperatorKey,
+) -> ObservedModelStream:
+    """Streaming wrapper for the Anthropic Python SDK (messages.create).
+
+    Usage:
+        with observe_anthropic_stream(client, request, my_key) as stream:
+            for event in stream:
+                ...
+        Path("receipt.json").write_text(stream.receipt.to_json())
+
+    The request is sent (and hashed) with stream=True.
+    """
+    sent = {**request, "stream": True}
+    return observe_model_stream(
+        provider="anthropic",
+        model=request.get("model", "unknown"),
+        api_endpoint="https://api.anthropic.com/v1/messages",
+        operator_key=operator_key,
+        call=lambda: client.messages.create(**sent),
+        serialize_request=lambda: sent,
+        tools=request.get("tools"),
+    )
+
+
+def observe_openai_stream(
+    client: Any,
+    request: dict,
+    operator_key: OperatorKey,
+) -> ObservedModelStream:
+    """Streaming wrapper for the OpenAI Python SDK (chat.completions.create).
+
+    The request is sent (and hashed) with stream=True. Token counts are only
+    available if the request sets stream_options={"include_usage": True}.
+    """
+    sent = {**request, "stream": True}
+    return observe_model_stream(
+        provider="openai",
+        model=request.get("model", "unknown"),
+        api_endpoint="https://api.openai.com/v1/chat/completions",
+        operator_key=operator_key,
+        call=lambda: client.chat.completions.create(**sent),
+        serialize_request=lambda: sent,
         tools=request.get("tools"),
     )
 
@@ -805,22 +1386,7 @@ def sign_tool_call(
         "provenance_version": "1.0",
     }
 
-    payload = _signed_payload(execution, provenance)
-    signature = operator_key.sign(payload)
-
-    attestation = {
-        "operator_fingerprint": operator_key.fingerprint,
-        "operator_public_key": operator_key.public_key_hex,
-        "attested_at": _now_iso(),
-        "signature": signature.hex(),
-    }
-
-    return Receipt(
-        receipt_version=RECEIPT_VERSION,
-        execution=execution,
-        provenance=provenance,
-        attestation=attestation,
-    )
+    return _sign_receipt_body(execution, provenance, operator_key)
 
 
 # ---------------------------------------------------------------------------
@@ -1409,22 +1975,7 @@ def sign_orchestration(
         "provenance_version": "1.0",
     }
 
-    payload = _signed_payload(execution, provenance)
-    signature = operator_key.sign(payload)
-
-    attestation = {
-        "operator_fingerprint": operator_key.fingerprint,
-        "operator_public_key": operator_key.public_key_hex,
-        "attested_at": _now_iso(),
-        "signature": signature.hex(),
-    }
-
-    return Receipt(
-        receipt_version=RECEIPT_VERSION,
-        execution=execution,
-        provenance=provenance,
-        attestation=attestation,
-    )
+    return _sign_receipt_body(execution, provenance, operator_key)
 
 
 # ---------------------------------------------------------------------------
@@ -2059,22 +2610,7 @@ def sign_data_flow(
         "provenance_version": "1.0",
     }
 
-    payload = _signed_payload(execution, provenance)
-    signature = operator_key.sign(payload)
-
-    attestation = {
-        "operator_fingerprint": operator_key.fingerprint,
-        "operator_public_key": operator_key.public_key_hex,
-        "attested_at": _now_iso(),
-        "signature": signature.hex(),
-    }
-
-    return Receipt(
-        receipt_version=RECEIPT_VERSION,
-        execution=execution,
-        provenance=provenance,
-        attestation=attestation,
-    )
+    return _sign_receipt_body(execution, provenance, operator_key)
 
 
 def _parse_host(url: str) -> str:
@@ -2434,3 +2970,16 @@ def verify_outcome(outcome: Receipt, subject: Receipt) -> None:
             raise ValueError("outcome: observed_at is earlier than the subject receipt")
     if ex.get("subject_operator_fingerprint") != subject.attestation.get("operator_fingerprint"):
         raise ValueError("outcome: subject operator fingerprint mismatch")
+
+
+# ---------------------------------------------------------------------------
+# Receipt chains (completeness evidence) — see chain.py / RECEIPT-CHAINS.md
+# ---------------------------------------------------------------------------
+
+from traceseal_observe.chain import (  # noqa: E402
+    ChainError,
+    ChainedOperatorKey,
+    ReceiptChain,
+    verify_chain,
+    verify_chain_checkpoint,
+)

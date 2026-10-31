@@ -49,7 +49,7 @@ That's the whole loop. No API keys exchanged. No access to your machine. No shar
 
 | Receipt type | What it proves |
 |---|---|
-| **Model call** | which provider, which model, hash of prompt, hash of response, tokens, latency, optional hash of the full tool definitions offered, operator signature |
+| **Model call** | which provider, which model was requested and which the provider reported serving, response id, stop reason, hash of prompt, hash of response (including streamed responses), tokens, latency, optional hash of the full tool definitions offered, operator signature |
 | **Tool call** | which tool, transport (python / MCP / HTTP / shell), input/output hash, exit code, optional hash of the tool's definition, operator signature |
 | **Outcome** | a later signed claim about what a call led to (succeeded / failed / partial / reversed / unknown), committing to the original receipt's hash; may be signed by a different key |
 | **Data flow** | outbound HTTP destination, payload hashes, PII pattern count, allow-list match — the signed answer to *"did you send user data to OpenAI between 2pm and 4pm yesterday?"* |
@@ -86,6 +86,55 @@ New Phase 2A receipts declare domain profile `1.1` and put strict UTC
 `observed_at`, `verified_at` or `reobserved_at` claims inside signed
 `execution`. Historical receipts without the profile marker remain valid.
 These are signed clock claims, not trusted timestamps or replay prevention.
+
+## Proving nothing is missing: receipt chains
+
+A signature proves a receipt is authentic. It can't prove you didn't leave
+the awkward ones out. Sign through a `ReceiptChain` and every receipt carries
+a signed sequence number and the hash of the receipt before it. Checkpoints
+are RFC 6962 Merkle roots in the C2SP signed-note format, so they can be
+cosigned by standard transparency-log witnesses.
+
+```python
+from traceseal_observe import ReceiptChain
+
+chain = ReceiptChain.open("/var/lib/agent/chain", key, "support-agent")
+response, receipt = observe_anthropic(client, request, chain.signer)
+
+checkpoint = chain.checkpoint()   # send it somewhere you don't control
+```
+
+```bash
+traceseal-chain verify receipts/*.json --checkpoint checkpoint.txt \
+    --window-start 2026-10-01T14:00:00Z --window-end 2026-10-01T16:00:00Z
+```
+
+```
+[FAIL] chain support-agent  operator ed25519:9dae521400bb39e17e74d8bc1222c45d
+  receipts: 40  seq 1..42  from genesis: True
+  GAP: seq 17..18 missing
+  checkpoint: verified=True anchored=False size=42 witnesses=0
+```
+
+Deleted, inserted, replaced and forked receipts are detected. Truncated tails
+are detected relative to any checkpoint someone else holds. Inclusion proofs
+let you disclose one time window without disclosing the rest. See
+[RECEIPT-CHAINS.md](RECEIPT-CHAINS.md).
+
+## Streaming
+
+```python
+from traceseal_observe import observe_anthropic_stream
+
+with observe_anthropic_stream(client, request, key) as stream:
+    for event in stream:          # events pass through unchanged
+        ...
+receipt = stream.receipt          # signed when the stream ends or is closed
+```
+
+The receipt hashes every chunk received and records whether the stream
+completed. `observe_openai_stream` and the generic `observe_model_stream` work
+the same way.
 
 ## Open Registry resolution evidence
 
@@ -235,6 +284,8 @@ offline supplied-evidence re-derivation, not fresh provider observation.
 - **Anthropic SDK** — `observe_anthropic(client, request, key)`
 - **OpenAI SDK** — `observe_openai(client, request, key)`
 - **Any model provider** — `observe_model_call(...)` with your own serializer
+- **Streaming** — `observe_anthropic_stream`, `observe_openai_stream`, `observe_model_stream(...)`
+- **Completeness** — `ReceiptChain(...).signer` works with every observer above; `verify_chain(...)` / `traceseal-chain verify`
 - **LangChain / LangGraph** — [`traceseal-langchain`](https://github.com/traceseal/traceseal-langchain): one callback handler, receipts for every node
 - **MCP tools** — `observe_mcp_tool(...)`
 - **Tool definitions** — `observe_model_call(..., tools=...)` and `observe_tool(..., tool_definition=...)`; the Anthropic and OpenAI wrappers pick up `tools` from the request
@@ -251,7 +302,7 @@ Data-flow receipts add a **PII fingerprint** — count of email/phone/credit-car
 
 Be honest about the trust model.
 
-**Prove:** the holder of this ed25519 key signed this exact payload at this time.
+**Prove:** the holder of this ed25519 key signed this exact payload at this time. With a receipt chain: that no receipt in the chain was removed, inserted or replaced, up to the latest checkpoint held by someone else.
 **Don't prove:** that the provider actually returned what you recorded. A compromised operator could fabricate a receipt. This is an *operator attestation*, not a zero-knowledge proof of execution. The guarantee is: the same guarantee your audit logs give you today, but cryptographically portable and tamper-evident.
 
 When providers start signing their responses (the obvious next step — we have a proposal out with Anthropic), the receipt format is designed to carry a `provider_attestation` field alongside yours, closing the loop.
