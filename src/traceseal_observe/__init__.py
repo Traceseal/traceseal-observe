@@ -485,6 +485,7 @@ CHAINABLE_RECEIPT_TYPES = frozenset(
         "outcome",
         "oversight",
         "policy_decision",
+        "erasure",
     }
 )
 
