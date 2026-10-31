@@ -78,7 +78,10 @@ Optional chain fields (`chain_version`, `chain_id`, `chain_seq`,
 checkpoints, and the streaming/response-metadata fields on `model` receipts
 are defined in [RECEIPT-CHAINS.md](RECEIPT-CHAINS.md), including the chained
 `chain_key_rotation` handover. RFC 3161 timestamping of checkpoints is
-described in [TRUSTED-TIME.md](TRUSTED-TIME.md).
+described in [TRUSTED-TIME.md](TRUSTED-TIME.md). The optional signed
+`execution.context` object (agent, principal commitment, authorisation,
+trace ids, causal links) and `requested_tool_calls` on model receipts are
+defined in [AGENT-CONTEXT.md](AGENT-CONTEXT.md).
 The additive `model_resolution` and `model_resolution_cosignature` profiles are
 defined in [MODEL-RESOLUTION-RECEIPTS.md](MODEL-RESOLUTION-RECEIPTS.md).
 The additive `outcome` profile, and the optional tool-definition hash fields on

@@ -325,6 +325,10 @@ class ModelCallRecord:
     closed early or failed part-way (output_hash then covers only the chunks
     actually received)."""
 
+    requested_tool_calls: list[dict] | None = None
+    """Tool calls the model's response asked for: [{id, name, input_hash}].
+    input_hash is sha256_of(arguments), matching observe_tool(args=...)."""
+
 
 @dataclass
 class Receipt:
@@ -512,6 +516,17 @@ def _sign_receipt_body(
     """
     if attested_at is None:
         attested_at = _now_iso()
+    if (
+        execution.get("receipt_type") in CHAINABLE_RECEIPT_TYPES
+        and "context" not in execution
+    ):
+        # Ambient agent/principal/authorisation/causality context, if any
+        # (see traceseal_observe.context). An explicit "context" wins.
+        from traceseal_observe.context import current_context
+
+        ctx = current_context()
+        if ctx is not None:
+            execution = {**execution, "context": ctx}
     chain = getattr(operator_key, "chain", None)
     if chain is not None:
         return chain._append(execution, provenance, attested_at)
@@ -556,6 +571,13 @@ def sign_model_call(
         execution["stream_chunk_count"] = record.stream_chunk_count
     if record.stream_complete is not None:
         execution["stream_complete"] = "true" if record.stream_complete else "false"
+    if record.requested_tool_calls:
+        from traceseal_observe.context import MAX_TOOL_CALLS
+
+        calls = [dict(c) for c in record.requested_tool_calls]
+        execution["requested_tool_calls"] = calls[:MAX_TOOL_CALLS]
+        if len(calls) > MAX_TOOL_CALLS:
+            execution["requested_tool_call_count"] = len(calls)
 
     # Provenance for model calls is weaker than for skills —
     # we don't have a publisher signature over the model's code.
@@ -841,6 +863,12 @@ def observe_model_call(
                 response_meta = _default_response_metadata(serialized)
         except Exception:
             response_meta = {}
+        try:
+            from traceseal_observe.context import extract_tool_calls
+
+            tool_calls = extract_tool_calls(serialized)
+        except Exception:
+            tool_calls = []
 
         # Extract token counts if available
         try:
@@ -894,6 +922,7 @@ def observe_model_call(
             response_id=response_meta.get("response_id", ""),
             stop_reason=response_meta.get("stop_reason", ""),
             system_fingerprint=response_meta.get("system_fingerprint", ""),
+            requested_tool_calls=tool_calls or None,
         )
 
         return response, sign_model_call(record, operator_key)
@@ -993,6 +1022,13 @@ class ObservedModelStream:
         self._iterator: Any = None
         self._raw: Any = None
         self._receipt: Receipt | None = None
+        from traceseal_observe.context import ToolCallAccumulator
+        import contextvars
+
+        self._tool_calls = ToolCallAccumulator()
+        # Sign under the context active when the call started, even if the
+        # stream is finished elsewhere.
+        self._context = contextvars.copy_context()
         self.error: BaseException | None = None
         """Set if the call or the stream raised."""
 
@@ -1094,6 +1130,10 @@ class ObservedModelStream:
         self._hasher.update(encoded)
         self._count += 1
         try:
+            self._tool_calls.feed(serialized)
+        except Exception:
+            pass
+        try:
             update = _clean_response_metadata(self._chunk_metadata(serialized))
         except Exception:
             update = {}
@@ -1140,8 +1180,9 @@ class ObservedModelStream:
             response_mode="stream",
             stream_chunk_count=self._count,
             stream_complete=complete,
+            requested_tool_calls=self._tool_calls.result() or None,
         )
-        self._receipt = sign_model_call(record, self._operator_key)
+        self._receipt = self._context.run(sign_model_call, record, self._operator_key)
 
 
 def observe_model_stream(
@@ -3045,6 +3086,14 @@ from traceseal_observe.chain import (  # noqa: E402
     ReceiptChain,
     verify_chain,
     verify_chain_checkpoint,
+)
+
+from traceseal_observe.context import (  # noqa: E402
+    Authorization,
+    Principal,
+    agent_context,
+    caused_by,
+    requested_tool_calls,
 )
 
 # RFC 3161 support lives in traceseal_observe.timestamp and needs the optional

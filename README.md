@@ -121,6 +121,29 @@ are detected relative to any checkpoint someone else holds. Inclusion proofs
 let you disclose one time window without disclosing the rest. See
 [RECEIPT-CHAINS.md](RECEIPT-CHAINS.md).
 
+## Who did it, for whom, and why
+
+```python
+with agent_context(agent_id="support-bot", agent_version="2.3.1",
+                   principal=Principal.user(user.id, pepper=PEPPER),
+                   authorization=Authorization(scopes=["refunds:write"], grant=oauth_claims)):
+    response, model_receipt = observe_anthropic(client, request, key)
+    with caused_by(model_receipt, tool_call_id=call.id):
+        result, tool_receipt = observe_tool("issue_refund", key, run, args=call.input)
+```
+
+Every receipt in the block carries a signed context: agent, principal
+(a keyed commitment, never the raw user id), tenant, session, W3C trace
+ids, and authorisation scopes and expiry. Model receipts sign the tool
+calls the model requested. `traceseal-trace verify` then reports:
+- tool calls the model never asked for;
+- arguments the agent changed;
+- requested calls that never ran;
+- actions with no model behind them;
+- actions outside their scope or after their authorisation expired.
+
+See [AGENT-CONTEXT.md](AGENT-CONTEXT.md).
+
 ## Trusted time and production keys
 
 ```python
@@ -311,6 +334,7 @@ offline supplied-evidence re-derivation, not fresh provider observation.
 - **Completeness** — `ReceiptChain(...).signer` works with every observer above; `verify_chain(...)` / `traceseal-chain verify`
 - **Trusted time** — `traceseal_observe.timestamp`: `timestamp_checkpoint`, `verify_timestamp_token`; `traceseal-chain timestamp`
 - **KMS / HSM** — `RemoteOperatorKey(name, public_key=..., sign_fn=...)`; rotation via `ReceiptChain.rotate_key`
+- **Context and causality** — `agent_context(...)`, `caused_by(receipt, tool_call_id=...)`; `traceseal-trace verify` / `find-principal`
 - **LangChain / LangGraph** — [`traceseal-langchain`](https://github.com/traceseal/traceseal-langchain): one callback handler, receipts for every node
 - **MCP tools** — `observe_mcp_tool(...)`
 - **Tool definitions** — `observe_model_call(..., tools=...)` and `observe_tool(..., tool_definition=...)`; the Anthropic and OpenAI wrappers pick up `tools` from the request

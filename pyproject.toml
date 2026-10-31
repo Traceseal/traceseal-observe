@@ -26,6 +26,7 @@ publisher-bind = "traceseal_observe.binding:main"
 publisher-key = "traceseal_observe.history:main"
 traceseal-selection = "traceseal_observe.selection:main"
 traceseal-chain = "traceseal_observe.chain:main"
+traceseal-trace = "traceseal_observe.trace:main"
 
 [project.optional-dependencies]
 timestamp = ["asn1crypto>=1.5"]
