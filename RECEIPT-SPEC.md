@@ -76,7 +76,9 @@ without claiming those domain semantics.
 Optional chain fields (`chain_version`, `chain_id`, `chain_seq`,
 `chain_prev_hash`, `chained_at`) on operational receipts, their RFC 6962
 checkpoints, and the streaming/response-metadata fields on `model` receipts
-are defined in [RECEIPT-CHAINS.md](RECEIPT-CHAINS.md).
+are defined in [RECEIPT-CHAINS.md](RECEIPT-CHAINS.md), including the chained
+`chain_key_rotation` handover. RFC 3161 timestamping of checkpoints is
+described in [TRUSTED-TIME.md](TRUSTED-TIME.md).
 The additive `model_resolution` and `model_resolution_cosignature` profiles are
 defined in [MODEL-RESOLUTION-RECEIPTS.md](MODEL-RESOLUTION-RECEIPTS.md).
 The additive `outcome` profile, and the optional tool-definition hash fields on

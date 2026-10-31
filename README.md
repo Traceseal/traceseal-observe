@@ -121,6 +121,29 @@ are detected relative to any checkpoint someone else holds. Inclusion proofs
 let you disclose one time window without disclosing the rest. See
 [RECEIPT-CHAINS.md](RECEIPT-CHAINS.md).
 
+## Trusted time and production keys
+
+```python
+from traceseal_observe import RemoteOperatorKey
+from traceseal_observe.timestamp import timestamp_checkpoint
+
+key = RemoteOperatorKey("prod", public_key=kms_public_key, sign_fn=kms_sign)  # KMS / HSM
+chain = ReceiptChain.open("/var/lib/agent/chain", key, "support-agent")
+token = timestamp_checkpoint(chain.checkpoint(), "https://tsa.example/")      # RFC 3161
+chain.rotate_key(next_key)                                                    # dual-signed
+```
+
+- **RFC 3161 / eIDAS timestamps** on checkpoints. One token pins every
+  receipt before it, and lets an auditor prove a time window from the TSA's
+  clock instead of yours. Verified against OpenSSL's TSA. Install with
+  `pip install "traceseal-observe[timestamp]"`. See
+  [TRUSTED-TIME.md](TRUSTED-TIME.md).
+- **KMS/HSM signing** through `RemoteOperatorKey`. Every remote signature
+  is checked before use.
+- **Key rotation and compromise** as chained, dual-signed receipts.
+  Verifiers follow handovers and flag receipts signed by a key declared
+  compromised. See [KEY-MANAGEMENT.md](KEY-MANAGEMENT.md).
+
 ## Streaming
 
 ```python
@@ -286,6 +309,8 @@ offline supplied-evidence re-derivation, not fresh provider observation.
 - **Any model provider** — `observe_model_call(...)` with your own serializer
 - **Streaming** — `observe_anthropic_stream`, `observe_openai_stream`, `observe_model_stream(...)`
 - **Completeness** — `ReceiptChain(...).signer` works with every observer above; `verify_chain(...)` / `traceseal-chain verify`
+- **Trusted time** — `traceseal_observe.timestamp`: `timestamp_checkpoint`, `verify_timestamp_token`; `traceseal-chain timestamp`
+- **KMS / HSM** — `RemoteOperatorKey(name, public_key=..., sign_fn=...)`; rotation via `ReceiptChain.rotate_key`
 - **LangChain / LangGraph** — [`traceseal-langchain`](https://github.com/traceseal/traceseal-langchain): one callback handler, receipts for every node
 - **MCP tools** — `observe_mcp_tool(...)`
 - **Tool definitions** — `observe_model_call(..., tools=...)` and `observe_tool(..., tool_definition=...)`; the Anthropic and OpenAI wrappers pick up `tools` from the request

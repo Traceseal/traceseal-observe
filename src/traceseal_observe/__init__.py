@@ -176,6 +176,69 @@ class OperatorKey:
         return cls.from_raw_bytes(name, path.read_bytes())
 
 
+class RemoteOperatorKey(OperatorKey):
+    """An operator key whose private half lives elsewhere (KMS, HSM, enclave).
+
+    Pass the Ed25519 public key and a function that signs raw bytes with the
+    matching private key. Every returned signature is verified against the
+    public key before use, so a misconfigured or misbehaving signer fails
+    closed instead of producing unverifiable receipts.
+
+        key = RemoteOperatorKey(
+            "kms-operator",
+            public_key=public_key_from_kms,       # Ed25519PublicKey, raw bytes or hex
+            sign_fn=lambda message: kms_sign(message),
+        )
+
+    Works anywhere an OperatorKey is accepted, including ReceiptChain.
+    The signer must perform pure Ed25519 over the exact message bytes (not a
+    pre-hash): Google Cloud KMS EC_SIGN_ED25519, AWS KMS Ed25519 keys,
+    PKCS#11 CKM_EDDSA. See KEY-MANAGEMENT.md for recipes.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        public_key: Ed25519PublicKey | bytes | str,
+        sign_fn: Callable[[bytes], bytes],
+    ):
+        if isinstance(public_key, str):
+            if len(public_key) != 64:
+                raise ValueError("public key hex must be 64 characters")
+            public_key = bytes.fromhex(public_key)
+        if isinstance(public_key, (bytes, bytearray)):
+            if len(public_key) != 32:
+                raise ValueError("raw Ed25519 public key must be 32 bytes")
+            public_key = Ed25519PublicKey.from_public_bytes(bytes(public_key))
+        if not isinstance(public_key, Ed25519PublicKey):
+            raise ValueError("public_key must be an Ed25519 public key")
+        if not callable(sign_fn):
+            raise ValueError("sign_fn must be callable")
+        super().__init__(name=name, private_key=None, public_key=public_key)
+        self._sign_fn = sign_fn
+
+    def sign(self, message: bytes) -> bytes:
+        from cryptography.exceptions import InvalidSignature
+
+        signature = self._sign_fn(message)
+        if not isinstance(signature, (bytes, bytearray)) or len(signature) != 64:
+            raise ValueError("remote signer returned a malformed Ed25519 signature")
+        signature = bytes(signature)
+        try:
+            self.public_key.verify(signature, message)
+        except InvalidSignature:
+            raise ValueError(
+                "remote signer returned a signature that does not verify "
+                "under the configured public key"
+            ) from None
+        return signature
+
+    @classmethod
+    def generate(cls, name: str = "default") -> OperatorKey:  # pragma: no cover
+        raise TypeError("RemoteOperatorKey keys are created in the remote signer")
+
+
 # ---------------------------------------------------------------------------
 # Receipt dataclasses
 # ---------------------------------------------------------------------------
@@ -2983,3 +3046,6 @@ from traceseal_observe.chain import (  # noqa: E402
     verify_chain,
     verify_chain_checkpoint,
 )
+
+# RFC 3161 support lives in traceseal_observe.timestamp and needs the optional
+# asn1crypto dependency: pip install "traceseal-observe[timestamp]"

@@ -57,6 +57,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from traceseal_observe import (
     CHAINABLE_RECEIPT_TYPES,
     OperatorKey,
+    canonical_dumps,
     Receipt,
     _sign_unchained,
     public_key_fingerprint,
@@ -78,6 +79,12 @@ CHAIN_FIELDS = frozenset(
     {"chain_version", "chain_id", "chain_seq", "chain_prev_hash", "chained_at"}
 )
 ORIGIN_PREFIX = "traceseal.io/chain"
+
+ROTATION_TYPE = "chain_key_rotation"
+ROTATION_VERSION = "1.0"
+ROTATION_REASONS = frozenset({"scheduled", "compromise"})
+_ACCEPTANCE_PURPOSE = "traceseal-chain-key-acceptance/1"
+_VERIFIABLE_TYPES = CHAINABLE_RECEIPT_TYPES | {ROTATION_TYPE}
 
 _CHAIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -202,6 +209,20 @@ def _fmt(digest: bytes) -> str:
     return "sha256:" + digest.hex()
 
 
+def _acceptance_message(execution: dict[str, Any]) -> bytes:
+    """What the incoming key signs to accept a rotation at this position."""
+    return canonical_dumps(
+        {
+            "chain_id": execution["chain_id"],
+            "chain_prev_hash": execution["chain_prev_hash"],
+            "chain_seq": execution["chain_seq"],
+            "next_public_key": execution["next_public_key"],
+            "previous_public_key": execution["previous_public_key"],
+            "purpose": _ACCEPTANCE_PURPOSE,
+        }
+    )
+
+
 def verify_inclusion(
     receipt_hash: str, seq: int, tree_size: int, root: str, proof: list[str]
 ) -> bool:
@@ -279,6 +300,10 @@ class ChainedOperatorKey(OperatorKey):
 
     chain: "ReceiptChain | None" = field(default=None, repr=False, compare=False)
 
+    def sign(self, message: bytes) -> bytes:
+        # Delegate so remote (KMS/HSM) keys and key rotation keep working.
+        return self.chain._key.sign(message)
+
 
 class ReceiptChain:
     """An append-only, hash-linked sequence of receipts for one signer stream.
@@ -313,6 +338,8 @@ class ReceiptChain:
         self._digests: list[bytes] = []
         self._leaves: list[bytes] = []
         self._dir: Path | None = None
+        self._header_path: Path | None = None
+        self._header: dict[str, Any] = {}
         self._hashes_fh: Any = None
         self._lock_fh: Any = None
         self._closed = False
@@ -322,7 +349,7 @@ class ReceiptChain:
             self.chain_id = _check_chain_id(chain_id or secrets.token_hex(16))
         self.signer = ChainedOperatorKey(
             name=operator_key.name,
-            private_key=operator_key.private_key,
+            private_key=None,
             public_key=operator_key.public_key,
             chain=self,
         )
@@ -353,18 +380,32 @@ class ReceiptChain:
             raise ChainError(f"chain at {directory} is open in another process")
 
         header_path = directory / _HEADER_FILE
+        self._header_path = header_path
         public_hex = self._key.public_key_hex
+        hashes_path = directory / _HASHES_FILE
+        existing_count = (
+            hashes_path.stat().st_size // 32 if hashes_path.exists() else 0
+        )
         if header_path.exists():
             try:
                 header = json.loads(header_path.read_text("utf-8"))
             except (OSError, ValueError) as exc:
                 self._release()
                 raise ChainError(f"chain header unreadable: {exc}") from None
-            if (
-                not isinstance(header, dict)
-                or header.get("chain_version") != CHAIN_VERSION
-                or header.get("operator_public_key") != public_hex
-            ):
+            if not isinstance(header, dict) or header.get("chain_version") != CHAIN_VERSION:
+                self._release()
+                raise ChainError("chain header is invalid")
+            pending = header.get("pending_rotation")
+            if isinstance(pending, dict):
+                # A rotation was in flight when the process stopped. It
+                # committed iff its receipt hash reached the hash file.
+                if existing_count >= pending.get("seq", 0):
+                    header["key_history"] = header.get("key_history", []) + [
+                        header["operator_public_key"]
+                    ]
+                    header["operator_public_key"] = pending.get("next_public_key")
+                del header["pending_rotation"]
+            if header.get("operator_public_key") != public_hex:
                 self._release()
                 raise ChainError("chain header does not match this operator key")
             existing = _check_chain_id(header.get("chain_id"))
@@ -379,13 +420,12 @@ class ReceiptChain:
             header = {
                 "chain_id": chain_id,
                 "chain_version": CHAIN_VERSION,
+                "key_history": [],
                 "operator_public_key": public_hex,
             }
-            tmp = header_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(header, sort_keys=True, indent=2), "utf-8")
-            os.replace(tmp, header_path)
+        self._header = header
+        self._write_header()
 
-        hashes_path = directory / _HASHES_FILE
         self._hashes_fh = open(hashes_path, "a+b")
         self._hashes_fh.seek(0)
         data = self._hashes_fh.read()
@@ -399,6 +439,16 @@ class ReceiptChain:
         self._leaves = [_hash_leaf(d) for d in self._digests]
         self._dir = directory
         return chain_id
+
+    def _write_header(self) -> None:
+        if self._header_path is None:
+            return
+        tmp = self._header_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(self._header, sort_keys=True, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self._header_path)
 
     def _persist(self, digest: bytes) -> None:
         if self._hashes_fh is None:
@@ -433,10 +483,16 @@ class ReceiptChain:
     # -- appending ---------------------------------------------------------
 
     def _append(
-        self, execution: dict[str, Any], provenance: dict[str, Any], attested_at: str
+        self,
+        execution: dict[str, Any],
+        provenance: dict[str, Any],
+        attested_at: str,
+        *,
+        _next_key: OperatorKey | None = None,
     ) -> Receipt:
         receipt_type = execution.get("receipt_type")
-        if receipt_type not in CHAINABLE_RECEIPT_TYPES:
+        allowed = {ROTATION_TYPE} if _next_key is not None else CHAINABLE_RECEIPT_TYPES
+        if receipt_type not in allowed:
             raise ChainError(f"receipt_type {receipt_type!r} is not chainable")
         clash = CHAIN_FIELDS.intersection(execution)
         if clash:
@@ -457,12 +513,84 @@ class ReceiptChain:
                     "chained_at": attested_at,
                 }
             )
+            if _next_key is not None:
+                body["next_key_acceptance"] = _next_key.sign(
+                    _acceptance_message(body)
+                ).hex()
+                self._header["pending_rotation"] = {
+                    "next_public_key": _next_key.public_key_hex,
+                    "seq": seq,
+                }
+                self._write_header()
             receipt = _sign_unchained(body, provenance, self._key, attested_at)
             digest = bytes.fromhex(receipt.receipt_hash[7:])
             self._persist(digest)
             self._digests.append(digest)
             self._leaves.append(_hash_leaf(digest))
+            if _next_key is not None:
+                self._header.pop("pending_rotation", None)
+                self._header["key_history"] = self._header.get("key_history", []) + [
+                    self._key.public_key_hex
+                ]
+                self._header["operator_public_key"] = _next_key.public_key_hex
+                self._write_header()
+                self._key = _next_key
+                self.signer.name = _next_key.name
+                self.signer.public_key = _next_key.public_key
             return receipt
+
+    def rotate_key(
+        self,
+        new_key: OperatorKey,
+        *,
+        reason: str = "scheduled",
+        compromised_after_seq: int | None = None,
+    ) -> Receipt:
+        """Hand the chain over to `new_key`. Returns the rotation receipt.
+
+        The rotation is itself chained: signed by the current key, carrying
+        the new public key and the new key's signature accepting this exact
+        position in this chain. Every later receipt is signed by `new_key`;
+        `chain.signer` switches automatically.
+
+        reason="compromise" with compromised_after_seq=X declares that
+        receipts X+1 .. (this rotation - 1), signed by the old key, must not
+        be trusted. Verifiers list them in report["compromised_seqs"]. Note
+        that a rotation is signed by the old key, so it is only as trustworthy
+        as the checkpoints that pin the chain before the compromise.
+        """
+        if isinstance(new_key, ChainedOperatorKey):
+            raise ChainError("pass the base OperatorKey, not a chained signer")
+        if new_key.public_key_hex == self._key.public_key_hex:
+            raise ChainError("new key is the current key")
+        if reason not in ROTATION_REASONS:
+            raise ChainError(f"reason must be one of {sorted(ROTATION_REASONS)}")
+        execution: dict[str, Any] = {
+            "receipt_type": ROTATION_TYPE,
+            "rotation_version": ROTATION_VERSION,
+            "rotation_reason": reason,
+            "previous_public_key": self._key.public_key_hex,
+            "next_public_key": new_key.public_key_hex,
+        }
+        if compromised_after_seq is not None:
+            if reason != "compromise":
+                raise ChainError("compromised_after_seq requires reason='compromise'")
+            if (
+                isinstance(compromised_after_seq, bool)
+                or not isinstance(compromised_after_seq, int)
+                or not 0 <= compromised_after_seq <= self.size
+            ):
+                raise ChainError(f"compromised_after_seq must be between 0 and {self.size}")
+            execution["previous_key_compromised_after_seq"] = compromised_after_seq
+        provenance = {"provenance_version": "1.0", "provider_attestation": "none"}
+        from traceseal_observe import _now_iso
+
+        return self._append(execution, provenance, _now_iso(), _next_key=new_key)
+
+    @property
+    def operator_public_key(self) -> str:
+        """Hex public key currently signing this chain."""
+        return self._key.public_key_hex
 
     # -- state and proofs --------------------------------------------------
 
@@ -611,7 +739,7 @@ def _chain_fields(receipt: Receipt) -> tuple[str, int, str, datetime]:
     ex = receipt.execution
     if ex.get("chain_version") != CHAIN_VERSION:
         raise ChainError("not a chained receipt (chain_version missing or unknown)")
-    if ex.get("receipt_type") not in CHAINABLE_RECEIPT_TYPES:
+    if ex.get("receipt_type") not in _VERIFIABLE_TYPES:
         raise ChainError("receipt_type is not chainable")
     chain_id = _check_chain_id(ex.get("chain_id"))
     seq = ex.get("chain_seq")
@@ -628,6 +756,98 @@ def _chain_fields(receipt: Receipt) -> tuple[str, int, str, datetime]:
     return chain_id, seq, prev, chained_at
 
 
+def _check_rotation(receipt: Receipt) -> dict[str, Any]:
+    """Validate a chain_key_rotation receipt; return its key handover."""
+    ex = receipt.execution
+    if ex.get("rotation_version") != ROTATION_VERSION:
+        raise ChainError("unsupported rotation_version")
+    previous, nxt = ex.get("previous_public_key"), ex.get("next_public_key")
+    _check_public_key_hex(previous)
+    next_bytes = _check_public_key_hex(nxt)
+    if previous != receipt.attestation.get("operator_public_key"):
+        raise ChainError("rotation is not signed by the key it hands over from")
+    if previous == nxt:
+        raise ChainError("rotation does not change the key")
+    reason = ex.get("rotation_reason")
+    if reason not in ROTATION_REASONS:
+        raise ChainError("rotation_reason is invalid")
+    acceptance = ex.get("next_key_acceptance")
+    if not isinstance(acceptance, str) or re.fullmatch(r"[0-9a-f]{128}", acceptance) is None:
+        raise ChainError("next_key_acceptance is malformed")
+    try:
+        Ed25519PublicKey.from_public_bytes(next_bytes).verify(
+            bytes.fromhex(acceptance), _acceptance_message(ex)
+        )
+    except (InvalidSignature, KeyError):
+        raise ChainError("next key did not accept this rotation") from None
+    compromised = ex.get("previous_key_compromised_after_seq")
+    if compromised is not None:
+        if (
+            reason != "compromise"
+            or isinstance(compromised, bool)
+            or not isinstance(compromised, int)
+            or not 0 <= compromised < ex["chain_seq"]
+        ):
+            raise ChainError("previous_key_compromised_after_seq is invalid")
+    return {
+        "seq": ex["chain_seq"],
+        "previous_public_key": previous,
+        "next_public_key": nxt,
+        "reason": reason,
+        "compromised_after_seq": compromised,
+    }
+
+
+def _fingerprint_of(public_hex: str) -> str | None:
+    try:
+        return public_key_fingerprint(
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex))
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def _verify_timestamps(tokens, note, anchors, label, errors) -> list[dict[str, Any]]:
+    tokens = list(tokens or ())
+    if not tokens:
+        return []
+    if not anchors:
+        errors.append(f"{label}: timestamps supplied without tsa_trust_anchors")
+        return []
+    from traceseal_observe.timestamp import (
+        TimestampError,
+        checkpoint_body,
+        verify_timestamp_token,
+    )
+
+    verified = []
+    for index, token in enumerate(tokens):
+        try:
+            verified.append(
+                verify_timestamp_token(
+                    token, data=checkpoint_body(note), trust_anchors=anchors
+                )
+            )
+        except TimestampError as exc:
+            errors.append(f"{label}: timestamp[{index}]: {exc}")
+    return verified
+
+
+def _resolve_checkpoint(note, known_keys, chain_id, witness_vkeys):
+    """Verify `note` with whichever known chain key its origin names."""
+    if not isinstance(note, str) or "\n" not in note:
+        raise ChainError("checkpoint must be a signed note")
+    origin = note.split("\n", 1)[0]
+    for public_hex in known_keys:
+        if chain_origin(public_hex, chain_id) == origin:
+            info = verify_chain_checkpoint(
+                note, public_hex, chain_id, witness_vkeys=witness_vkeys
+            )
+            info["signed_by"] = public_hex
+            return info
+    raise ChainError("checkpoint is not signed by any key of this chain")
+
+
 def verify_chain(
     receipts: list[Receipt],
     *,
@@ -636,32 +856,54 @@ def verify_chain(
     checkpoint: str | None = None,
     inclusion_proof: list[str] | None = None,
     witness_vkeys: Iterable[str] = (),
+    checkpoint_timestamps: Iterable[bytes] = (),
+    tsa_trust_anchors: Iterable[Any] = (),
+    start_checkpoint: str | None = None,
+    start_checkpoint_timestamps: Iterable[bytes] = (),
+    start_consistency_proof: list[str] | None = None,
     window: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Verify a set of chained receipts. Never raises on bad input.
 
-    Checks every signature, that all receipts belong to one chain and one
-    key, that hash links are intact, and reports gaps and forks. Optionally:
+    Checks every signature, that all receipts belong to one chain, that hash
+    links are intact, that the signing key only changes through valid
+    rotation receipts, and reports gaps and forks.
 
+      operator_public_key — the key you already trust. The first supplied
+                         receipt must be signed by it; later keys are
+                         accepted only through rotations.
       checkpoint       — a signed checkpoint. If the receipts are the whole
                          chain 1..N, the Merkle root is recomputed and must
                          match. Otherwise pass `inclusion_proof` for the
                          highest receipt seq <= N; its hash links anchor
                          every earlier receipt in the segment.
-      witness_vkeys    — witnesses whose cosignatures the checkpoint must carry.
-      window           — (start, end) UTC "YYYY-MM-DDTHH:MM:SSZ". Reports
-                         whether the segment provably covers the window: it
-                         starts at genesis or before `start`, and ends after
-                         `end` or at a checkpoint head cosigned at/after `end`.
+      witness_vkeys    — C2SP witnesses whose cosignatures every supplied
+                         checkpoint must carry.
+      checkpoint_timestamps, tsa_trust_anchors
+                       — RFC 3161 tokens over the checkpoint body, verified
+                         against these TSA roots (x509.Certificate list).
+      start_checkpoint, start_checkpoint_timestamps, start_consistency_proof
+                       — an earlier checkpoint with trusted time (TSA token
+                         or witness cosignature) at or before the window
+                         start, plus a consistency proof to `checkpoint`.
+                         Proves, independent of the operator's clock, that
+                         nothing created after the window opened precedes
+                         the supplied segment.
+      window           — (start, end) UTC "YYYY-MM-DDTHH:MM:SSZ". See
+                         report["window"]["start_basis"/"end_basis"].
 
     Returns a report dict; report["ok"] is True only if there are no errors
-    and no gaps. Read report["errors"], ["gaps"], ["forks"], ["warnings"].
+    and no gaps.
     """
     report: dict[str, Any] = {
         "ok": False,
         "chain_id": None,
         "operator_public_key": None,
         "operator_fingerprint": None,
+        "operator_keys": [],
+        "head_public_key": None,
+        "rotations": [],
+        "compromised_seqs": [],
         "count": 0,
         "first_seq": None,
         "last_seq": None,
@@ -672,13 +914,16 @@ def verify_chain(
         "errors": [],
         "warnings": [],
         "checkpoint": None,
+        "start_checkpoint": None,
         "window": None,
     }
     errors: list[str] = report["errors"]
+    warnings: list[str] = report["warnings"]
     if not isinstance(receipts, list) or not receipts:
         errors.append("no receipts supplied")
         return report
 
+    # -- pass 1: each receipt on its own ----------------------------------
     by_seq: dict[int, tuple[Receipt, str, str, datetime]] = {}
     for index, receipt in enumerate(receipts):
         label = f"receipt[{index}]"
@@ -692,15 +937,10 @@ def verify_chain(
             errors.append(f"{label}: {exc}")
             continue
         label = f"seq {seq}"
-        public_hex = receipt.attestation.get("operator_public_key")
         if report["chain_id"] is None:
             report["chain_id"] = this_chain
-            report["operator_public_key"] = public_hex
         if this_chain != report["chain_id"]:
             errors.append(f"{label}: belongs to chain {this_chain!r}, not {report['chain_id']!r}")
-            continue
-        if public_hex != report["operator_public_key"]:
-            errors.append(f"{label}: signed by a different operator key")
             continue
         digest = receipt.receipt_hash
         if seq in by_seq:
@@ -708,65 +948,136 @@ def verify_chain(
                 report["forks"].append(seq)
                 errors.append(f"{label}: two different receipts claim this position (fork)")
             else:
-                report["warnings"].append(f"{label}: duplicate copy ignored")
+                warnings.append(f"{label}: duplicate copy ignored")
             continue
         by_seq[seq] = (receipt, digest, prev, chained_at)
 
     if chain_id is not None and report["chain_id"] not in (None, chain_id):
         errors.append(f"receipts are for chain {report['chain_id']!r}, expected {chain_id!r}")
-    if operator_public_key is not None and report["operator_public_key"] not in (
-        None,
-        operator_public_key,
-    ):
-        errors.append("receipts are signed by a different operator key than expected")
     if not by_seq:
         return report
 
-    try:
-        pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(report["operator_public_key"]))
-        report["operator_fingerprint"] = public_key_fingerprint(pk)
-    except ValueError:
-        pass
-
+    # -- pass 2: order, links, keys ---------------------------------------
     seqs = sorted(by_seq)
     report["count"] = len(seqs)
     report["first_seq"], report["last_seq"] = seqs[0], seqs[-1]
     report["starts_at_genesis"] = seqs[0] == 1
     report["head_hash"] = by_seq[seqs[-1]][1]
-    for before, after in zip(seqs, seqs[1:]):
-        if after != before + 1:
-            report["gaps"].append([before + 1, after - 1])
-            continue
-        if by_seq[after][2] != by_seq[before][1]:
-            errors.append(f"seq {after}: chain_prev_hash does not match seq {before}")
-        if by_seq[after][3] < by_seq[before][3]:
-            report["warnings"].append(
-                f"seq {after}: chained_at is earlier than seq {before} (clock went backwards)"
-            )
 
+    def signer_of(s: int) -> str:
+        return by_seq[s][0].attestation["operator_public_key"]
+
+    root_key = signer_of(seqs[0])
+    report["operator_public_key"] = root_key
+    report["operator_fingerprint"] = _fingerprint_of(root_key)
+    if operator_public_key is not None and root_key != operator_public_key:
+        errors.append("the first receipt is not signed by the expected operator key")
+
+    keys: list[dict[str, Any]] = []
+    known_keys: list[str] = []
+    compromised_keys: dict[str, int] = {}
+
+    def note_key(public_hex: str, s: int) -> None:
+        if keys and keys[-1]["public_key"] == public_hex:
+            keys[-1]["last_seq"] = s
+            return
+        keys.append({
+            "public_key": public_hex,
+            "fingerprint": _fingerprint_of(public_hex),
+            "first_seq": s,
+            "last_seq": s,
+        })
+        if public_hex not in known_keys:
+            known_keys.append(public_hex)
+
+    expected_key = root_key
+    for index, s in enumerate(seqs):
+        receipt = by_seq[s][0]
+        signer = signer_of(s)
+        if index:
+            before = seqs[index - 1]
+            if s != before + 1:
+                report["gaps"].append([before + 1, s - 1])
+                if signer != expected_key:
+                    warnings.append(
+                        f"seq {s}: operator key changed inside the gap before it; "
+                        "the rotation cannot be checked"
+                    )
+            else:
+                if by_seq[s][2] != by_seq[before][1]:
+                    errors.append(f"seq {s}: chain_prev_hash does not match seq {before}")
+                if signer != expected_key:
+                    errors.append(
+                        f"seq {s}: signed by {_fingerprint_of(signer)}, but the chain "
+                        f"key at this point is {_fingerprint_of(expected_key)}"
+                    )
+                if by_seq[s][3] < by_seq[before][3]:
+                    warnings.append(
+                        f"seq {s}: chained_at is earlier than seq {before} (clock went backwards)"
+                    )
+        note_key(signer, s)
+        expected_key = signer
+        if receipt.execution.get("receipt_type") == ROTATION_TYPE:
+            try:
+                rotation = _check_rotation(receipt)
+            except ChainError as exc:
+                errors.append(f"seq {s}: {exc}")
+                continue
+            report["rotations"].append(rotation)
+            expected_key = rotation["next_public_key"]
+            if expected_key not in known_keys:
+                known_keys.append(expected_key)
+            if rotation["compromised_after_seq"] is not None:
+                compromised_keys[rotation["previous_public_key"]] = rotation[
+                    "compromised_after_seq"
+                ]
+                first_bad = rotation["compromised_after_seq"] + 1
+                if first_bad <= s - 1:
+                    report["compromised_seqs"].append([first_bad, s - 1])
+                    warnings.append(
+                        f"seq {first_bad}..{s - 1}: signed by a key the operator "
+                        "declared compromised; do not rely on these receipts"
+                    )
+    report["operator_keys"] = keys
+    report["head_public_key"] = expected_key
+
+    # -- checkpoint ----------------------------------------------------------
+    anchors = list(tsa_trust_anchors or ())
     cp_info = None
+    cp_times: list[int] = []
     if checkpoint is not None:
         cp_report: dict[str, Any] = {"verified": False}
         report["checkpoint"] = cp_report
         try:
-            cp_info = verify_chain_checkpoint(
-                checkpoint,
-                report["operator_public_key"],
-                report["chain_id"],
-                witness_vkeys=witness_vkeys,
+            cp_info = _resolve_checkpoint(
+                checkpoint, known_keys, report["chain_id"], witness_vkeys
             )
         except ChainError as exc:
             errors.append(f"checkpoint: {exc}")
         else:
             size = cp_info["tree_size"]
+            stamps = _verify_timestamps(
+                checkpoint_timestamps, checkpoint, anchors, "checkpoint", errors
+            )
+            cp_times = [w["time"] for w in cp_info["witnesses"]] + [
+                t["gen_time_unix"] for t in stamps
+            ]
             cp_report.update(
                 verified=True,
                 tree_size=size,
                 root=cp_info["root"],
+                signed_by=_fingerprint_of(cp_info["signed_by"]),
                 witnesses=cp_info["witnesses"],
+                timestamps=stamps,
                 anchored=False,
                 receipts_after_segment=max(0, size - seqs[-1]),
             )
+            bad_after = compromised_keys.get(cp_info["signed_by"])
+            if bad_after is not None and size > bad_after:
+                warnings.append(
+                    "checkpoint is signed by a key declared compromised after "
+                    f"seq {bad_after}"
+                )
             whole = seqs[0] == 1 and seqs[-1] >= size and not report["gaps"]
             if whole:
                 leaves = [receipt_leaf_hash(by_seq[s][1]) for s in range(1, size + 1)]
@@ -805,10 +1116,66 @@ def verify_chain(
                 else:
                     errors.append(f"checkpoint: inclusion proof for seq {covered[-1]} is invalid")
             if seqs[-1] > size:
-                report["warnings"].append(
+                warnings.append(
                     f"receipts after seq {size} are not covered by the checkpoint"
                 )
+            if cp_report["anchored"] and cp_times:
+                latest_trusted = max(cp_times)
+                for s in seqs:
+                    if s <= size and by_seq[s][3].timestamp() > latest_trusted:
+                        warnings.append(
+                            f"seq {s}: chained_at is later than a trusted time that "
+                            "already covers it (signer clock ahead?)"
+                        )
+                        break
+    elif list(checkpoint_timestamps or ()):
+        errors.append("checkpoint_timestamps given without a checkpoint")
 
+    # -- start checkpoint ----------------------------------------------------
+    start_info = None
+    start_times: list[int] = []
+    if start_checkpoint is not None:
+        sc_report: dict[str, Any] = {"verified": False}
+        report["start_checkpoint"] = sc_report
+        try:
+            start_info = _resolve_checkpoint(
+                start_checkpoint, known_keys, report["chain_id"], witness_vkeys
+            )
+        except ChainError as exc:
+            errors.append(f"start_checkpoint: {exc}")
+        else:
+            stamps = _verify_timestamps(
+                start_checkpoint_timestamps, start_checkpoint, anchors,
+                "start_checkpoint", errors,
+            )
+            start_times = [w["time"] for w in start_info["witnesses"]] + [
+                t["gen_time_unix"] for t in stamps
+            ]
+            consistent = False
+            if cp_info is None or not report["checkpoint"].get("anchored"):
+                errors.append("start_checkpoint: needs an anchored `checkpoint` to link to")
+            elif start_info["tree_size"] > cp_info["tree_size"]:
+                errors.append("start_checkpoint: is larger than `checkpoint`")
+            elif start_info["tree_size"] == cp_info["tree_size"]:
+                consistent = start_info["root"] == cp_info["root"]
+            elif start_consistency_proof is not None:
+                consistent = verify_consistency(
+                    start_info["tree_size"], cp_info["tree_size"],
+                    start_info["root"], cp_info["root"], start_consistency_proof,
+                )
+            else:
+                errors.append("start_checkpoint: start_consistency_proof is required")
+            if not consistent and not any(e.startswith("start_checkpoint") for e in errors):
+                errors.append("start_checkpoint: not consistent with `checkpoint`")
+            sc_report.update(
+                verified=True,
+                tree_size=start_info["tree_size"],
+                consistent=consistent,
+                witnesses=start_info["witnesses"],
+                timestamps=stamps,
+            )
+
+    # -- window --------------------------------------------------------------
     if window is not None:
         start, end = (_parse_time(window[0]), _parse_time(window[1])) if (
             isinstance(window, (tuple, list)) and len(window) == 2
@@ -818,23 +1185,49 @@ def verify_chain(
         else:
             first_t = by_seq[seqs[0]][3]
             last_t = by_seq[seqs[-1]][3]
-            left = report["starts_at_genesis"] or first_t < start
-            right = last_t > end
+            # Start edge: everything created at/after `start` has seq >= first.
+            if report["starts_at_genesis"]:
+                start_basis = "genesis"
+            elif (
+                start_info is not None
+                and report["start_checkpoint"].get("consistent")
+                and start_info["tree_size"] >= seqs[0] - 1
+                and any(t <= start.timestamp() for t in start_times)
+            ):
+                start_basis = "trusted_time"
+            elif first_t < start:
+                start_basis = "signer_clock"
+            else:
+                start_basis = None
+            # End edge: everything created by `end` has seq <= last.
             if (
-                not right
-                and cp_info is not None
+                cp_info is not None
                 and report["checkpoint"].get("anchored")
                 and seqs[-1] == cp_info["tree_size"]
+                and any(t >= end.timestamp() for t in cp_times)
             ):
-                right = any(w["time"] >= end.timestamp() for w in cp_info["witnesses"])
+                end_basis = "published_checkpoint"
+            elif last_t > end:
+                end_basis = "signer_clock"
+            else:
+                end_basis = None
             report["window"] = {
                 "start": window[0],
                 "end": window[1],
-                "complete": bool(left and right and not report["gaps"] and not errors),
-                "covers_start": bool(left),
-                "covers_end": bool(right),
+                "complete": bool(
+                    start_basis and end_basis and not report["gaps"] and not errors
+                ),
+                "covers_start": start_basis is not None,
+                "covers_end": end_basis is not None,
+                "start_basis": start_basis,
+                "end_basis": end_basis,
                 "receipts_in_window": sum(
                     1 for s in seqs if start <= by_seq[s][3] <= end
+                ),
+                "compromised_in_window": any(
+                    lo <= s <= hi and start <= by_seq[s][3] <= end
+                    for lo, hi in report["compromised_seqs"]
+                    for s in seqs
                 ),
             }
 
@@ -863,6 +1256,55 @@ def load_receipt(path: Path | str) -> Receipt:
 # ---------------------------------------------------------------------------
 
 
+def _read_json(path: str | None) -> Any:
+    return json.loads(Path(path).read_text("utf-8")) if path else None
+
+
+def _read_text(path: str | None) -> str | None:
+    return Path(path).read_text("utf-8") if path else None
+
+
+def _read_certs(paths: list[str]) -> list[Any]:
+    from traceseal_observe.timestamp import load_certificates
+
+    certs: list[Any] = []
+    for path in paths:
+        certs.extend(load_certificates(Path(path).read_bytes()))
+    return certs
+
+
+def _print_report(report: dict[str, Any], passed: bool) -> None:
+    status = "OK" if passed else "FAIL"
+    print(f"[{status}] chain {report['chain_id']}  operator {report['operator_fingerprint']}")
+    print(f"  receipts: {report['count']}  seq {report['first_seq']}..{report['last_seq']}"
+          f"  from genesis: {report['starts_at_genesis']}")
+    for rotation in report.get("rotations", []):
+        print(f"  key rotation at seq {rotation['seq']} ({rotation['reason']}) -> "
+              f"{_fingerprint_of(rotation['next_public_key'])}")
+    for lo, hi in report.get("compromised_seqs", []):
+        print(f"  COMPROMISED: seq {lo}..{hi} signed by a key declared compromised")
+    for gap in report["gaps"]:
+        print(f"  GAP: seq {gap[0]}..{gap[1]} missing")
+    for error in report["errors"]:
+        print(f"  ERROR: {error}")
+    for warning in report["warnings"]:
+        print(f"  warning: {warning}")
+    for label in ("checkpoint", "start_checkpoint"):
+        cp = report.get(label)
+        if cp:
+            times = [t["gen_time"] for t in cp.get("timestamps", [])]
+            print(f"  {label}: verified={cp['verified']} size={cp.get('tree_size')}"
+                  + (f" anchored={cp.get('anchored')}" if label == "checkpoint" else
+                     f" consistent={cp.get('consistent')}")
+                  + f" witnesses={len(cp.get('witnesses', []))}"
+                  + (f" tsa={','.join(times)}" if times else ""))
+    if report["window"]:
+        w = report["window"]
+        print(f"  window {w['start']}..{w['end']}: complete={w['complete']}"
+              f" start={w['start_basis']} end={w['end_basis']}"
+              f" receipts={w['receipts_in_window']}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="traceseal-chain",
@@ -872,25 +1314,74 @@ def main(argv: list[str] | None = None) -> int:
     v = sub.add_parser("verify", help="verify chained receipts")
     v.add_argument("receipts", nargs="+", help="receipt JSON files")
     v.add_argument("--chain-id")
-    v.add_argument("--operator-public-key", help="expected key (64 hex)")
+    v.add_argument("--operator-public-key", help="key you already trust (64 hex)")
     v.add_argument("--checkpoint", help="checkpoint note file")
     v.add_argument("--inclusion-proof", help="JSON list of sha256:<hex>")
     v.add_argument("--witness-vkey", action="append", default=[])
+    v.add_argument("--checkpoint-timestamp", action="append", default=[],
+                   help="RFC 3161 token (DER) over --checkpoint")
+    v.add_argument("--tsa-root", action="append", default=[],
+                   help="trusted TSA root certificate(s), PEM or DER")
+    v.add_argument("--start-checkpoint", help="earlier checkpoint note file")
+    v.add_argument("--start-timestamp", action="append", default=[],
+                   help="RFC 3161 token (DER) over --start-checkpoint")
+    v.add_argument("--start-consistency-proof", help="JSON list of sha256:<hex>")
     v.add_argument("--window-start")
     v.add_argument("--window-end")
     v.add_argument("--json", action="store_true", help="print the full report")
+
+    t = sub.add_parser("timestamp", help="get an RFC 3161 token for a checkpoint")
+    t.add_argument("--checkpoint", required=True)
+    t.add_argument("--tsa-url", required=True)
+    t.add_argument("--output", required=True)
+
+    tv = sub.add_parser("timestamp-verify", help="verify an RFC 3161 token over a checkpoint")
+    tv.add_argument("--checkpoint", required=True)
+    tv.add_argument("--timestamp", required=True)
+    tv.add_argument("--tsa-root", action="append", required=True)
+    tv.add_argument("--tsa-cert", action="append", default=[],
+                    help="intermediate or TSA certificate not included in the token")
     args = parser.parse_args(argv)
+
+    if args.command in ("timestamp", "timestamp-verify"):
+        from traceseal_observe.timestamp import (
+            TimestampError,
+            checkpoint_body,
+            timestamp_checkpoint,
+            verify_timestamp_token,
+        )
+
+        try:
+            note = Path(args.checkpoint).read_text("utf-8")
+            if args.command == "timestamp":
+                token = timestamp_checkpoint(note, args.tsa_url)
+                Path(args.output).write_bytes(token)
+                print(f"[OK] wrote {args.output} (verify it before relying on it)")
+                return 0
+            info = verify_timestamp_token(
+                Path(args.timestamp).read_bytes(),
+                data=checkpoint_body(note),
+                trust_anchors=_read_certs(args.tsa_root),
+                intermediates=_read_certs(args.tsa_cert),
+            )
+        except (OSError, ValueError) as exc:
+            label = "FAIL" if isinstance(exc, TimestampError) else "ERROR"
+            print(f"[{label}] {exc}", file=sys.stderr)
+            return 1
+        print(f"[OK] checkpoint existed by {info['gen_time']} (TSA {info['tsa_subject']},"
+              f" policy {info['policy']}, ETSI qualified statement:"
+              f" {info['etsi_qualified_statement']})")
+        return 0
 
     try:
         receipts = [load_receipt(p) for p in args.receipts]
-        checkpoint = (
-            Path(args.checkpoint).read_text("utf-8") if args.checkpoint else None
-        )
-        proof = (
-            json.loads(Path(args.inclusion_proof).read_text("utf-8"))
-            if args.inclusion_proof
-            else None
-        )
+        checkpoint = _read_text(args.checkpoint)
+        start_checkpoint = _read_text(args.start_checkpoint)
+        proof = _read_json(args.inclusion_proof)
+        start_proof = _read_json(args.start_consistency_proof)
+        cp_tokens = [Path(p).read_bytes() for p in args.checkpoint_timestamp]
+        start_tokens = [Path(p).read_bytes() for p in args.start_timestamp]
+        roots = _read_certs(args.tsa_root)
     except (OSError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 2
@@ -904,30 +1395,18 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint=checkpoint,
         inclusion_proof=proof,
         witness_vkeys=args.witness_vkey,
+        checkpoint_timestamps=cp_tokens,
+        tsa_trust_anchors=roots,
+        start_checkpoint=start_checkpoint,
+        start_checkpoint_timestamps=start_tokens,
+        start_consistency_proof=start_proof,
         window=window,
     )
     passed = report["ok"] and (window is None or report["window"]["complete"])
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        status = "OK" if passed else "FAIL"
-        print(f"[{status}] chain {report['chain_id']}  operator {report['operator_fingerprint']}")
-        print(f"  receipts: {report['count']}  seq {report['first_seq']}..{report['last_seq']}"
-              f"  from genesis: {report['starts_at_genesis']}")
-        for gap in report["gaps"]:
-            print(f"  GAP: seq {gap[0]}..{gap[1]} missing")
-        for error in report["errors"]:
-            print(f"  ERROR: {error}")
-        for warning in report["warnings"]:
-            print(f"  warning: {warning}")
-        if report["checkpoint"]:
-            cp = report["checkpoint"]
-            print(f"  checkpoint: verified={cp['verified']} anchored={cp.get('anchored')}"
-                  f" size={cp.get('tree_size')} witnesses={len(cp.get('witnesses', []))}")
-        if report["window"]:
-            w = report["window"]
-            print(f"  window {w['start']}..{w['end']}: complete={w['complete']}"
-                  f" receipts={w['receipts_in_window']}")
+        _print_report(report, passed)
     return 0 if passed else 1
 
 

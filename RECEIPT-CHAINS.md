@@ -41,7 +41,7 @@ the whole receipt, attestation included. So each link also commits to the
 previous receipt's otherwise-unsigned `attested_at`.
 
 Only the operational types `model`, `tool`, `data_flow`, `orchestration` and
-`outcome` are chained. Domain-profile receipts (resolution, identity,
+`outcome` are chained, plus the chain's own `chain_key_rotation` (§1.6). Domain-profile receipts (resolution, identity,
 selection) have strict field sets. A chained signer refuses to sign them
 rather than leave them silently outside the chain.
 
@@ -94,11 +94,33 @@ Given a set of receipts, a verifier:
    - Otherwise it needs an **inclusion proof** for the highest supplied
      `chain_seq ≤ N`. Because of the hash links, that one proof anchors
      every earlier receipt in the contiguous segment.
-6. Optionally checks a time **window** `[start, end]`. The window is covered
-   if the segment starts at genesis or with a receipt whose `chained_at` is
-   before `start`, and ends with a receipt whose `chained_at` is after `end`
-   *or* at a checkpoint head cosigned by a required witness at or after
-   `end`. The bounding receipts can be disclosed: they contain only hashes.
+6. Optionally verifies RFC 3161 timestamp tokens over a checkpoint's body
+   (the three note lines, without signature lines, so a later witness
+   cosignature doesn't change what was timestamped). See TRUSTED-TIME.md.
+7. Optionally checks a time **window** `[start, end]`: are all receipts
+   created in the window in the supplied set? Each edge reports its
+   **basis**, from strongest to weakest:
+
+   | Edge | Basis | Evidence |
+   |---|---|---|
+   | start | `genesis` | the segment starts at `chain_seq` 1 |
+   | start | `trusted_time` | a *start checkpoint* of size `M ≥ first_seq − 1`, with a TSA token or witness cosignature dated at or before `start`, shown consistent with the main checkpoint by a consistency proof. Receipts 1..M existed before the window opened, so anything created later has a higher `chain_seq`. This rests on the TSA or witness, not on the operator. |
+   | start | `signer_clock` | the first receipt's `chained_at` is before `start` |
+   | end | `published_checkpoint` | the segment ends at the head of an anchored checkpoint carrying a TSA token or witness cosignature dated at or after `end` |
+   | end | `signer_clock` | the last receipt's `chained_at` is after `end` |
+
+   A window is `complete` when both edges have a basis and there are no
+   gaps or errors.
+
+   **The end edge is weaker than it looks.** A TSA or witness time is an
+   *upper* bound: it proves the checkpoint existed by then, not that it was
+   the newest checkpoint then. Both end bases assume the operator was honest
+   *at the time*, i.e. it put the current time in `chained_at` and
+   timestamped or witnessed its current checkpoint promptly. That is the
+   threat model chains are built for: logs that are altered *after the
+   fact*, once someone wants something to disappear. An operator dishonest
+   from the start can leave actions out of the chain entirely, and no log
+   format can detect that.
 
 A **consistency proof** (RFC 9162 §2.1.4) shows that a checkpoint of size
 `N` extends an earlier checkpoint of size `M`. A witness checks this before
@@ -121,11 +143,44 @@ cosigning.
 - Anything about the tail after the newest checkpoint someone else holds.
   Publish checkpoints often (for example every N receipts or every minute)
   and send them to a witness, a customer or an auditor.
-- That `chained_at` is true time. It is a signed clock claim. Trusted
-  timestamps (RFC 3161 / eIDAS) and witness cosignature times are the
-  stronger evidence.
+- That `chained_at` is true time. It is a signed clock claim. RFC 3161 /
+  eIDAS timestamps and witness cosignatures on checkpoints are the stronger
+  evidence (§1.4 step 7).
 
-### 1.6 Operator API
+### 1.6 Key rotation and compromise
+
+A chain outlives any one signing key. `ReceiptChain.rotate_key(new_key)`
+appends a chained `chain_key_rotation` receipt, **signed by the outgoing
+key**, with these fields:
+
+| Field | Rule |
+|---|---|
+| `rotation_version` | `"1.0"` |
+| `rotation_reason` | `"scheduled"` or `"compromise"` |
+| `previous_public_key` | the signing key of this receipt |
+| `next_public_key` | the incoming key; signs every later receipt |
+| `next_key_acceptance` | the incoming key's Ed25519 signature over canonical JSON `{chain_id, chain_prev_hash, chain_seq, next_public_key, previous_public_key, purpose: "traceseal-chain-key-acceptance/1"}`, binding its consent to this exact position in this chain |
+| `previous_key_compromised_after_seq` | optional, with `compromise` only: an integer `X` < this `chain_seq` |
+
+Verifiers start from the key that signed the first supplied receipt (or
+the `operator_public_key` they already trust). They accept a different key
+only right after a valid rotation, and treat any other key change as an
+error. A key change hidden inside a gap is a warning, because the rotation
+can't be checked.
+
+`previous_key_compromised_after_seq = X` declares receipts `X+1 .. k−1`
+(where `k` is the rotation's `chain_seq`) untrustworthy. They are listed in
+`compromised_seqs`. The declaration is signed by the compromised key, so an
+attacker holding that key could sign a rotation too. Two different
+rotations at one position are then a fork. The defence is checkpoints that
+reached third parties before the compromise.
+
+Checkpoints are signed by whichever key is current, under that key's
+origin line. Verifiers resolve the signing key from the origin among the
+chain's keys. After a rotation, a C2SP witness therefore sees a new origin.
+The rotation receipt is what links the two.
+
+### 1.7 Operator API
 
 ```python
 from traceseal_observe import OperatorKey, ReceiptChain, observe_anthropic
@@ -137,6 +192,8 @@ signer = chain.signer                    # use wherever an OperatorKey goes
 response, receipt = observe_anthropic(client, request, signer)
 
 checkpoint = chain.checkpoint()          # C2SP note; send it off-box
+token = timestamp_checkpoint(checkpoint, "https://tsa.example/")  # RFC 3161
+chain.rotate_key(new_key)                # chained, dual-signed handover
 proof = chain.inclusion_proof(seq=17)    # for disclosing a partial segment
 consistency = chain.consistency_proof(old_size=100)
 ```
@@ -148,7 +205,7 @@ one chain per worker. The chain stores hashes only, so keeping the receipts
 themselves is the operator's job. A receipt that is signed and then lost
 shows up as a gap, which is the honest result.
 
-### 1.7 Auditor CLI
+### 1.8 Auditor CLI
 
 ```bash
 traceseal-chain verify receipts/*.json --checkpoint checkpoint.txt
@@ -158,7 +215,17 @@ traceseal-chain verify receipts/*.json --checkpoint cp.txt \
 ```
 
 The exit code is 0 only if the chain is complete and, when a window is
-given, the window is covered.
+given, the window is covered. Trusted-time evidence:
+
+```bash
+traceseal-chain timestamp --checkpoint cp.txt --tsa-url https://tsa.example/ --output cp.tsr
+traceseal-chain verify receipts/*.json \
+    --checkpoint cp.txt --checkpoint-timestamp cp.tsr --tsa-root tsa-root.pem \
+    --start-checkpoint cp-0959.txt --start-timestamp cp-0959.tsr \
+    --start-consistency-proof consistency.json \
+    --inclusion-proof proof.json \
+    --window-start 2026-10-01T10:00:00Z --window-end 2026-10-01T12:00:00Z
+```
 
 ---
 
