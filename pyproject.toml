@@ -31,7 +31,14 @@ traceseal-report = "traceseal_observe.report:main"
 
 [project.optional-dependencies]
 timestamp = ["asn1crypto>=1.5"]
-dev = ["pytest>=7.0", "asn1crypto>=1.5"]
+otel = ["opentelemetry-api>=1.20"]
+dev = [
+    "pytest>=7.0",
+    "asn1crypto>=1.5",
+    "anthropic",
+    "openai",
+    "opentelemetry-sdk>=1.20",
+]
 
 [project.urls]
 Homepage = "https://traceseal.io"

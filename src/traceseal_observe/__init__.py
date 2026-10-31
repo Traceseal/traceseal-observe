@@ -728,6 +728,174 @@ _STREAM_NOT_OBSERVED = (
 )
 
 
+@dataclass
+class _ModelCallState:
+    provider: str
+    model: str
+    api_endpoint: str
+    input_hash: str
+    started_at: str
+    t_start: float
+    tools_offered_hash: str
+    tools_offered_count: int | None
+
+
+def _start_model_call(provider, model, api_endpoint, serialize_request, tools) -> _ModelCallState:
+    started_at = _now_iso()
+    t_start = time.monotonic()
+    # Hash the request (and offered tools) before the call, so a failed call
+    # still records what was sent and offered.
+    input_hash = (
+        sha256_of(serialize_request()) if serialize_request is not None else "sha256:empty"
+    )
+    return _ModelCallState(
+        provider=provider,
+        model=model,
+        api_endpoint=api_endpoint,
+        input_hash=input_hash,
+        started_at=started_at,
+        t_start=t_start,
+        tools_offered_hash=tool_definitions_hash(tools) if tools is not None else "",
+        tools_offered_count=len(tools) if tools is not None else None,
+    )
+
+
+def _finish_model_call(
+    state: _ModelCallState,
+    response: Any,
+    operator_key: OperatorKey,
+    *,
+    serialize_response=None,
+    extract_input_tokens=None,
+    extract_output_tokens=None,
+    extract_status_code=None,
+    extract_response_metadata=None,
+) -> tuple[Any, Receipt]:
+    wall_time_ms = int((time.monotonic() - state.t_start) * 1000)
+    common = dict(
+        provider=state.provider,
+        model=state.model,
+        api_endpoint=state.api_endpoint,
+        input_hash=state.input_hash,
+        started_at=state.started_at,
+        wall_time_ms=wall_time_ms,
+        tools_offered_hash=state.tools_offered_hash,
+        tools_offered_count=state.tools_offered_count,
+    )
+    if serialize_response is None and _is_stream_response(response):
+        # Hashing str(stream) would sign a meaningless value (an object
+        # repr). Record honestly that the output was not observed and hand
+        # the unconsumed stream back to the caller.
+        record = ModelCallRecord(
+            **common, output_hash="sha256:empty", ok=False, exit_code=1,
+            error_message=_STREAM_NOT_OBSERVED, response_mode="stream",
+        )
+        return response, sign_model_call(record, operator_key)
+
+    if serialize_response is not None:
+        serialized = serialize_response(response)
+    elif hasattr(response, "model_dump"):
+        serialized = response.model_dump()
+    elif hasattr(response, "to_dict"):
+        serialized = response.to_dict()
+    elif isinstance(response, (dict, list)):
+        serialized = response
+    else:
+        serialized = str(response)
+    output_hash = sha256_of(serialized)
+
+    try:
+        if extract_response_metadata is not None:
+            response_meta = _clean_response_metadata(extract_response_metadata(response))
+        else:
+            response_meta = _default_response_metadata(serialized)
+    except Exception:
+        response_meta = {}
+    try:
+        from traceseal_observe.context import extract_tool_calls
+
+        tool_calls = extract_tool_calls(serialized)
+    except Exception:
+        tool_calls = []
+    try:
+        input_tokens = extract_input_tokens(response) if extract_input_tokens else None
+        output_tokens = extract_output_tokens(response) if extract_output_tokens else None
+    except Exception:
+        input_tokens = None
+        output_tokens = None
+
+    # Application-level failures (401, 429, 500...) even when the transport
+    # succeeded: a model call that returned 401 is not "ok".
+    call_ok, exit_code, error_msg = True, 0, ""
+    if extract_status_code is not None:
+        try:
+            status = extract_status_code(response)
+            if status is not None and status >= 400:
+                call_ok, exit_code, error_msg = False, status, f"HTTP {status}"
+        except Exception:
+            pass
+    else:
+        for attr in ("status_code", "status", "http_status"):
+            code = getattr(response, attr, None)
+            if isinstance(code, int) and code >= 400:
+                call_ok, exit_code, error_msg = False, code, f"HTTP {code}"
+                break
+
+    record = ModelCallRecord(
+        **common,
+        output_hash=output_hash,
+        ok=call_ok,
+        exit_code=exit_code,
+        error_message=error_msg,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        served_model=response_meta.get("served_model", ""),
+        response_id=response_meta.get("response_id", ""),
+        stop_reason=response_meta.get("stop_reason", ""),
+        system_fingerprint=response_meta.get("system_fingerprint", ""),
+        requested_tool_calls=tool_calls or None,
+    )
+    return response, sign_model_call(record, operator_key)
+
+
+def _fail_model_call(state: _ModelCallState, exc: Exception, operator_key: OperatorKey) -> Receipt:
+    record = ModelCallRecord(
+        provider=state.provider,
+        model=state.model,
+        api_endpoint=state.api_endpoint,
+        input_hash=state.input_hash,
+        output_hash="sha256:empty",
+        started_at=state.started_at,
+        wall_time_ms=int((time.monotonic() - state.t_start) * 1000),
+        ok=False,
+        exit_code=1,
+        error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
+        tools_offered_hash=state.tools_offered_hash,
+        tools_offered_count=state.tools_offered_count,
+    )
+    return sign_model_call(record, operator_key)
+
+
+def _client_endpoint(client: Any, default_base: str, path: str) -> str:
+    """The real endpoint for an SDK client, honouring a custom base_url
+    (gateways, Bedrock/Vertex/Azure-compatible proxies). Credentials and
+    query strings in the base URL are never recorded."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    base = getattr(client, "base_url", None)
+    raw = str(base) if base else default_base
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        netloc = host + (f":{parts.port}" if parts.port else "")
+        clean = urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
+    except ValueError:
+        clean = default_base.rstrip("/")
+    return clean + "/" + path.lstrip("/")
+
+
 # ---------------------------------------------------------------------------
 # The high-level API — observe_model_call()
 # ---------------------------------------------------------------------------
@@ -810,152 +978,19 @@ def observe_model_call(
         # Write the receipt for later verification
         Path("receipt.json").write_text(receipt.to_json())
     """
-    started_at = _now_iso()
-    t_start = time.monotonic()
-
-    # Hash the request before making the call
-    if serialize_request is not None:
-        input_hash = sha256_of(serialize_request())
-    else:
-        input_hash = "sha256:empty"
-
-    # Hash the offered tools before the call, so a failed call still
-    # records what the model was offered.
-    tools_offered_hash = tool_definitions_hash(tools) if tools is not None else ""
-    tools_offered_count = len(tools) if tools is not None else None
-
+    state = _start_model_call(provider, model, api_endpoint, serialize_request, tools)
     try:
         response = call()
-        wall_time_ms = int((time.monotonic() - t_start) * 1000)
-
-        if serialize_response is None and _is_stream_response(response):
-            # Hashing str(stream) would sign a meaningless value (an object
-            # repr). Record honestly that the output was not observed and
-            # hand the unconsumed stream back to the caller.
-            record = ModelCallRecord(
-                provider=provider,
-                model=model,
-                api_endpoint=api_endpoint,
-                input_hash=input_hash,
-                output_hash="sha256:empty",
-                started_at=started_at,
-                wall_time_ms=wall_time_ms,
-                ok=False,
-                exit_code=1,
-                error_message=_STREAM_NOT_OBSERVED,
-                tools_offered_hash=tools_offered_hash,
-                tools_offered_count=tools_offered_count,
-                response_mode="stream",
-            )
-            return response, sign_model_call(record, operator_key)
-
-        # Serialize and hash the response
-        if serialize_response is not None:
-            serialized = serialize_response(response)
-        else:
-            # Best-effort serialization
-            if hasattr(response, "model_dump"):
-                serialized = response.model_dump()
-            elif hasattr(response, "to_dict"):
-                serialized = response.to_dict()
-            elif isinstance(response, (dict, list)):
-                serialized = response
-            else:
-                serialized = str(response)
-
-        output_hash = sha256_of(serialized)
-
-        try:
-            if extract_response_metadata is not None:
-                response_meta = _clean_response_metadata(
-                    extract_response_metadata(response)
-                )
-            else:
-                response_meta = _default_response_metadata(serialized)
-        except Exception:
-            response_meta = {}
-        try:
-            from traceseal_observe.context import extract_tool_calls
-
-            tool_calls = extract_tool_calls(serialized)
-        except Exception:
-            tool_calls = []
-
-        # Extract token counts if available
-        try:
-            input_tokens = extract_input_tokens(response) if extract_input_tokens else None
-            output_tokens = extract_output_tokens(response) if extract_output_tokens else None
-        except Exception:
-            input_tokens = None
-            output_tokens = None
-
-        # Detect application-level failures (e.g. 401, 403, 429, 500)
-        # even when the HTTP transport succeeded. A model call that
-        # returns 401 is not "ok" from the operator's perspective.
-        call_ok = True
-        exit_code = 0
-        error_msg = ""
-        if extract_status_code is not None:
-            try:
-                status = extract_status_code(response)
-                if status is not None and status >= 400:
-                    call_ok = False
-                    exit_code = status
-                    error_msg = f"HTTP {status}"
-            except Exception:
-                pass  # Can't extract status — assume success
-        else:
-            # Best-effort: check common attributes
-            for attr in ("status_code", "status", "http_status"):
-                code = getattr(response, attr, None)
-                if isinstance(code, int) and code >= 400:
-                    call_ok = False
-                    exit_code = code
-                    error_msg = f"HTTP {code}"
-                    break
-
-        record = ModelCallRecord(
-            provider=provider,
-            model=model,
-            api_endpoint=api_endpoint,
-            input_hash=input_hash,
-            output_hash=output_hash,
-            started_at=started_at,
-            wall_time_ms=wall_time_ms,
-            ok=call_ok,
-            exit_code=exit_code,
-            error_message=error_msg,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            tools_offered_hash=tools_offered_hash,
-            tools_offered_count=tools_offered_count,
-            served_model=response_meta.get("served_model", ""),
-            response_id=response_meta.get("response_id", ""),
-            stop_reason=response_meta.get("stop_reason", ""),
-            system_fingerprint=response_meta.get("system_fingerprint", ""),
-            requested_tool_calls=tool_calls or None,
+        return _finish_model_call(
+            state, response, operator_key,
+            serialize_response=serialize_response,
+            extract_input_tokens=extract_input_tokens,
+            extract_output_tokens=extract_output_tokens,
+            extract_status_code=extract_status_code,
+            extract_response_metadata=extract_response_metadata,
         )
-
-        return response, sign_model_call(record, operator_key)
-
     except Exception as exc:
-        wall_time_ms = int((time.monotonic() - t_start) * 1000)
-        record = ModelCallRecord(
-            provider=provider,
-            model=model,
-            api_endpoint=api_endpoint,
-            input_hash=input_hash,
-            output_hash="sha256:empty",
-            started_at=started_at,
-            wall_time_ms=wall_time_ms,
-            ok=False,
-            exit_code=1,
-            error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
-            tools_offered_hash=tools_offered_hash,
-            tools_offered_count=tools_offered_count,
-        )
-        receipt = sign_model_call(record, operator_key)
-        return None, receipt
+        return None, _fail_model_call(state, exc, operator_key)
 
 
 # ---------------------------------------------------------------------------
@@ -1278,7 +1313,7 @@ def observe_anthropic(
     return observe_model_call(
         provider="anthropic",
         model=request.get("model", "unknown"),
-        api_endpoint="https://api.anthropic.com/v1/messages",
+        api_endpoint=_client_endpoint(client, "https://api.anthropic.com", "v1/messages"),
         operator_key=operator_key,
         call=lambda: client.messages.create(**request),
         serialize_request=lambda: request,
@@ -1313,7 +1348,7 @@ def observe_openai(
     return observe_model_call(
         provider="openai",
         model=request.get("model", "unknown"),
-        api_endpoint="https://api.openai.com/v1/chat/completions",
+        api_endpoint=_client_endpoint(client, "https://api.openai.com/v1", "chat/completions"),
         operator_key=operator_key,
         call=lambda: client.chat.completions.create(**request),
         serialize_request=lambda: request,
@@ -1343,7 +1378,7 @@ def observe_anthropic_stream(
     return observe_model_stream(
         provider="anthropic",
         model=request.get("model", "unknown"),
-        api_endpoint="https://api.anthropic.com/v1/messages",
+        api_endpoint=_client_endpoint(client, "https://api.anthropic.com", "v1/messages"),
         operator_key=operator_key,
         call=lambda: client.messages.create(**sent),
         serialize_request=lambda: sent,
@@ -1365,7 +1400,7 @@ def observe_openai_stream(
     return observe_model_stream(
         provider="openai",
         model=request.get("model", "unknown"),
-        api_endpoint="https://api.openai.com/v1/chat/completions",
+        api_endpoint=_client_endpoint(client, "https://api.openai.com/v1", "chat/completions"),
         operator_key=operator_key,
         call=lambda: client.chat.completions.create(**sent),
         serialize_request=lambda: sent,
@@ -1509,6 +1544,82 @@ def sign_tool_call(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _ToolCallState:
+    tool_name: str
+    transport: str
+    input_hash: str
+    started_at: str
+    t_start: float
+    tool_version: str
+    endpoint: str
+    tool_definition_hash: str
+
+
+def _start_tool_call(tool_name, transport, args, tool_version, endpoint,
+                     serialize_input, tool_definition) -> _ToolCallState:
+    tool_definition_hash = sha256_of(tool_definition) if tool_definition is not None else ""
+    started_at = _now_iso()
+    t_start = time.monotonic()
+    if serialize_input is not None:
+        input_hash = sha256_of(serialize_input())
+    elif args is not None:
+        input_hash = sha256_of(args)
+    else:
+        input_hash = "sha256:empty"
+    return _ToolCallState(tool_name, transport, input_hash, started_at, t_start,
+                          tool_version, endpoint, tool_definition_hash)
+
+
+def _finish_tool_call(state: _ToolCallState, result: Any, operator_key: OperatorKey,
+                      serialize_output=None) -> Receipt:
+    wall_time_ms = int((time.monotonic() - state.t_start) * 1000)
+    if serialize_output is not None:
+        serialized = serialize_output(result)
+    elif result is None:
+        serialized = None
+    elif isinstance(result, (dict, list, str, int, float, bool)):
+        serialized = result
+    elif hasattr(result, "model_dump"):
+        serialized = result.model_dump()
+    elif hasattr(result, "to_dict"):
+        serialized = result.to_dict()
+    else:
+        serialized = str(result)
+    record = ToolCallRecord(
+        tool_name=state.tool_name,
+        transport=state.transport,
+        input_hash=state.input_hash,
+        output_hash="sha256:empty" if serialized is None else sha256_of(serialized),
+        started_at=state.started_at,
+        wall_time_ms=wall_time_ms,
+        ok=True,
+        exit_code=0,
+        tool_version=state.tool_version,
+        endpoint=state.endpoint,
+        tool_definition_hash=state.tool_definition_hash,
+    )
+    return sign_tool_call(record, operator_key)
+
+
+def _fail_tool_call(state: _ToolCallState, exc: Exception, operator_key: OperatorKey) -> Receipt:
+    record = ToolCallRecord(
+        tool_name=state.tool_name,
+        transport=state.transport,
+        input_hash=state.input_hash,
+        output_hash="sha256:empty",
+        started_at=state.started_at,
+        wall_time_ms=int((time.monotonic() - state.t_start) * 1000),
+        ok=False,
+        exit_code=1,
+        error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
+        tool_version=state.tool_version,
+        endpoint=state.endpoint,
+        tool_definition_hash=state.tool_definition_hash,
+    )
+    return sign_tool_call(record, operator_key)
+
+
 def observe_tool(
     tool_name: str,
     operator_key: OperatorKey,
@@ -1564,76 +1675,13 @@ def observe_tool(
             transport="python",
         )
     """
-    tool_definition_hash = (
-        sha256_of(tool_definition) if tool_definition is not None else ""
-    )
-    started_at = _now_iso()
-    t_start = time.monotonic()
-
-    # Hash the input
-    if serialize_input is not None:
-        input_hash = sha256_of(serialize_input())
-    elif args is not None:
-        input_hash = sha256_of(args)
-    else:
-        input_hash = "sha256:empty"
-
+    state = _start_tool_call(tool_name, transport, args, tool_version, endpoint,
+                             serialize_input, tool_definition)
     try:
         result = call()
-        wall_time_ms = int((time.monotonic() - t_start) * 1000)
-
-        # Serialize and hash the output
-        if serialize_output is not None:
-            serialized = serialize_output(result)
-        elif result is None:
-            serialized = None
-        elif isinstance(result, (dict, list, str, int, float, bool)):
-            serialized = result
-        elif hasattr(result, "model_dump"):
-            serialized = result.model_dump()
-        elif hasattr(result, "to_dict"):
-            serialized = result.to_dict()
-        else:
-            serialized = str(result)
-
-        # Compute output hash. sha256_of handles None as empty.
-        if serialized is None:
-            output_hash = "sha256:empty"
-        else:
-            output_hash = sha256_of(serialized)
-
-        record = ToolCallRecord(
-            tool_name=tool_name,
-            transport=transport,
-            input_hash=input_hash,
-            output_hash=output_hash,
-            started_at=started_at,
-            wall_time_ms=wall_time_ms,
-            ok=True,
-            exit_code=0,
-            tool_version=tool_version,
-            endpoint=endpoint,
-            tool_definition_hash=tool_definition_hash,
-        )
-        return result, sign_tool_call(record, operator_key)
-
+        return result, _finish_tool_call(state, result, operator_key, serialize_output)
     except Exception as exc:
-        wall_time_ms = int((time.monotonic() - t_start) * 1000)
-        record = ToolCallRecord(
-            tool_name=tool_name,
-            transport=transport,
-            input_hash=input_hash,
-            output_hash="sha256:empty",
-            started_at=started_at,
-            wall_time_ms=wall_time_ms,
-            ok=False,
-            exit_code=1,
-            error_message=_redact_error(f"{type(exc).__name__}: {str(exc)}"),
-            tool_version=tool_version,
-            endpoint=endpoint,
-            tool_definition_hash=tool_definition_hash,
-        )
-        return None, sign_tool_call(record, operator_key)
+        return None, _fail_tool_call(state, exc, operator_key)
 
 
 # ---------------------------------------------------------------------------
@@ -3115,3 +3163,13 @@ from traceseal_observe.oversight import (  # noqa: E402
 
 # RFC 3161 support lives in traceseal_observe.timestamp and needs the optional
 # asn1crypto dependency: pip install "traceseal-observe[timestamp]"
+from traceseal_observe.aio import (  # noqa: E402
+    AsyncObservedModelStream,
+    aobserve_anthropic,
+    aobserve_anthropic_stream,
+    aobserve_model_call,
+    aobserve_model_stream,
+    aobserve_openai,
+    aobserve_openai_stream,
+    aobserve_tool,
+)
