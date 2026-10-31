@@ -477,7 +477,15 @@ def sign_execution_receipt(
 # Operational receipt types that describe what an agent did. Only these are
 # appended to a ReceiptChain (see traceseal_observe.chain).
 CHAINABLE_RECEIPT_TYPES = frozenset(
-    {"model", "tool", "data_flow", "orchestration", "outcome"}
+    {
+        "model",
+        "tool",
+        "data_flow",
+        "orchestration",
+        "outcome",
+        "oversight",
+        "policy_decision",
+    }
 )
 
 
@@ -3094,6 +3102,11 @@ from traceseal_observe.context import (  # noqa: E402
     agent_context,
     caused_by,
     requested_tool_calls,
+)
+from traceseal_observe.oversight import (  # noqa: E402
+    observe_policy,
+    sign_oversight,
+    sign_policy_decision,
 )
 
 # RFC 3161 support lives in traceseal_observe.timestamp and needs the optional

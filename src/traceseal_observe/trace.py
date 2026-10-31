@@ -158,7 +158,8 @@ def _label(receipt: Receipt) -> str:
     ex = receipt.execution
     kind = ex.get("receipt_type", "?")
     name = ex.get("tool_name") or ex.get("model") or ex.get("workflow_name") or ex.get(
-        "destination_host") or ex.get("outcome_status") or ""
+        "destination_host") or ex.get("outcome_status") or ex.get("policy_id") or ex.get(
+        "decision") or ""
     seq = ex.get("chain_seq")
     return f"{kind}:{name}" + (f"#{seq}" if seq is not None else "")
 
@@ -167,13 +168,25 @@ def verify_trace(
     receipts: list[Receipt],
     *,
     required_scopes: dict[str, str | list[str]] | None = None,
+    require_approval: Any = (),
+    require_policy: dict[str, str] | None = None,
+    min_review_seconds: int | None = None,
 ) -> dict[str, Any]:
-    """Verify context, causality and authorisation across receipts.
+    """Verify context, causality, authorisation and oversight across receipts.
 
     required_scopes maps a tool_name to the scope (or list of scopes, all
     required) its receipts' context.authorization must carry.
-    Never raises on bad input; read report["ok"], ["errors"], ["findings"].
+    require_approval: tool names that must cite a human approval
+    (oversight receipt with decision approved/modified covering the call).
+    require_policy maps a tool_name to a policy_id whose non-deny decision
+    the tool receipt must cite.
+    min_review_seconds: flag human reviews faster than this (rubber-stamping).
+    Never raises on bad input; read report["ok"], ["errors"], ["warnings"].
     """
+    from traceseal_observe.oversight import check_oversight, check_policy_decision
+
+    require_approval = set(require_approval or ())
+    require_policy = dict(require_policy or {})
     report: dict[str, Any] = {
         "ok": False,
         "count": 0,
@@ -187,6 +200,8 @@ def verify_trace(
         "unprompted_tool_receipts": [],
         "agents": {},
         "principals": {},
+        "oversight": [],
+        "policy_decisions": [],
     }
     errors, warnings = report["errors"], report["warnings"]
     if not isinstance(receipts, list) or not receipts:
@@ -194,6 +209,8 @@ def verify_trace(
         return report
 
     by_hash: dict[str, Receipt] = {}
+    oversight: dict[str, dict[str, Any]] = {}
+    policies: dict[str, dict[str, Any]] = {}
     contexts: dict[str, dict[str, Any]] = {}
     calls_by_model: dict[str, list[dict[str, str]]] = {}
     for index, receipt in enumerate(receipts):
@@ -217,12 +234,51 @@ def verify_trace(
                 contexts[digest] = check_context(ctx)
             except TraceError as exc:
                 errors.append(f"{label}: {exc}")
-        if receipt.execution.get("receipt_type") == "model":
+        rtype = receipt.execution.get("receipt_type")
+        if rtype == "model":
             try:
                 calls_by_model[digest] = _requested_calls(receipt)
             except TraceError as exc:
                 errors.append(f"{label}: {exc}")
+        elif rtype == "oversight":
+            try:
+                oversight[digest] = check_oversight(receipt)
+            except ValueError as exc:
+                errors.append(f"{label}: {exc}")
+        elif rtype == "policy_decision":
+            try:
+                policies[digest] = check_policy_decision(receipt)
+            except ValueError as exc:
+                errors.append(f"{label}: {exc}")
     report["count"] = len(by_hash)
+
+    for item in oversight.values():
+        report["oversight"].append({k: v for k, v in item.items() if k != "decided_at_dt"})
+        if (
+            min_review_seconds is not None
+            and item["decision"] in ("approved", "modified")
+            and item["review_seconds"] is not None
+            and item["review_seconds"] < min_review_seconds
+        ):
+            warnings.append(
+                f"oversight {item['hash'][:15]}: approved after {item['review_seconds']}s "
+                f"(below {min_review_seconds}s; possible rubber-stamping)"
+            )
+    report["policy_decisions"] = list(policies.values())
+    # Human rejections of specific requested calls, whether or not cited.
+    rejected_calls = {
+        (subject, call_id)
+        for item in oversight.values() if item["decision"] == "rejected"
+        for subject in item["subjects"] for call_id in item["tool_call_ids"]
+    }
+    stops = sorted(
+        (
+            (contexts.get(item["hash"], {}).get("session_id"), item["decided_at_dt"], item["decision"])
+            for item in oversight.values()
+            if item["decision"] in ("stopped", "resumed")
+        ),
+        key=lambda t: t[1],
+    )
 
     executed: set[tuple[str, str]] = set()
     for digest, receipt in by_hash.items():
@@ -266,11 +322,46 @@ def verify_trace(
             if missing:
                 errors.append(f"{label}: missing required scope(s) {missing}")
 
-        # -- tool calls ---------------------------------------------------
-        if receipt.execution.get("receipt_type") != "tool":
+        # -- stops: nothing may act in a session a human stopped ------------
+        session = ctx.get("session_id")
+        rtype = receipt.execution.get("receipt_type")
+        if session and when is not None and rtype not in ("oversight",):
+            state = "running"
+            for stop_session, stop_time, stop_decision in stops:
+                if stop_session == session and stop_time <= when:
+                    state = stop_decision
+            if state == "stopped":
+                errors.append(f"{label}: acted in session {session!r} after a human stopped it")
+
+        if rtype != "tool":
             continue
-        model_causes = [c for c in causes if c in calls_by_model]
         call_id = ctx.get("tool_call_id")
+
+        # -- policy decisions cited by this action -------------------------
+        cited_policies = [policies[c] for c in causes if c in policies]
+        for policy in cited_policies:
+            if policy["decision"] == "deny":
+                errors.append(f"{label}: executed although policy {policy['policy_id']!r} denied it")
+        if tool_name in require_policy:
+            wanted = require_policy[tool_name]
+            if not any(p["policy_id"] == wanted and p["decision"] != "deny" for p in cited_policies):
+                errors.append(f"{label}: does not cite a passing {wanted!r} policy decision")
+
+        # -- human oversight cited by this action --------------------------
+        cited = [
+            oversight[c] for c in causes if c in oversight
+            and (not oversight[c]["tool_call_ids"] or call_id in oversight[c]["tool_call_ids"])
+        ]
+        approvals = [o for o in cited if o["decision"] in ("approved", "modified")]
+        for o in cited:
+            if o["decision"] in ("rejected", "stopped"):
+                errors.append(f"{label}: executed although a human decision was {o['decision']!r}")
+        if tool_name in require_approval and not approvals:
+            errors.append(f"{label}: requires human approval but cites none")
+        human_modified = {o["modified_input_hash"] for o in approvals if o["modified_input_hash"]}
+
+        # -- tool calls requested by a model -------------------------------
+        model_causes = [c for c in causes if c in calls_by_model]
         if not model_causes:
             if call_id is not None and not causes:
                 warnings.append(f"{label}: tool_call_id without caused_by; cannot check it")
@@ -281,21 +372,35 @@ def verify_trace(
             warnings.append(f"{label}: caused by a model receipt but has no tool_call_id")
             continue
         for model_hash in model_causes:
+            if (model_hash, call_id) in rejected_calls:
+                errors.append(f"{label}: executed call {call_id!r}, which a human rejected")
             match = next((c for c in calls_by_model[model_hash] if c["id"] == call_id), None)
             entry = {"tool_receipt": digest, "model_receipt": model_hash, "tool_call_id": call_id}
+            input_hash = receipt.execution.get("input_hash")
             if match is None:
                 entry["status"] = "not_requested"
                 errors.append(f"{label}: tool_call_id {call_id!r} was not requested by the cited model response")
             else:
                 executed.add((model_hash, call_id))
-                if match["input_hash"] != receipt.execution.get("input_hash"):
+                if human_modified:
+                    if input_hash in human_modified:
+                        entry["status"] = "human_modified"
+                    else:
+                        entry["status"] = "arguments_differ"
+                        errors.append(f"{label}: did not run with the arguments the reviewer approved")
+                elif match["input_hash"] != input_hash:
                     entry["status"] = "arguments_differ"
-                    warnings.append(f"{label}: ran with different arguments than the model requested")
+                    if approvals:
+                        errors.append(f"{label}: ran with arguments the reviewer did not approve")
+                    else:
+                        warnings.append(f"{label}: ran with different arguments than the model requested")
                 elif match["name"] != tool_name:
                     entry["status"] = "name_differs"
                     warnings.append(f"{label}: model asked for {match['name']!r}, receipt names {tool_name!r}")
                 else:
                     entry["status"] = "matched"
+            if approvals:
+                entry["approved_by"] = [o["hash"] for o in approvals]
             report["tool_calls"].append(entry)
 
     for model_hash, calls in calls_by_model.items():
@@ -344,6 +449,11 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("receipts", nargs="+")
     v.add_argument("--require-scope", action="append", default=[],
                    metavar="TOOL=SCOPE", help="require SCOPE on every TOOL receipt")
+    v.add_argument("--require-approval", action="append", default=[], metavar="TOOL",
+                   help="TOOL receipts must cite a human approval")
+    v.add_argument("--require-policy", action="append", default=[], metavar="TOOL=POLICY",
+                   help="TOOL receipts must cite a passing POLICY decision")
+    v.add_argument("--min-review-seconds", type=int)
     v.add_argument("--json", action="store_true")
     f = sub.add_parser("find-principal", help="list receipts about one principal")
     f.add_argument("receipts", nargs="+")
@@ -375,7 +485,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[ERROR] --require-scope expects TOOL=SCOPE, got {item!r}", file=sys.stderr)
             return 2
         required.setdefault(tool, []).append(scope)
-    report = verify_trace(receipts, required_scopes=required)
+    policies_required = {}
+    for item in args.require_policy:
+        tool, _, policy = item.partition("=")
+        if not tool or not policy:
+            print(f"[ERROR] --require-policy expects TOOL=POLICY, got {item!r}", file=sys.stderr)
+            return 2
+        policies_required[tool] = policy
+    report = verify_trace(receipts, required_scopes=required,
+                          require_approval=args.require_approval,
+                          require_policy=policies_required,
+                          min_review_seconds=args.min_review_seconds)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["ok"] else 1
@@ -388,6 +508,12 @@ def main(argv: list[str] | None = None) -> int:
     for call in report["unexecuted_tool_calls"]:
         print(f"  requested, not executed: {call['name']} [{call['id']}]"
               f" from {labels.get(call['model_receipt'])}")
+    for item in report["oversight"]:
+        signed = "reviewer-signed" if item["reviewer_signed"] else "operator-attested"
+        took = f", {item['review_seconds']}s review" if item["review_seconds"] is not None else ""
+        print(f"  human {item['decision']} ({signed}{took})")
+    for item in report["policy_decisions"]:
+        print(f"  policy {item['policy_id']}: {item['decision']} at {item['stage']}")
     for digest in report["unprompted_tool_receipts"]:
         print(f"  unprompted (no model cause): {labels.get(digest)}")
     for error in report["errors"]:
