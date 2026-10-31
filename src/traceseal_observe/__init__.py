@@ -486,6 +486,8 @@ CHAINABLE_RECEIPT_TYPES = frozenset(
         "oversight",
         "policy_decision",
         "erasure",
+        "incident",
+        "evidence_pack",
     }
 )
 
@@ -3104,6 +3106,7 @@ from traceseal_observe.context import (  # noqa: E402
     caused_by,
     requested_tool_calls,
 )
+from traceseal_observe.incident import reporting_deadlines, sign_incident  # noqa: E402
 from traceseal_observe.oversight import (  # noqa: E402
     observe_policy,
     sign_oversight,
