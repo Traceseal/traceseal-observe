@@ -73,7 +73,8 @@ LEGAL_NOTICE = (
 
 
 def reporting_deadlines(
-    category: str, aware_at: str, *, death: bool = False, widespread: bool = False
+    category: str, aware_at: str, *, death: bool = False, widespread: bool = False,
+    classified_at: str | None = None,
 ) -> list[dict[str, str]]:
     """Statutory notification deadlines that run from awareness.
 
@@ -92,8 +93,12 @@ def reporting_deadlines(
       and within 24 hours, incident notification within 72 hours.
     major_ict_incident (DORA Art. 19, Delegated Regulation (EU) 2025/301
       Art. 5): initial notification within 4 hours of classifying the
-      incident as major and no later than 24 hours after awareness. Only the
-      24-hour outer limit can be computed from aware_at.
+      incident as major and no later than 24 hours after awareness; if the
+      incident is classified as major only after those 24 hours, within 4
+      hours of that classification (Art. 5(2)). Pass classified_at to get
+      the actual deadline. Without it the due time is the 24-hour limit,
+      marked "definitive": "false", and incident_status() reports it as
+      unconfirmed rather than missed.
 
     Follow-up obligations without a fixed time from awareness (GDPR Art. 34,
     NIS2 final report, DORA intermediate and final reports) are returned by
@@ -101,6 +106,8 @@ def reporting_deadlines(
     """
     if category not in INCIDENT_CATEGORIES:
         raise ValueError(f"category must be one of {sorted(INCIDENT_CATEGORIES)}")
+    if classified_at is not None and category != "major_ict_incident":
+        raise ValueError("classified_at applies to major_ict_incident only")
     aware = _utc(aware_at, "aware_at")
     out: list[dict[str, str]] = []
     if category == "serious_incident":
@@ -132,13 +139,25 @@ def reporting_deadlines(
                     "qualifier": "without undue delay and in any event within 72 hours; "
                                  "national transposition may add requirements."})
     elif category == "major_ict_incident":
-        out.append({"regime": "DORA", "step": "initial notification",
-                    "basis": "DORA Art. 19(4); Delegated Regulation (EU) 2025/301 Art. 5",
-                    "due": _fmt(aware + timedelta(hours=24)),
-                    "qualifier": "within 4 hours of classifying the incident as major, and no later "
-                                 "than 24 hours after awareness; the due time is the 24-hour outer "
-                                 "limit only. Check the current RTS text and your competent "
-                                 "authority's procedures."})
+        rule = ("within 4 hours of classifying the incident as major, and no later than 24 hours "
+                "after awareness; where it is classified as major only after 24 hours, within 4 "
+                "hours of that classification (Art. 5(2)). Check the current RTS text and your "
+                "competent authority's procedures.")
+        entry = {"regime": "DORA", "step": "initial notification",
+                 "basis": "DORA Art. 19(4); Delegated Regulation (EU) 2025/301 Art. 5"}
+        if classified_at is None:
+            entry.update(due=_fmt(aware + timedelta(hours=24)), definitive="false",
+                         qualifier=rule + " Classification time not recorded: the due time is "
+                                          "the 24-hour limit and may be earlier or later.")
+        else:
+            classified = _utc(classified_at, "classified_at")
+            if classified < aware:
+                raise ValueError("classified_at is before aware_at")
+            outer = aware + timedelta(hours=24)
+            four = classified + timedelta(hours=4)
+            due = four if classified > outer else min(four, outer)
+            entry.update(due=_fmt(due), classified_at=classified_at, qualifier=rule)
+        out.append(entry)
     return out
 
 
@@ -212,6 +231,7 @@ def sign_incident(
     supersedes: Any = None,
     death: bool = False,
     widespread: bool = False,
+    classified_at: str | None = None,
 ) -> Any:
     """Sign an incident record (one per stage; link stages with supersedes).
 
@@ -267,9 +287,12 @@ def sign_incident(
         if _utc(reported_at, "reported_at") < aware:
             raise ValueError("reported_at is before aware_at")
         execution["reported_at"] = reported_at
+    if classified_at is not None:
+        execution["classified_at"] = classified_at
     if supersedes is not None:
         execution["supersedes"] = _receipt_hash(supersedes)
-    deadlines = reporting_deadlines(category, aware_at, death=death, widespread=widespread)
+    deadlines = reporting_deadlines(category, aware_at, death=death, widespread=widespread,
+                                    classified_at=classified_at)
     if deadlines:
         execution["deadlines"] = deadlines
     related = related_obligations(category)
@@ -277,6 +300,32 @@ def sign_incident(
         execution["related_obligations"] = related
     provenance = {"provenance_version": "1.0", "provider_attestation": "none"}
     return sign_execution_receipt(execution, provenance, operator_key)
+
+
+def _definitive(d: dict[str, str], category: Any) -> bool:
+    # 1.5.1 DORA records carry no classification time and no flag.
+    if d.get("definitive") == "false":
+        return False
+    return not (category == "major_ict_incident" and "classified_at" not in d)
+
+
+def _strictest_deadlines(history: list[Any]) -> list[dict[str, str]]:
+    """Resolve each (regime, step) deadline across every stage of an incident.
+
+    A later stage must not loosen a deadline an earlier stage established
+    (for example a closing record that omits death, widespread or
+    classified_at). Definitive deadlines win over unconfirmed ones; among
+    the same kind, the earliest due time wins."""
+    best: dict[tuple[str, str], dict[str, str]] = {}
+    for h in history:
+        category = h.execution.get("category")
+        for d in h.execution.get("deadlines", []):
+            key = (d.get("regime", ""), d.get("step", ""))
+            rank = (0 if _definitive(d, category) else 1, _utc(d["due"], "due"))
+            cur = best.get(key)
+            if cur is None or rank < (0 if _definitive(cur, category) else 1, _utc(cur["due"], "due")):
+                best[key] = d
+    return list(best.values())
 
 
 def incident_status(incidents: list[Any], *, now: str | None = None) -> list[dict[str, Any]]:
@@ -299,8 +348,17 @@ def incident_status(incidents: list[Any], *, now: str | None = None) -> list[dic
         reported = [h.execution["reported_at"] for h in history if "reported_at" in h.execution]
         first_report = min(reported) if reported else None
         overdue = []
-        for d in r.execution.get("deadlines", []):
+        unconfirmed = []
+        deadlines = _strictest_deadlines(history)
+        for d in deadlines:
             due = _utc(d["due"], "due")
+            if not _definitive(d, r.execution.get("category")):
+                # The real deadline depends on a fact the record doesn't hold
+                # (e.g. DORA classification time): never call it missed.
+                if (first_report is not None and _utc(first_report, "reported_at") > due) or (
+                        first_report is None and moment > due):
+                    unconfirmed.append({**d, "first_reported_at": first_report})
+                continue
             if first_report is not None:
                 if _utc(first_report, "reported_at") > due:
                     overdue.append({**d, "reported_late": first_report})
@@ -315,8 +373,9 @@ def incident_status(incidents: list[Any], *, now: str | None = None) -> list[dic
             "aware_at": r.execution.get("aware_at"),
             "first_reported_at": first_report,
             "stages": len(history),
-            "deadlines": r.execution.get("deadlines", []),
+            "deadlines": deadlines,
             "missed_deadlines": overdue,
+            "unconfirmed_deadlines": unconfirmed,
             "related_obligations": r.execution.get("related_obligations", []),
             "affected_receipts": r.execution.get("affected_receipt_hashes", []),
         })

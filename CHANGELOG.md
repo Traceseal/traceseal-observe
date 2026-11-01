@@ -5,6 +5,24 @@ All notable changes to `traceseal-observe`. Format follows
 keeps the `RECEIPT-SPEC.md` v1.0 envelope: receipts from earlier versions
 verify unchanged, and new receipts verify with any v1 verifier.
 
+## [1.5.2] — 2026-11-01
+
+### Fixed
+- **DORA late classification.** A major ICT incident classified as major
+  more than 24 hours after awareness may be notified within 4 hours of that
+  classification (Delegated Regulation (EU) 2025/301 Art. 5(2)). 1.5.1
+  flagged such timely notifications as late and failed the evidence pack.
+  - `reporting_deadlines()` and `sign_incident()` take `classified_at` and
+    compute the actual deadline.
+  - Without it, the 24-hour limit is marked `"definitive": "false"`, and
+    `incident_status()` reports it under `unconfirmed_deadlines`, never as
+    missed. This also applies to records signed with 1.5.1.
+- **Deadlines across incident stages.** `incident_status()` read deadlines
+  from the latest stage only, so a later record that omitted `death`,
+  `widespread` or `classified_at` loosened the deadline and could turn a
+  failing pack into a passing one. Deadlines are now resolved across the
+  whole incident history, keeping the strictest one known.
+
 ## [1.5.1] — 2026-11-01
 
 Legal-accuracy review of every regulatory reference. No change to receipt
