@@ -450,3 +450,13 @@ def test_circular_execution_fails_instead_of_hanging():
     r.execution["loop"] = r.execution
     with pytest.raises(ValueError, match="circular"):
         verify_receipt_signature(r)
+
+
+def test_tuple_with_boolean_is_refused_at_signing():
+    import pytest
+    from traceseal_observe import OperatorKey, sign_execution_receipt
+
+    k = OperatorKey.generate()
+    with pytest.raises(ValueError, match="RECEIPT-SPEC"):
+        sign_execution_receipt({"receipt_type": "tool", "metadata": (True,)},
+                               {"provenance_version": "1.0"}, k)

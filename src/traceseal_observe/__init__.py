@@ -753,7 +753,7 @@ def _forbidden_json_value(value: Any, path: str = "") -> str | None:
     def walk(item: Any, where: str, depth: int) -> str | None:
         if item is None or isinstance(item, bool):
             return where or "/"
-        if isinstance(item, (dict, list)):
+        if isinstance(item, (dict, list, tuple)):
             if depth > 64:
                 return f"{where or '/'} (nested too deeply)"
             if id(item) in on_path:
@@ -860,16 +860,21 @@ def sign_execution_receipt(
         raise ValueError("execution.receipt_type is required")
     # Refuse what every verifier would reject (RECEIPT-SPEC §3): booleans,
     # nulls, circular values. Use strings such as "true" / "false".
-    # Exactly the envelope the verifier checks (same depth accounting).
+    # Check before encoding (catches cycles/absurd depth cheaply), then
+    # check the normalised JSON that is actually signed, exactly as the
+    # verifier sees it (tuples become lists, etc.).
     forbidden = _forbidden_json_value({"execution": execution, "provenance": provenance})
+    if not forbidden:
+        try:
+            execution_copy = json.loads(canonical_dumps(execution))
+            provenance_copy = json.loads(canonical_dumps(provenance))
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("receipt body is not canonical JSON") from exc
+        forbidden = _forbidden_json_value({"execution": execution_copy,
+                                           "provenance": provenance_copy})
     if forbidden:
         raise ValueError(f"cannot sign: JSON boolean, null or circular value at {forbidden} "
                          "(RECEIPT-SPEC §3; use strings such as \"true\")")
-    try:
-        execution_copy = json.loads(canonical_dumps(execution))
-        provenance_copy = json.loads(canonical_dumps(provenance))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("receipt body is not canonical JSON") from exc
 
     # Domain profile validation happens before signing.  Historical receipts
     # without a profile marker remain valid; profile 1.1 opts into strict,
