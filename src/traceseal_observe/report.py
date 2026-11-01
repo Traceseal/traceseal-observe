@@ -374,7 +374,7 @@ def analyse(
         and not foreign
         and all(rep["ok"] for rep in chain_reports.values())
         and trace["ok"]
-        and not any(i.get("missed_deadlines") for i in incidents)
+        and not any(i.get("missed_deadlines") or i.get("problems") for i in incidents)
     )
     return summary
 
@@ -427,7 +427,9 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
                  + ([f"{len(foreign)} receipt(s) signed by a key outside the pinned operator keys"]
                     if foreign else []))
     missed = [f"{i.get('category')} {str(i.get('head', ''))[:15]}: {d.get('basis')} due {d.get('due')}"
-              for i in s["incidents"] for d in i.get("missed_deadlines", [])]
+              for i in s["incidents"] for d in i.get("missed_deadlines", [])] + [
+        f"{i.get('category')} {str(i.get('head', ''))[:15]}: {p}"
+        for i in s["incidents"] for p in i.get("problems", [])]
     # An incident receipt that could not be analysed may belong to any regime.
     incident_failures = [f for f in s.get("analysis_failures") or [] if f.startswith("incidents")]
     ops = sum(n for t, n in s["by_type"].items() if t not in ("skill",))
@@ -475,7 +477,7 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
         control("EU AI Act", "Art. 14 / 26(2)", "Human oversight",
                 _status(bool(trace["oversight"]), oversight_errors),
                 f"{len(trace['oversight'])} human decisions "
-                f"({sum(1 for o in trace['oversight'] if o['reviewer_signed'])} reviewer-signed).",
+                f"({sum(1 for o in trace['oversight'] if o['reviewer_signed'] is True)} reviewer-signed).",
                 "Records that oversight took place; whether the oversight measures and the "
                 "reviewers' competence meet Art. 14 and 26(2) is not assessed.",
                 "Art. 14: providers (design). Art. 26(2): deployers (assigning competent people). "

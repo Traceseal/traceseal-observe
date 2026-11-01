@@ -19,7 +19,15 @@ Checks, for every receipt carrying a signed `context` (see context.py):
   - tool receipts with no model cause ("unprompted": the agent's own code
     acted, not the model);
   - authorisation: actions after `authorization.expires_at`, and, given
-    `required_scopes`, actions whose context lacks the required scope.
+    `required_scopes`, actions whose context lacks the required scope;
+  - human oversight: approvals bound to the model response and call ids
+    they name, approval timing, rejections, stops and resumes, and reviewer
+    countersignatures (against an optional reviewer key registry).
+
+Time is only ever a signed field (started_at, observed_at, decided_at,
+chained_at) in strict YYYY-MM-DDTHH:MM:SSZ, or chain_seq order; never the
+unsigned attestation.attested_at. A check that needs a time it can't get is
+an error saying the check was not performed.
 
 Errors (report["ok"] False): bad signatures, malformed context, tool calls
 that were not requested, expired or missing authorisation. The rest are
@@ -63,13 +71,49 @@ def _time(value: Any) -> datetime | None:
     return None
 
 
-def _when(receipt: Receipt) -> datetime | None:
+# Signed time fields, in order of preference. attestation.attested_at is
+# outside the signed payload and is never used.
+_SIGNED_TIME_KEYS = ("started_at", "observed_at", "decided_at", "chained_at")
+
+
+def _signed_when(receipt: Receipt) -> tuple[datetime | None, str]:
+    """(signed time, "") or (None, why there is none).
+
+    Only signed fields count, and only strict YYYY-MM-DDTHH:MM:SSZ. The
+    first signed time field present decides: a malformed one is not
+    skipped in favour of another."""
     ex = receipt.execution
-    for key in ("started_at", "observed_at", "chained_at"):
-        t = _time(ex.get(key))
-        if t is not None:
-            return t
-    return _time(receipt.attestation.get("attested_at"))
+    for key in _SIGNED_TIME_KEYS:
+        if key in ex:
+            t = _time(ex[key])
+            if t is None:
+                return None, f"signed {key} is not UTC YYYY-MM-DDTHH:MM:SSZ"
+            return t, ""
+    return None, "no signed time (started_at, observed_at, decided_at or chained_at)"
+
+
+def _when(receipt: Receipt) -> datetime | None:
+    return _signed_when(receipt)[0]
+
+
+def _chain_pos(receipt: Receipt) -> tuple[str, int] | None:
+    ex = receipt.execution
+    cid, seq = ex.get("chain_id"), ex.get("chain_seq")
+    if isinstance(cid, str) and type(seq) is int:
+        return cid, seq
+    return None
+
+
+def _order(a: Receipt, b: Receipt) -> int | None:
+    """Signed order of a relative to b: -1 before, 1 after, 0 same second,
+    None unknown. chain_seq when both are in one chain, else signed time."""
+    pa, pb = _chain_pos(a), _chain_pos(b)
+    if pa is not None and pb is not None and pa[0] == pb[0]:
+        return (pa[1] > pb[1]) - (pa[1] < pb[1])
+    ta, tb = _when(a), _when(b)
+    if ta is None or tb is None:
+        return None
+    return (ta > tb) - (ta < tb)
 
 
 def _check_principal(value: Any, label: str) -> None:
@@ -164,6 +208,30 @@ def _label(receipt: Receipt) -> str:
     return f"{kind}:{name}" + (f"#{seq}" if seq is not None else "")
 
 
+def _scope_value(ctx: dict[str, Any], field: str) -> Any:
+    if field == "agent":
+        return (ctx.get("agent") or {}).get("id")
+    return ctx.get(field)
+
+
+def _stop_applies(stop_ctx: dict[str, Any], ctx: dict[str, Any], rtype: Any) -> bool:
+    """Is an action with context `ctx` in the scope of a stop?
+
+    Same session: always. A stop without session_id, or an action without
+    one, applies to tool actions in the same agent/tenant scope (a field
+    either side leaves out does not narrow the scope)."""
+    stop_session, session = stop_ctx.get("session_id"), ctx.get("session_id")
+    if stop_session is not None and session is not None:
+        return stop_session == session
+    if rtype != "tool":
+        return False
+    for field in ("agent", "tenant"):
+        a, b = _scope_value(stop_ctx, field), _scope_value(ctx, field)
+        if a is not None and b is not None and a != b:
+            return False
+    return True
+
+
 def verify_trace(
     receipts: list[Receipt],
     *,
@@ -171,19 +239,31 @@ def verify_trace(
     require_approval: Any = (),
     require_policy: dict[str, str] | None = None,
     min_review_seconds: int | None = None,
+    reviewer_keys: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Verify context, causality, authorisation and oversight across receipts.
 
     required_scopes maps a tool_name to the scope (or list of scopes, all
     required) its receipts' context.authorization must carry.
     require_approval: tool names that must cite a human approval
-    (oversight receipt with decision approved/modified covering the call).
+    (oversight receipt with decision approved/modified naming the model
+    receipt the tool cites and its tool_call_id, decided after that model
+    response and before the tool started).
     require_policy maps a tool_name to a policy_id whose non-deny decision
     the tool receipt must cite.
-    min_review_seconds: flag human reviews faster than this (rubber-stamping).
+    min_review_seconds: flag human reviews faster than this (rubber-stamping),
+    measured from the later of review_started_at and the subject model
+    receipt's time.
+    reviewer_keys: reviewer key registry, mapping a reviewer ref to the
+    Ed25519 public key(s) (hex) allowed to countersign for it. Without it
+    countersignatures are reported as reviewer_signed="unverified".
     Never raises on bad input; read report["ok"], ["errors"], ["warnings"].
     """
-    from traceseal_observe.oversight import check_oversight, check_policy_decision
+    from traceseal_observe.oversight import (
+        check_oversight,
+        check_policy_decision,
+        normalize_reviewer_keys,
+    )
 
     require_approval = set(require_approval or ())
     require_policy = dict(require_policy or {})
@@ -204,6 +284,13 @@ def verify_trace(
         "policy_decisions": [],
     }
     errors, warnings = report["errors"], report["warnings"]
+    registry = None
+    if reviewer_keys is not None:
+        try:
+            registry = normalize_reviewer_keys(reviewer_keys)
+        except ValueError as exc:
+            errors.append(str(exc))
+            registry = {}  # fail closed: no countersignature verifies
     if not isinstance(receipts, list) or not receipts:
         errors.append("no receipts supplied")
         return report
@@ -213,6 +300,7 @@ def verify_trace(
     policies: dict[str, dict[str, Any]] = {}
     contexts: dict[str, dict[str, Any]] = {}
     calls_by_model: dict[str, list[dict[str, str]]] = {}
+    pending_oversight: list[Receipt] = []
     for index, receipt in enumerate(receipts):
         label = f"receipt[{index}]"
         if not isinstance(receipt, Receipt):
@@ -241,44 +329,106 @@ def verify_trace(
             except TraceError as exc:
                 errors.append(f"{label}: {exc}")
         elif rtype == "oversight":
-            try:
-                oversight[digest] = check_oversight(receipt)
-            except ValueError as exc:
-                errors.append(f"{label}: {exc}")
+            pending_oversight.append(receipt)
         elif rtype == "policy_decision":
             try:
                 policies[digest] = check_policy_decision(receipt)
             except ValueError as exc:
                 errors.append(f"{label}: {exc}")
     report["count"] = len(by_hash)
+    operator_keys = {str(r.attestation.get("operator_public_key", "")).lower()
+                     for r in by_hash.values()}
+    for receipt in pending_oversight:
+        try:
+            oversight[receipt.receipt_hash] = check_oversight(
+                receipt, reviewer_keys=registry, operator_keys=operator_keys)
+        except ValueError as exc:
+            errors.append(f"{_label(receipt)}: {exc}")
 
+    # -- each human decision on its own ---------------------------------------
     for item in oversight.values():
-        report["oversight"].append({k: v for k, v in item.items() if k != "decided_at_dt"})
-        if (
-            min_review_seconds is not None
-            and item["decision"] in ("approved", "modified")
-            and item["review_seconds"] is not None
-            and item["review_seconds"] < min_review_seconds
-        ):
-            warnings.append(
-                f"oversight {item['hash'][:15]}: approved after {item['review_seconds']}s "
-                f"(below {min_review_seconds}s; possible rubber-stamping)"
-            )
+        tag = f"oversight {item['hash'][:15]}"
+        if item["reviewer_signed"] == "unverified":
+            warnings.append(f"{tag}: reviewer countersignature is valid but its key was not "
+                            "checked against a reviewer key registry (reviewer_signed: unverified)")
+        window = None
+        if item["decision"] in ("approved", "modified"):
+            # The review cannot start before the model response it reviews existed.
+            subject_times = []
+            for subject in item["subjects"]:
+                if subject not in by_hash:
+                    continue
+                kind = by_hash[subject].execution.get("receipt_type")
+                if kind != "model":
+                    errors.append(f"{tag}: human {item['decision']} decision names a {kind!r} "
+                                  "receipt as its subject, not a model receipt")
+                    continue
+                when, why = _signed_when(by_hash[subject])
+                if when is None:
+                    errors.append(f"{tag}: approval timing not checked: subject model receipt "
+                                  f"has {why}")
+                    continue
+                subject_times.append(when)
+                started = item["review_started_at_dt"]
+                if started is not None and started < when:
+                    errors.append(f"{tag}: human review started at {started:%Y-%m-%dT%H:%M:%SZ}, "
+                                  f"before the model response it reviews existed ({when:%Y-%m-%dT%H:%M:%SZ})")
+                if item["decided_at_dt"] < when:
+                    errors.append(f"{tag}: human approval decided before the model response it "
+                                  "approves existed")
+            starts = subject_times + ([item["review_started_at_dt"]]
+                                      if item["review_started_at_dt"] is not None else [])
+            if starts:
+                window = max(0, int((item["decided_at_dt"] - max(starts)).total_seconds()))
+            if min_review_seconds is not None:
+                if window is None:
+                    warnings.append(f"{tag}: review time unknown (no review_started_at and no "
+                                    "subject model receipt supplied); rubber-stamp check not performed")
+                elif window < min_review_seconds:
+                    warnings.append(
+                        f"{tag}: approved after {window}s "
+                        f"(below {min_review_seconds}s; possible rubber-stamping)"
+                    )
+        entry = {k: v for k, v in item.items() if k not in ("decided_at_dt", "review_started_at_dt")}
+        entry["effective_review_seconds"] = window
+        report["oversight"].append(entry)
     report["policy_decisions"] = list(policies.values())
-    # Human rejections of specific requested calls, whether or not cited.
+
+    # Human rejections, whether or not cited: of specific requested calls, or
+    # (subjects without tool_call_ids) of everything a model response asked for.
     rejected_calls = {
         (subject, call_id)
         for item in oversight.values() if item["decision"] == "rejected"
         for subject in item["subjects"] for call_id in item["tool_call_ids"]
     }
-    stops = sorted(
-        (
-            (contexts.get(item["hash"], {}).get("session_id"), item["decided_at_dt"], item["decision"])
-            for item in oversight.values()
-            if item["decision"] in ("stopped", "resumed")
-        ),
-        key=lambda t: t[1],
-    )
+    rejected_subjects = {
+        subject
+        for item in oversight.values()
+        if item["decision"] == "rejected" and not item["tool_call_ids"]
+        for subject in item["subjects"]
+    }
+
+    # Stops, and the resumes that lift them. A resume lifts a stop only if it
+    # cites the stop and is strictly later in signed order; on a tie the stop wins.
+    stops: list[tuple[Receipt, dict[str, Any], list[Receipt]]] = []
+    stop_hashes = {h for h, o in oversight.items() if o["decision"] == "stopped"}
+    for digest in stop_hashes:
+        stops.append((by_hash[digest], contexts.get(digest, {}), []))
+    for digest, item in oversight.items():
+        if item["decision"] != "resumed":
+            continue
+        cites = (set(item["subjects"]) | set(contexts.get(digest, {}).get("caused_by", []))) & stop_hashes
+        if not cites:
+            warnings.append(f"oversight {digest[:15]}: 'resumed' decision cites no supplied stop; "
+                            "it lifts nothing")
+        for stop_receipt, _, lifts in stops:
+            if stop_receipt.receipt_hash not in cites:
+                continue
+            if _order(by_hash[digest], stop_receipt) == 1:
+                lifts.append(by_hash[digest])
+            else:
+                warnings.append(f"oversight {digest[:15]}: 'resumed' is not strictly later than "
+                                f"the stop {stop_receipt.receipt_hash[:15]} it cites; the stop stands")
 
     executed: set[tuple[str, str]] = set()
     for digest, receipt in by_hash.items():
@@ -309,10 +459,13 @@ def verify_trace(
 
         # -- authorisation ------------------------------------------------
         auth = ctx.get("authorization")
-        when = _when(receipt)
-        if auth and "expires_at" in auth and when is not None and when > _time(auth["expires_at"]):
-            errors.append(f"{label}: acted at {when:%Y-%m-%dT%H:%M:%SZ}, after its "
-                          f"authorization expired at {auth['expires_at']}")
+        when, why_no_time = _signed_when(receipt)
+        if auth and "expires_at" in auth:
+            if when is None:
+                errors.append(f"{label}: authorization expiry not checked: receipt has {why_no_time}")
+            elif when > _time(auth["expires_at"]):
+                errors.append(f"{label}: acted at {when:%Y-%m-%dT%H:%M:%SZ}, after its "
+                              f"authorization expired at {auth['expires_at']}")
         tool_name = receipt.execution.get("tool_name")
         if required_scopes and receipt.execution.get("receipt_type") == "tool" and tool_name in required_scopes:
             needed = required_scopes[tool_name]
@@ -322,16 +475,35 @@ def verify_trace(
             if missing:
                 errors.append(f"{label}: missing required scope(s) {missing}")
 
-        # -- stops: nothing may act in a session a human stopped ------------
-        session = ctx.get("session_id")
+        # -- stops: nothing may act in a scope a human stopped -------------
         rtype = receipt.execution.get("receipt_type")
-        if session and when is not None and rtype not in ("oversight",):
-            state = "running"
-            for stop_session, stop_time, stop_decision in stops:
-                if stop_session == session and stop_time <= when:
-                    state = stop_decision
-            if state == "stopped":
-                errors.append(f"{label}: acted in session {session!r} after a human stopped it")
+        if rtype != "oversight":
+            for stop_receipt, stop_ctx, lifts in stops:
+                if not _stop_applies(stop_ctx, ctx, rtype):
+                    continue
+                where = (f"in session {ctx['session_id']!r}" if ctx.get("session_id")
+                         and stop_ctx.get("session_id") == ctx.get("session_id")
+                         else "in the stopped agent/tenant scope"
+                         + ("" if ctx.get("session_id") else " (no session_id)"))
+                position = _order(stop_receipt, receipt)
+                if position is None:
+                    errors.append(f"{label}: cannot order against the human stop "
+                                  f"{stop_receipt.receipt_hash[:15]} ({why_no_time or 'no common signed order'}); "
+                                  "after-stop check not performed")
+                    continue
+                if position == 1:
+                    continue  # the stop came later
+                orders = [_order(lift, receipt) for lift in lifts]
+                if any(o == -1 for o in orders):
+                    continue  # resumed strictly before this action
+                if lifts and all(o is None for o in orders):
+                    errors.append(f"{label}: cannot order against the human resume of stop "
+                                  f"{stop_receipt.receipt_hash[:15]}; after-stop check not performed")
+                    continue
+                if ctx.get("session_id") and stop_ctx.get("session_id") == ctx.get("session_id"):
+                    errors.append(f"{label}: acted in session {ctx['session_id']!r} after a human stopped it")
+                else:
+                    errors.append(f"{label}: acted {where} after a human stopped it")
 
         if rtype != "tool":
             continue
@@ -348,22 +520,45 @@ def verify_trace(
                 errors.append(f"{label}: does not cite a passing {wanted!r} policy decision")
 
         # -- human oversight cited by this action --------------------------
-        # A decision covers this action only if it names this call (when it
-        # names calls) and is about a model response this action cites (when
-        # it names subjects). Tool-call ids are unique per response, not
-        # globally, so an id alone must not carry an approval across responses.
+        # An approval covers this action only if it names this call and the
+        # model response this action cites (its subject). Tool-call ids are
+        # unique per response, not globally, so an id alone must not carry
+        # an approval across responses. Rejections and stops that name
+        # calls or subjects apply only where they match.
+        cited_all = [oversight[c] for c in causes if c in oversight]
         cited = [
-            oversight[c] for c in causes if c in oversight
-            and (not oversight[c]["tool_call_ids"] or call_id in oversight[c]["tool_call_ids"])
-            and (not oversight[c]["subjects"] or set(oversight[c]["subjects"]) & set(causes))
+            o for o in cited_all
+            if (not o["tool_call_ids"] or call_id in o["tool_call_ids"])
+            and (not o["subjects"] or set(o["subjects"]) & set(causes))
         ]
-        approvals = [o for o in cited if o["decision"] in ("approved", "modified")]
+        approvals = [
+            o for o in cited
+            if o["decision"] in ("approved", "modified") and o["tool_call_ids"] and o["subjects"]
+            and any(s in causes and (s not in by_hash or s in calls_by_model) for s in o["subjects"])
+        ]
         for o in cited:
             if o["decision"] in ("rejected", "stopped"):
                 errors.append(f"{label}: executed although a human decision was {o['decision']!r}")
+        for o in approvals:
+            # The approval must be decided before the tool ran.
+            if when is None:
+                errors.append(f"{label}: human approval timing not checked: tool receipt has {why_no_time}")
+            elif o["decided_at_dt"] > when:
+                errors.append(f"{label}: started at {when:%Y-%m-%dT%H:%M:%SZ}, before the human "
+                              f"approval it cites was decided ({o['decided_at']})")
+            if not any(s in by_hash for s in o["subjects"] if s in causes):
+                message = (f"{label}: human approval timing not checked: the approved model "
+                           "receipt was not supplied")
+                (errors if tool_name in require_approval else warnings).append(message)
         if tool_name in require_approval and not approvals:
             errors.append(f"{label}: requires human approval but cites none")
         human_modified = {o["modified_input_hash"] for o in approvals if o["modified_input_hash"]}
+        for cause in causes:
+            if cause in rejected_subjects:
+                errors.append(f"{label}: executed a call from model response {cause[:15]}, "
+                              "which a human rejected")
+            if call_id is not None and (cause, call_id) in rejected_calls:
+                errors.append(f"{label}: executed call {call_id!r}, which a human rejected")
 
         # -- tool calls requested by a model -------------------------------
         model_causes = [c for c in causes if c in calls_by_model]
@@ -377,11 +572,10 @@ def verify_trace(
             warnings.append(f"{label}: caused by a model receipt but has no tool_call_id")
             continue
         for model_hash in model_causes:
-            if (model_hash, call_id) in rejected_calls:
-                errors.append(f"{label}: executed call {call_id!r}, which a human rejected")
             match = next((c for c in calls_by_model[model_hash] if c["id"] == call_id), None)
             entry = {"tool_receipt": digest, "model_receipt": model_hash, "tool_call_id": call_id}
             input_hash = receipt.execution.get("input_hash")
+            model_approvals = [o for o in approvals if model_hash in o["subjects"]]
             if match is None:
                 entry["status"] = "not_requested"
                 errors.append(f"{label}: tool_call_id {call_id!r} was not requested by the cited model response")
@@ -404,8 +598,8 @@ def verify_trace(
                     warnings.append(f"{label}: model asked for {match['name']!r}, receipt names {tool_name!r}")
                 else:
                     entry["status"] = "matched"
-            if approvals:
-                entry["approved_by"] = [o["hash"] for o in approvals]
+            if model_approvals:
+                entry["approved_by"] = [o["hash"] for o in model_approvals]
             report["tool_calls"].append(entry)
 
     for model_hash, calls in calls_by_model.items():
@@ -459,6 +653,10 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--require-policy", action="append", default=[], metavar="TOOL=POLICY",
                    help="TOOL receipts must cite a passing POLICY decision")
     v.add_argument("--min-review-seconds", type=int)
+    v.add_argument("--reviewer-keys", metavar="FILE",
+                   help="JSON object mapping reviewer refs to the Ed25519 public key(s) "
+                        "(hex) allowed to countersign for them; without it reviewer "
+                        "countersignatures are reported as unverified")
     v.add_argument("--json", action="store_true")
     f = sub.add_parser("find-principal", help="list receipts about one principal")
     f.add_argument("receipts", nargs="+")
@@ -497,7 +695,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[ERROR] --require-policy expects TOOL=POLICY, got {item!r}", file=sys.stderr)
             return 2
         policies_required[tool] = policy
+    registry = None
+    if args.reviewer_keys:
+        from traceseal_observe.oversight import normalize_reviewer_keys
+
+        try:
+            registry = normalize_reviewer_keys(json.loads(Path(args.reviewer_keys).read_text()))
+        except (OSError, ValueError) as exc:
+            print(f"[ERROR] --reviewer-keys: {exc}", file=sys.stderr)
+            return 2
     report = verify_trace(receipts, required_scopes=required,
+                          reviewer_keys=registry,
                           require_approval=args.require_approval,
                           require_policy=policies_required,
                           min_review_seconds=args.min_review_seconds)
@@ -514,7 +722,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  requested, not executed: {call['name']} [{call['id']}]"
               f" from {labels.get(call['model_receipt'])}")
     for item in report["oversight"]:
-        signed = "reviewer-signed" if item["reviewer_signed"] else "operator-attested"
+        signed = {True: "reviewer-signed",
+                  "unverified": "reviewer-countersigned, key unverified"}.get(
+                      item["reviewer_signed"], "operator-attested")
         took = f", {item['review_seconds']}s review" if item["review_seconds"] is not None else ""
         print(f"  human {item['decision']} ({signed}{took})")
     for item in report["policy_decisions"]:

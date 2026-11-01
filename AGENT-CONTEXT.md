@@ -161,8 +161,11 @@ The verifier also reports:
 - causes that weren't supplied (`unresolved_causes`).
 
 Authorisation **errors**:
-- an action whose time (`started_at`, otherwise `observed_at` or
-  `chained_at`) is after `authorization.expires_at`;
+- an action whose signed time (`started_at`, otherwise `observed_at`,
+  `decided_at` or `chained_at`, strict `YYYY-MM-DDTHH:MM:SSZ`) is after
+  `authorization.expires_at`. The unsigned `attestation.attested_at` is
+  never used: a receipt with `expires_at` but no valid signed time is an
+  error (expiry not checked), never a pass;
 - with `required_scopes`, a tool receipt whose context lacks a required
   scope.
 

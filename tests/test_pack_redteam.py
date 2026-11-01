@@ -353,7 +353,9 @@ class TestHostileJson:
                              aware_at="2026-01-01T00:00:00Z", operator_key=key)
         ex = dict(root.execution, **patch)
         s = analyse([sign_execution_receipt(ex, PROV, key)], now="2026-10-01T00:00:00Z")
-        assert not s["ok"] and s["analysis_failures"]
+        # incident.py reports hostile values as problems (or analysis fails): never ok
+        assert not s["ok"]
+        assert s["analysis_failures"] or any(i.get("problems") for i in s["incidents"])
         assert {c["ref"]: c["status"] for c in s["controls"]}["Art. 73"] == "issues"
 
     def test_build_with_unparsable_receipt_file(self, tmp_path):
@@ -379,7 +381,8 @@ class TestAnalyseTimeAndKeys:
 
         key = OperatorKey.generate()
         m = _model(key, [], t="2026-10-01T12:00:00Z")
-        p = sign_policy_decision(policy_id="pii", decision="allow", stage="output", operator_key=key)
+        p = sign_policy_decision(policy_id="pii", decision="allow", stage="output",
+                                 decided_at="2026-10-01T12:00:00Z", operator_key=key)
         p.attestation["attested_at"] = "2025-01-01T00:00:00Z"
         verify_receipt_signature(p)
         s = analyse([m, p], now="2026-11-01T00:00:00Z")
