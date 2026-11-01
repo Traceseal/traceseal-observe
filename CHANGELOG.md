@@ -16,8 +16,12 @@ still verify.
   mandatory and must come from a key you pin (`--operator-pubkey`, or
   `expected_keys=`). Findings are re-derived from the pack's receipts and
   checkpoints and must match report.json. Paths outside the pack and
-  symlinks are refused. Exit codes: 0 passed, 3 intact but with issues,
-  1 verification failed, 2 usage.
+  symlinks are refused. `report.json` and `report.md` must match the
+  re-derived findings byte for byte, and a back-dated analysis time fails.
+  An **auditor analysis** then runs with the auditor's clock (`--now`,
+  default the current time), pinned keys, reviewer registry and extra
+  requirements, and decides the exit code: 0 passed, 3 intact but with
+  issues, 1 verification failed, 2 usage.
 - **`traceseal-keys verify` checks each receipt's signature** before key
   status. A revoked key without `compromised_after` gives
   `revoked_time_unproven`, not `valid`.
@@ -78,6 +82,11 @@ still verify.
 - Duplicate JSON keys, NaN, and booleans or nulls in signed sections are
   rejected (RECEIPT-SPEC §3). Hostile input no longer crashes the
   verifiers.
+
+- `sign_execution_receipt` refuses booleans, nulls and circular values,
+  which every verifier rejects (RECEIPT-SPEC §3).
+- Stop/resume decisions ordered only by signed times (different chains)
+  are flagged with a warning.
 
 ### Changed
 - Docs and README: claims scoped to what the code checks (operator

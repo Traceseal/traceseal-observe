@@ -148,6 +148,25 @@ It checks:
   match `report.json`, and the pack receipt's `verification_ok` to match.
   Each mismatch is reported as a problem. Packs without recorded options
   (built before 1.6.0) fail this check.
+- **the report files themselves:** `report.json` and `report.md` must be
+  byte for byte what `build` writes for the re-derived findings, so no
+  field, note or sentence in them can be edited;
+- **the analysis time:** an "as of" time earlier than the pack's own
+  latest receipt is a back-dated analysis and fails.
+
+Then it runs **the auditor's analysis** over the same receipts. It uses:
+- **your clock:** `--now`, by default the current time, so deadlines are
+  judged as of today, not as of whenever the operator chose;
+- **the pinned operator keys:** receipts signed by other keys are excluded;
+- **your reviewer registry:** `--reviewer-keys`, if given, replaces the
+  operator's;
+- **your requirements:** `--require-approval`, `--require-policy`,
+  `--require-scope` and `--min-review-seconds` are added to the ones
+  recorded.
+
+Its verdict is the **auditor result**, and the exit code follows it. The
+operator cannot make a pack pass by picking a convenient date or by
+leaving a requirement out.
 
 Hostile content (a manifest that is a list, a pack receipt that is not
 JSON, fields of the wrong type) is reported as a problem, never a crash.
@@ -157,19 +176,25 @@ found:
 
 ```
 [OK] 6 files, 4 receipts, pack signature: valid by 1f2e3d4c5b6a7980… (pinned)
-  pack result: ISSUES FOUND
+  pack result (as built): passed
+  auditor result (your clock and requirements): ISSUES FOUND
+  recorded analysis options: now=2026-10-01T00:00:00Z, operator_keys=[…]
+  - incident serious_incident: MISSED EU AI Act Art. 73(2) due 2026-10-16T00:00:00Z
 ```
 
-Exit codes: `0` intact and the pack's findings passed; `3` intact but the
-pack reports issues; `1` the pack failed verification; `2` usage error
-(including no pinned signer).
+Exit codes: `0` intact and the auditor result passed; `3` intact but the
+auditor result shows issues; `1` the pack failed verification; `2` usage
+error (including no pinned signer).
 
 What `verify-pack` does **not** do: it does not make the operator's
 receipts true. It shows that the pack is unmodified since the pinned key
 signed it and that its findings follow from the receipts and options it
-contains. Whether the options (which approvals were required, which TSA
-roots were trusted) are the right ones is for the auditor to judge; they
-are listed in `report.json`.
+contains. Whether the recorded options (which TSA roots and witnesses
+were trusted) are right is for the auditor to judge; they are printed, and
+the auditor can add requirements and supply their own clock and reviewer
+registry. Stop/resume decisions in different chains are ordered by the
+operator's signed times, and the report warns when a verdict rests on
+that.
 
 ### The control map
 

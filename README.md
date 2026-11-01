@@ -134,9 +134,12 @@ traceseal-report verify-pack pack/ --operator-pubkey <ops public key hex>
 ```
 
 `verify-pack` requires the pack signature and the operator key you expect,
-checks every file, and re-derives the findings from the receipts. It exits
-0 when the pack is intact and its findings passed, 3 when it is intact but
-records issues, 1 when verification fails and 2 for usage errors.
+checks every file, re-derives the findings (the report files must match
+exactly), and then runs the analysis again with **your** clock (`--now`,
+default today) and any requirements you add (`--require-approval`,
+`--reviewer-keys`, …). It exits 0 when the pack is intact and that auditor
+result passed, 3 when it is intact but shows issues, 1 when verification
+fails and 2 for usage errors.
 
 ## Receipt types
 
