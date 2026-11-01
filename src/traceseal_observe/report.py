@@ -934,7 +934,7 @@ def _receipt_from_bytes(data: bytes, label: str) -> Receipt:
 
     try:
         obj = loads_receipt_json(data)
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise ValueError(f"{label}: not valid JSON ({exc})") from None
     if not isinstance(obj, dict):
         raise ValueError(f"{label}: not a JSON object")

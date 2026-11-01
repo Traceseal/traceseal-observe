@@ -754,3 +754,15 @@ def test_single_string_approval_enforced_at_build_and_verify(tmp_path):
     assert not s["ok"]  # 'refund' requires approval and cites none
     r = verify_pack(tmp_path / "pack", [key.public_key_hex])
     assert r["ok"] and r["pack_result"] == "ISSUES FOUND", r["problems"]
+
+
+def test_deeply_nested_receipt_file_is_a_failed_receipt_not_a_crash(tmp_path):
+    key = OperatorKey.generate()
+    paths = _write(tmp_path, [_tool(key, "t", {})])
+    deep = tmp_path / "in" / "deep.json"
+    deep.write_text("[" * 20000 + "]" * 20000)
+    s = build_pack(tmp_path / "pack", paths + [deep], operator_key=key,
+                   operator_keys=[key.public_key_hex])
+    assert not s["ok"] and s["signature_failures"]
+    r = verify_pack(tmp_path / "pack", [key.public_key_hex])
+    assert any("nested too deeply" in p for p in r["problems"])

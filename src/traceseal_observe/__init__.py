@@ -501,9 +501,13 @@ def loads_receipt_json(data: str | bytes) -> Any:
     errors (ValueError), so every parser reads the same document."""
     if isinstance(data, (bytes, bytearray)):
         data = bytes(data).decode("utf-8")
-    return json.loads(
-        data, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant
-    )
+    try:
+        return json.loads(
+            data, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant
+        )
+    except RecursionError:
+        # Hostile nesting must fail like any other malformed JSON.
+        raise ValueError("JSON is nested too deeply") from None
 
 
 @dataclass
