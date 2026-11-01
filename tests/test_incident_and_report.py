@@ -276,10 +276,10 @@ class TestEvidencePack:
         assert report_mod.main(["verify-pack", str(tmp_path / "pack"),
                                 "--operator-pubkey", key.public_key_hex]) == 3
         out = capsys.readouterr().out
-        assert "[OK]" in out and "pack result: ISSUES FOUND" in out and "(pinned)" in out
+        assert "[OK]" in out and "auditor result (your clock and requirements): ISSUES FOUND" in out and "(pinned)" in out
         assert report_mod.main(["verify-pack", str(tmp_path / "pack"), "--trust-signer-in-pack"]) == 3
         out = capsys.readouterr().out
-        assert "NOT PINNED" in out and "pack result: ISSUES FOUND" in out
+        assert "NOT PINNED" in out and "auditor result (your clock and requirements): ISSUES FOUND" in out
 
 
 class TestIncidentRedTeam:

@@ -451,6 +451,7 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
         problems: list[str] = []
         if isinstance(status, tuple):
             status, problems = status
+            problems = _dedupe(problems)
         return {"framework": framework, "ref": ref, "title": title, "status": status,
                 "evidence": evidence, "notes": notes, "problems": problems,
                 "applies_to": applies_to}
@@ -470,7 +471,8 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
                 high_risk),
         control("EU AI Act", "Art. 12(2)", "Logs enable risk identification, post-market and "
                 "deployer monitoring",
-                _status(s["with_context"] > 0, []),
+                _status(s["with_context"] > 0,
+                        integrity + [e for e in trace_errors if "context" in e] + unclaimed),
                 f"{s['with_context']} receipts carry signed agent/principal/trace context; "
                 f"inputs and outputs committed by hash.",
                 "The extra logging content of Art. 12(3) applies only to remote biometric "
@@ -889,8 +891,24 @@ def verify_pack(
     expected_keys: Iterable[str] | str | None,
     *,
     trust_signer_in_pack: bool = False,
+    now: str | None = None,
+    require_approval: Any = (),
+    require_policy: dict[str, str] | None = None,
+    required_scopes: dict[str, Any] | None = None,
+    reviewer_keys: dict[str, Any] | None = None,
+    min_review_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Offline check of a pack. Never raises on hostile pack content.
+
+    Two analyses run. The first re-derives the pack's own findings with the
+    options recorded at build time; report.json and report.md must match
+    it byte for byte, so nothing in them can be edited. The second is the
+    AUDITOR's: it runs on the pack's receipts with the auditor's clock
+    (`now`, default: the current time), the pinned operator keys, the
+    auditor's reviewer key registry if given, and the auditor's
+    requirements added to the recorded ones. Its verdict is
+    `auditor_result`, and the CLI's exit code follows it, so an operator
+    cannot pick a convenient date or drop a requirement to make a pack pass.
 
     expected_keys: the operator Ed25519 public key(s) (hex) the pack must be
     signed by, obtained out of band. Required: pass None only together with
@@ -917,7 +935,9 @@ def verify_pack(
                          "out of band), or trust_signer_in_pack=True")
     problems: list[str] = []
     warnings: list[str] = []
-    result: dict[str, Any] = {"ok": False, "pack_result": None, "signed": False, "pinned": False,
+    result: dict[str, Any] = {"ok": False, "pack_result": None, "auditor_result": None,
+                              "auditor_findings": [], "analysis_options": None,
+                              "signed": False, "pinned": False,
                               "signer": None, "files": 0, "receipts": 0,
                               "problems": problems, "warnings": warnings}
     try:
@@ -1053,6 +1073,15 @@ def verify_pack(
                 problems.append(f"findings could not be re-derived ({type(exc).__name__}: {exc})")
             else:
                 problems += _compare(report, derived)
+                problems += _compare_rendered(report, derived, contents)
+                result["analysis_options"] = _options_summary(options)
+                recorded_now = _parse_time(options.get("now"))
+                latest = _parse_time(derived["period"].get("last"))
+                if recorded_now is None:
+                    problems.append("analysis_options.now is missing or malformed")
+                elif latest is not None and recorded_now < latest:
+                    problems.append(f"the pack was analysed 'as of' {options.get('now')}, before its own "
+                                    f"latest receipt ({derived['period']['last']}): a back-dated analysis")
                 result["pack_result"] = "passed" if derived["ok"] else "ISSUES FOUND"
                 if pack_receipt is not None and \
                         pack_receipt.execution.get("verification_ok") != ("true" if derived["ok"] else "false"):
@@ -1062,9 +1091,99 @@ def verify_pack(
                 if options.get("operator_keys") is None:
                     warnings.append("the pack was built without an operator key pin: receipts from "
                                     "any signer were analysed")
+                # -- the auditor's own analysis ------------------------------------
+                try:
+                    approvals = set(options.get("require_approval") or [])
+                    approvals |= {require_approval} if isinstance(require_approval, str) \
+                        else set(require_approval or ())
+                    auditor = analyse(
+                        receipts, checkpoints=notes, checkpoint_timestamps=stamps,
+                        tsa_trust_anchors=anchors, witness_vkeys=options.get("witness_vkeys") or [],
+                        required_scopes={**(options.get("required_scopes") or {}),
+                                         **(required_scopes or {})} or None,
+                        require_approval=sorted(approvals),
+                        require_policy={**(options.get("require_policy") or {}),
+                                        **(require_policy or {})} or None,
+                        min_review_seconds=max(
+                            [v for v in (options.get("min_review_seconds"), min_review_seconds)
+                             if isinstance(v, int)], default=None),
+                        now=now or _now_utc(),
+                        operator_keys=pins or options.get("operator_keys"),
+                        reviewer_keys=(reviewer_keys if reviewer_keys is not None
+                                       else options.get("reviewer_keys")),
+                    )
+                except Exception as exc:
+                    problems.append(f"auditor analysis failed ({type(exc).__name__}: {exc})")
+                else:
+                    result["auditor_result"] = "passed" if auditor["ok"] else "ISSUES FOUND"
+                    result["auditor_findings"] = _findings(auditor)
     problems[:] = _dedupe(problems)
     result["ok"] = not problems
     return result
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _options_summary(options: dict[str, Any]) -> dict[str, Any]:
+    keys = ("now", "operator_keys", "require_approval", "require_policy", "required_scopes",
+            "min_review_seconds", "witness_vkeys")
+    out = {k: options.get(k) for k in keys}
+    out["reviewer_keys"] = sorted(options.get("reviewer_keys") or {}) or None
+    out["checkpoints"] = len(options.get("checkpoints") or [])
+    return out
+
+
+def _findings(summary: dict[str, Any]) -> list[str]:
+    out = [f"{c['framework']} {c['ref']}: {c['status']}" + (
+        f" ({'; '.join(c['problems'][:2])})" if c.get("problems") else "")
+        for c in summary["controls"] if c["status"] == "issues"]
+    out += [f"incident {i.get('category')}: MISSED {d.get('basis')} due {d.get('due')}"
+            for i in summary["incidents"] for d in i.get("missed_deadlines", [])]
+    out += [f"trace: {e}" for e in summary["trace"]["errors"][:20]]
+    return _dedupe(out)
+
+
+def _expected_report(report: dict[str, Any], derived: dict[str, Any]) -> dict[str, Any]:
+    expected = dict(derived)
+    for k in ("pack_version", "generated_at", "analysis_options", "pack_signer"):
+        if k in report:
+            expected[k] = report[k]
+    return expected
+
+
+def _compare_rendered(report: dict[str, Any], derived: dict[str, Any],
+                      contents: dict[str, bytes]) -> list[str]:
+    """report.json and report.md must be exactly what build_pack writes for
+    the re-derived findings: no field or sentence can be edited."""
+    out = []
+    expected = _expected_report(report, derived)
+    want_json = json.dumps(expected, indent=2, sort_keys=True, default=str).encode("utf-8")
+    if contents.get("report.json") != want_json:
+        try:
+            normalised = json.loads(want_json)
+        except ValueError:
+            normalised = {}
+        changed = sorted(k for k in set(normalised) | set(report)
+                         if normalised.get(k) != report.get(k))
+        out.append("report.json does not match the re-derived findings"
+                   + (f" (fields: {', '.join(changed[:8])})" if changed else ""))
+    want_md = render_markdown(expected).encode("utf-8")
+    if "report.md" not in contents:
+        out.append("report.md missing or not covered by the manifest")
+    elif contents["report.md"] != want_md:
+        out.append("report.md does not match the re-derived findings")
+    return out
 
 
 def _compare(report: dict[str, Any], derived: dict[str, Any]) -> list[str]:
@@ -1128,6 +1247,14 @@ def main(argv: list[str] | None = None) -> int:
                         "(repeatable). Required unless --trust-signer-in-pack.")
     v.add_argument("--trust-signer-in-pack", action="store_true",
                    help="accept whichever key signed the pack (NOT pinned: anyone can re-sign a pack)")
+    v.add_argument("--now", help="the auditor's 'as of' time (UTC YYYY-MM-DDTHH:MM:SSZ); "
+                                 "default: the current time")
+    v.add_argument("--require-approval", action="append", default=[])
+    v.add_argument("--require-policy", action="append", default=[], metavar="TOOL=POLICY")
+    v.add_argument("--require-scope", action="append", default=[], metavar="TOOL=SCOPE")
+    v.add_argument("--min-review-seconds", type=int)
+    v.add_argument("--reviewer-keys", metavar="FILE",
+                   help="the auditor's reviewer key registry (overrides the one in the pack)")
     args = parser.parse_args(argv)
 
     if args.command == "verify-pack":
@@ -1137,9 +1264,17 @@ def main(argv: list[str] | None = None) -> int:
                   "--trust-signer-in-pack to accept whichever key signed the pack (unsafe: anyone "
                   "can re-sign a pack).", file=sys.stderr)
             return 2
+        vpairs = lambda items: {k: v for k, _, v in (i.partition("=") for i in items)}  # noqa: E731
         try:
+            if args.now is not None and _parse_time(args.now) is None:
+                raise ValueError("--now must be UTC YYYY-MM-DDTHH:MM:SSZ")
             result = verify_pack(args.directory, args.operator_pubkey or None,
-                                 trust_signer_in_pack=args.trust_signer_in_pack)
+                                 trust_signer_in_pack=args.trust_signer_in_pack,
+                                 now=args.now, require_approval=args.require_approval,
+                                 require_policy=vpairs(args.require_policy) or None,
+                                 required_scopes=vpairs(args.require_scope) or None,
+                                 reviewer_keys=_read_reviewer_keys(args.reviewer_keys),
+                                 min_review_seconds=args.min_review_seconds)
         except ValueError as exc:
             print(f"traceseal-report verify-pack: {exc}", file=sys.stderr)
             return 2
@@ -1150,12 +1285,20 @@ def main(argv: list[str] | None = None) -> int:
         pin = ("pinned" if result["pinned"] else "NOT PINNED") if signer else ""
         print(f"[{'OK' if result['ok'] else 'FAIL'}] {result['files']} files, {result['receipts']} receipts, "
               f"pack signature: {sig}" + (f" by {_fp(signer)} ({pin})" if signer else ""))
-        print(f"  pack result: {result['pack_result'] or 'unknown (not re-derived)'}")
+        print(f"  pack result (as built): {result['pack_result'] or 'unknown (not re-derived)'}")
+        print(f"  auditor result (your clock and requirements): "
+              f"{result['auditor_result'] or 'unknown'}")
+        opts = result.get("analysis_options") or {}
+        if opts:
+            print("  recorded analysis options: " + ", ".join(
+                f"{k}={v}" for k, v in opts.items() if v not in (None, [], {}, 0)))
+        for finding in result["auditor_findings"][:30]:
+            print(f"  - {finding}")
         for problem in result["problems"]:
             print(f"  {problem}")
         if not result["ok"]:
             return 1
-        return 0 if result["pack_result"] == "passed" else 3
+        return 0 if result["auditor_result"] == "passed" else 3
 
     from traceseal_observe import OperatorKey
     from traceseal_observe.chain import _read_certs

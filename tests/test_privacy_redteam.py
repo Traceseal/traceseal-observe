@@ -425,3 +425,44 @@ class TestDestinationBlocking:
             assert check_client(ok) == []
         ok.get("https://api.example.com/").read()
         assert rs
+
+
+class TestPass2Edges:
+    """Second red-team pass: remaining URL and scrubbed-text gaps."""
+
+    @pytest.mark.parametrize("url,secret", [
+        ("https://gw.example.com/v1%3Bapi_key=SECRETSEMI/x", "SECRETSEMI"),
+        ("https://gw.example.com/key=hunter2pass/x", "hunter2pass"),
+        ("https://gw.example.com/passwd/hunter2/x", "hunter2"),
+    ])
+    def test_sanitize_url_edges(self, url, secret):
+        from traceseal_observe import sanitize_url
+        assert secret not in sanitize_url(url)
+
+    def test_provider_urls_untouched(self):
+        from traceseal_observe import sanitize_url
+        for url in ("https://api.anthropic.com/v1/messages",
+                    "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-x/invoke"):
+            assert sanitize_url(url) == url
+
+    @pytest.mark.parametrize("text,secret", [
+        ("ValueError: bad key sk-proj-ABCDEFGHIJKLMNOPQRSTUV here", "sk-proj-ABCDEFGHIJKLMNOPQRSTUV"),
+        ("KeyError: password 'hunter2' rejected", "hunter2"),
+        ("RuntimeError: secret is: hunter2", "hunter2"),
+        ("X: aws wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY bad", "wJalrXUtnFEMI"),
+        ("X: call +44 20 7946 0958 now", "7946"),
+    ])
+    def test_scrubbed_text_edges(self, text, secret):
+        assert secret not in _redact_error(text, mode="scrubbed")
+
+    def test_plain_errors_stay_readable_when_scrubbed(self):
+        msg = "TimeoutError: read timed out after 30 seconds on /v1/messages"
+        assert _redact_error(msg, mode="scrubbed") == msg
+
+
+def test_signing_refuses_values_every_verifier_rejects():
+    from traceseal_observe import sign_execution_receipt
+    k = OperatorKey.generate()
+    for bad in ({"receipt_type": "tool", "flag": True}, {"receipt_type": "tool", "x": None}):
+        with pytest.raises(ValueError, match="RECEIPT-SPEC"):
+            sign_execution_receipt(bad, {"provenance_version": "1.0"}, k)

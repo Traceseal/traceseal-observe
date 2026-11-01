@@ -127,7 +127,7 @@ class TestVerifyPackTrust:
         assert result["ok"] and result["pinned"] and result["signed"]
         assert result["pack_result"] == "ISSUES FOUND"
         assert report_mod.main(["verify-pack", str(pack), "--operator-pubkey", key.public_key_hex]) == 3
-        assert "pack result: ISSUES FOUND" in capsys.readouterr().out
+        assert "auditor result (your clock and requirements): ISSUES FOUND" in capsys.readouterr().out
 
     def test_unsigned_pack_fails(self, tmp_path):
         key = OperatorKey.generate()
@@ -617,3 +617,63 @@ def test_normalized_reviewer_registry_round_trips(tmp_path):
     stored = json.loads((tmp_path / "pack" / "report.json").read_text())["analysis_options"]
     assert stored["reviewer_keys"] == {"id:alice": [rev.public_key_hex]}
     assert verify_pack(tmp_path / "pack", [key.public_key_hex])["ok"]
+
+
+class TestAuditorControlsTheAnalysis:
+    """Pass 2: the pack author must not choose the clock or drop requirements,
+    and nothing in report.json / report.md may be edited."""
+
+    def _incident_pack(self, tmp_path, **build):
+        from traceseal_observe import sign_incident
+        from traceseal_observe.report import build_pack
+
+        key = OperatorKey.generate()
+        inc = sign_incident(category="serious_incident", severity="critical", status="detected",
+                            aware_at="2026-01-01T00:00:00Z", operator_key=key)
+        paths = _write(tmp_path, [inc])
+        build_pack(tmp_path / "pack", paths, operator_key=key,
+                   operator_keys=[key.public_key_hex], **build)
+        return key
+
+    def test_backdated_now_is_a_problem_and_auditor_clock_rules(self, tmp_path):
+        from traceseal_observe.report import verify_pack
+
+        key = self._incident_pack(tmp_path, now="2026-01-01T01:00:00Z")
+        r = verify_pack(tmp_path / "pack", [key.public_key_hex])
+        assert r["pack_result"] == "passed"           # what the author computed
+        assert r["auditor_result"] == "ISSUES FOUND"  # today the Art. 73 deadline has passed
+        assert any("MISSED" in f for f in r["auditor_findings"])
+
+    def test_back_dated_before_own_receipts_fails(self, tmp_path):
+        from traceseal_observe.report import verify_pack
+
+        key = self._incident_pack(tmp_path, now="2025-06-01T00:00:00Z")
+        r = verify_pack(tmp_path / "pack", [key.public_key_hex])
+        assert not r["ok"] and any("back-dated analysis" in p for p in r["problems"])
+
+    def test_auditor_adds_requirements(self, tmp_path):
+        from traceseal_observe.report import build_pack, verify_pack
+
+        key = OperatorKey.generate()
+        paths = _write(tmp_path, [_tool(key, "issue_refund", {})])
+        build_pack(tmp_path / "pack", paths, operator_key=key, operator_keys=[key.public_key_hex])
+        plain = verify_pack(tmp_path / "pack", [key.public_key_hex])
+        strict = verify_pack(tmp_path / "pack", [key.public_key_hex], require_approval=["issue_refund"])
+        assert plain["auditor_result"] == "passed" and strict["auditor_result"] == "ISSUES FOUND"
+
+    def test_any_edit_to_report_files_is_caught(self, tmp_path):
+        from traceseal_observe.report import verify_pack
+
+        key = self._incident_pack(tmp_path)
+        pack = tmp_path / "pack"
+        rj = json.loads((pack / "report.json").read_text())
+        rj["incidents"] = []
+        (pack / "report.json").write_text(json.dumps(rj, indent=2, sort_keys=True))
+        md = pack / "report.md"
+        md.write_text(md.read_text() + "\nNo incidents. All controls satisfied.\n")
+        _remanifest(pack)
+        _resign(pack, key)
+        r = verify_pack(pack, [key.public_key_hex])
+        assert not r["ok"]
+        assert any("report.json does not match" in p for p in r["problems"])
+        assert any("report.md does not match" in p for p in r["problems"])

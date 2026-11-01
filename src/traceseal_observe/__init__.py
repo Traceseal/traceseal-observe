@@ -88,8 +88,13 @@ _TOKEN_SEGMENT_RE = _re.compile(
 # A segment named like this is followed by a secret (".../key/<secret>").
 _SECRET_MARKER_SEGMENTS = frozenset({
     "key", "keys", "token", "tokens", "secret", "apikey", "api_key", "api-key",
-    "access_token", "auth", "sig", "signature", "password", "credentials",
+    "access_token", "auth", "sig", "signature", "password", "passwd", "pwd", "pass",
+    "credential", "credentials", "session", "sessionid", "private", "otp",
 })
+# A path segment like "api_key=..." or "password:..." carries its value inline.
+_CREDENTIAL_PAIR_SEGMENT_RE = _re.compile(
+    r"(?i)(api[_-]?key|access[_-]?key|token|secret|passw(or)?d|pwd|pass|auth|session|sig|signature|key)"
+    r"\s*[=:]")
 # Everything after one of these segments is a webhook capability.
 _WEBHOOK_MARKER_SEGMENTS = frozenset({"hooks", "hook", "webhook", "webhooks", "catch", "trigger"})
 # Hosts whose whole path (after the first segment) is the capability.
@@ -118,6 +123,8 @@ def _secret_segment(segment: str) -> bool:
     text = unquote(segment)
     if not text:
         return False
+    if _CREDENTIAL_PAIR_SEGMENT_RE.search(text):
+        return True
     if _TOKEN_SEGMENT_RE.match(text):
         return True
     for name, pattern in _PII_PATTERNS.items():
@@ -172,7 +179,8 @@ def sanitize_url(url: Any, *, host_only: bool = False) -> str:
     redact_rest = False
     seen_named = 0
     for i, segment in enumerate(segments):
-        segment = segment.split(";", 1)[0]  # drop ;params
+        # drop ;params, including a percent-encoded ";" (%3B)
+        segment = _re.split(r";|%3[bB]", segment, maxsplit=1)[0]
         if i == 0 or segment == "":
             out.append(segment)
             continue
@@ -260,6 +268,13 @@ _CREDENTIAL_PAIR_RE = _re.compile(
 _INPUT_VALUE_RE = _re.compile(r"input_value=.*?(?=, input_type=|\]|$)", _re.MULTILINE)
 
 
+# "password 'hunter2'", "secret is: x", "token = x" (quoted or not).
+_LOOSE_SECRET_RE = _re.compile(
+    r"(?i)\b((?:api[ _-]?key|access[ _-]?key|secret(?:[ _-]?key)?|token|passw(?:or)?d|pwd|"
+    r"credentials?)\b\s*(?:is|was|=|:)?\s*[:=]?\s*)(['\"]?)[^\s'\",;&]{3,}\2")
+_SPACED_PHONE_RE = _re.compile(r"\+\d{1,3}(?:[ .-]?\(?\d{1,4}\)?){2,5}\d")
+
+
 def _scrub_error_text(text: str) -> str:
     text = _INPUT_VALUE_RE.sub("input_value=" + REDACTED, text)
     text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
@@ -267,13 +282,18 @@ def _scrub_error_text(text: str) -> str:
     text = _URL_IN_TEXT_RE.sub(lambda m: sanitize_url(m.group()), text)
     text = _USERINFO_RE.sub(REDACTED + "@", text)
     text = _CREDENTIAL_PAIR_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    text = _LOOSE_SECRET_RE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _SPACED_PHONE_RE.sub("{phone}", text)
     for name, pattern in _PII_PATTERNS.items():
         validator = _PII_VALIDATORS.get(name)
         text = pattern.sub(
             lambda m, n=name, v=validator: m.group() if v and not v(m.group()) else "{" + n + "}",
             text,
         )
-    return text
+    # Any remaining word that looks like a credential or identifier token
+    # (API-key shapes, long high-entropy strings) is redacted too.
+    return _re.sub(r"[^\s'\"`,;()\[\]{}<>]{12,}",
+                   lambda m: REDACTED if _secret_segment(m.group()) else m.group(), text)
 
 
 def _redact_error(message: Any, limit: int = 200, *, mode: str | None = None) -> str:
@@ -834,6 +854,13 @@ def sign_execution_receipt(
     receipt_type = execution.get("receipt_type")
     if not isinstance(receipt_type, str) or not receipt_type:
         raise ValueError("execution.receipt_type is required")
+    # Refuse what every verifier would reject (RECEIPT-SPEC §3): booleans,
+    # nulls, circular values. Use strings such as "true" / "false".
+    forbidden = (_forbidden_json_value(execution, ".execution")
+                 or _forbidden_json_value(provenance, ".provenance"))
+    if forbidden:
+        raise ValueError(f"cannot sign: JSON boolean, null or circular value at {forbidden} "
+                         "(RECEIPT-SPEC §3; use strings such as \"true\")")
     try:
         execution_copy = json.loads(canonical_dumps(execution))
         provenance_copy = json.loads(canonical_dumps(provenance))

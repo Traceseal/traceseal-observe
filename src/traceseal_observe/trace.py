@@ -104,6 +104,11 @@ def _chain_pos(receipt: Receipt) -> tuple[str, int] | None:
     return None
 
 
+def _same_chain(a: Receipt, b: Receipt) -> bool:
+    pa, pb = _chain_pos(a), _chain_pos(b)
+    return pa is not None and pb is not None and pa[0] == pb[0]
+
+
 def _order(a: Receipt, b: Receipt) -> int | None:
     """Signed order of a relative to b: -1 before, 1 after, 0 same second,
     None unknown. chain_seq when both are in one chain, else signed time."""
@@ -494,7 +499,13 @@ def verify_trace(
                 if position == 1:
                     continue  # the stop came later
                 orders = [_order(lift, receipt) for lift in lifts]
-                if any(o == -1 for o in orders):
+                lifted_by = [lift for lift, o in zip(lifts, orders) if o == -1]
+                if lifted_by:
+                    if not any(_same_chain(lift, receipt) for lift in lifted_by):
+                        warnings.append(
+                            f"{label}: allowed after a human stop because a resume is signed as "
+                            "earlier, but the resume and this action are not in one chain, so the "
+                            "order rests on the operator's signed times, not on chain sequence")
                     continue  # resumed strictly before this action
                 if lifts and all(o is None for o in orders):
                     errors.append(f"{label}: cannot order against the human resume of stop "

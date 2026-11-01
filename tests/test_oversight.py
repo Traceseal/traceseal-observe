@@ -230,7 +230,10 @@ class TestOversightChecks:
         with agent_context(session_id="s-9"):
             resume = sign_oversight(decision="resumed", operator_key=key, reviewer=REVIEWER,
                                     subjects=[stop], decided_at="2020-01-01T00:05:00Z")
-        assert verify_trace([stop, resume, after])["ok"]
+        report = verify_trace([stop, resume, after])
+        assert report["ok"]
+        # unchained: the order rests on signed times, and the report says so
+        assert any("operator's signed times" in w for w in report["warnings"])
         with agent_context(session_id="other"):
             elsewhere = observe_tool("t", key, lambda: 1)[1]
         assert verify_trace([stop, elsewhere])["ok"]
