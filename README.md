@@ -14,10 +14,12 @@ your customer) can verify it on their own machine, without access to yours.
 > show me nothing is missing. Not a screenshot: something I can verify
 > independently."*
 
-The EU AI Act (record-keeping, human oversight, log retention, incident
-reporting), GDPR, NIS2, DORA and the procurement questionnaires that
-follow them all ask versions of this question. "Trust our logs" doesn't
-answer it. Signed, chained, independently timestamped receipts do.
+The EU AI Act (record-keeping, human oversight, log retention and incident
+reporting for high-risk systems, from December 2027), GDPR, NIS2, DORA and
+the procurement questionnaires that follow them all ask versions of this
+question. "Trust our logs" doesn't answer it. Signed, chained,
+independently timestamped receipts give you evidence you can hand over.
+They are evidence, not a compliance verdict: see [LEGAL.md](LEGAL.md).
 
 ## One minute
 
@@ -146,27 +148,42 @@ authorisation, trace, causes) and chain fields (`chain_id`, `chain_seq`,
 
 ## Mapping to obligations
 
-Informational, not legal advice. `traceseal-report` produces this mapping
-from your actual receipts, with the problems it found.
+**Informational, not legal advice.** TraceSeal produces verifiable
+evidence. It is not a conformity assessment or a certification, and using
+it does not by itself make anyone compliant with anything. Read
+[LEGAL.md](LEGAL.md) before relying on this table. `traceseal-report`
+produces the mapping from your actual receipts, with the problems it found.
 
-| Obligation | Evidence |
-|---|---|
-| EU AI Act Art. 12: record-keeping | chained receipts, checkpoints, trusted time |
-| Art. 12(2)–(3): identify situations, inputs, persons | signed context, input/output hashes |
-| Art. 14 / 26(2): human oversight | oversight receipts, required-approval checks, reviewer signatures |
-| Art. 19 / 26(6): keep logs ≥ 6 months | vault retention floors, chains, checkpoints |
-| Art. 26(5): monitoring | causality checks, unprompted actions, changed arguments, policy decisions |
-| Art. 72 / 73: post-market monitoring, serious incidents | outcome and incident receipts, deadline tracking |
-| GDPR Art. 5, 25: minimisation | hashes not values, principal commitments |
-| GDPR Art. 15 / 17: access, erasure | principal lookups, crypto-shredding with erasure receipts |
-| GDPR Art. 30, 33: records, breach notification | data-flow receipts, incident deadlines |
-| NIS2 Art. 23, DORA | incident receipts and timelines |
-| ISO/IEC 42001, NIST AI RMF | event logging, monitoring, incident response evidence |
+The EU AI Act obligations below apply to **high-risk** AI systems only.
+As amended by Regulation (EU) 2026/1744 (the Digital Omnibus on AI), they
+apply from **2 December 2027** for Annex III systems and **2 August 2028**
+for Annex I systems. Most agent deployments are not high-risk; whether
+yours is depends on its intended purpose. GDPR, NIS2 and DORA already apply
+where you are in scope.
+
+| Obligation | Applies to | Evidence TraceSeal can supply |
+|---|---|---|
+| EU AI Act Art. 12: record-keeping | providers (system design) | chained receipts, checkpoints, trusted time |
+| Art. 12(2): logs that support risk identification and monitoring | providers | signed context, input/output hashes |
+| Art. 14 / 26(2): human oversight | providers (design) / deployers (assign people) | oversight receipts, required-approval checks, reviewer signatures |
+| Art. 19 / 26(6): keep logs ≥ 6 months | providers / deployers | vault retention floors, chains, checkpoints |
+| Art. 26(5): monitoring | deployers | causality checks, unprompted actions, changed arguments, policy decisions |
+| Art. 72 / 73: post-market monitoring, serious incidents | providers (deployers inform them) | outcome and incident receipts, deadline tracking |
+| GDPR Art. 5, 25: minimisation, data protection by design | controllers | hashes not values, pseudonymised principal commitments |
+| GDPR Art. 15 / 17: access, erasure | controllers | principal lookups, crypto-shredding with erasure receipts |
+| GDPR Art. 30, 33, 34: records, breach notification | controllers (processors notify them) | data-flow receipts (input only), incident deadlines |
+| NIS2 Art. 23 | essential and important entities | incident receipts and timelines |
+| DORA Art. 19 | financial entities | incident receipts, 24-hour outer limit |
+| ISO/IEC 42001, NIST AI RMF (voluntary) | adopters | event logging, monitoring, incident response evidence |
+
+"Evidence" means relevant records exist and pass verification, not that
+the obligation is met. Pseudonymised data (principal commitments, hashes
+of guessable values) is still personal data under GDPR.
 
 ## Privacy
 
-Receipts contain **hashes, not values**. Principals are keyed commitments,
-never raw user ids. Data-flow receipts carry **counts** of PII-shaped
+Receipts contain **hashes, not values**. Principals are keyed commitments
+(pseudonymised, not anonymised), never raw user ids. Data-flow receipts carry **counts** of PII-shaped
 patterns: emails, phone numbers (US, UK, international), cards, IBANs,
 IPv4 addresses, US SSNs, credentials. Payloads you need to keep live
 encrypted in the evidence vault, erasable per user or tenant.
@@ -263,4 +280,6 @@ Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-Apache 2.0: no barriers to signing, no barriers to verification.
+Apache 2.0: no barriers to signing, no barriers to verification. Provided
+"as is", without warranty. Regulatory references are informational and
+not legal advice; see [LEGAL.md](LEGAL.md).

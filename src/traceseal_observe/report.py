@@ -17,8 +17,9 @@ and `traceseal-report verify-pack pack/` re-checks the manifest, the pack
 signature and every receipt signature, offline.
 
 The control mapping says what evidence exists for each obligation and
-whether the verifiers found problems. It is not a conformity assessment
-and not legal advice: it shows where the evidence is, and where it isn't.
+whether the verifiers found problems. It is not a conformity assessment,
+not a certification and not legal advice: it shows where the evidence is,
+and where it isn't. Each control says who the obligation applies to.
 """
 
 from __future__ import annotations
@@ -35,6 +36,16 @@ from typing import Any
 from traceseal_observe import Receipt, summarize_data_flows, verify_receipt_signature
 
 PACK_VERSION = "1.0"
+HIGH_RISK_DATES = ("Applies from 2 December 2027 (Annex III) and 2 August 2028 (Annex I), "
+                   "as amended by Regulation (EU) 2026/1744.")
+LEGAL_NOTICE = (
+    "This pack maps cryptographically verified evidence to obligations. It is informational "
+    "only: it is not legal advice, not a conformity assessment, not a certification, and not "
+    "a finding that any obligation is met. 'evidence' means relevant records exist and passed "
+    "verification; it does not mean the obligation is satisfied. Whether an obligation applies "
+    "depends on your role, whether the system is high-risk, and national law. Laws and dates "
+    "change: check the current texts and obtain advice from qualified counsel."
+)
 _TIME_KEYS = ("started_at", "observed_at", "decided_at", "aware_at", "chained_at")
 
 
@@ -171,6 +182,7 @@ def analyse(
                      for r in erasures],
     }
     summary["controls"] = map_controls(summary)
+    summary["legal_notice"] = LEGAL_NOTICE
     summary["ok"] = (
         not signature_failures
         and all(rep["ok"] for rep in chain_reports.values())
@@ -210,73 +222,120 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
     period_days = s["period"]["days"]
     flows = s["data_flows"]
 
-    def control(framework, ref, title, status, evidence, notes=""):
+    def control(framework, ref, title, status, evidence, notes="", applies_to=""):
         problems: list[str] = []
         if isinstance(status, tuple):
             status, problems = status
         return {"framework": framework, "ref": ref, "title": title, "status": status,
-                "evidence": evidence, "notes": notes, "problems": problems}
+                "evidence": evidence, "notes": notes, "problems": problems,
+                "applies_to": applies_to}
 
+    high_risk = "Providers of high-risk AI systems. " + HIGH_RISK_DATES
+    deployer = "Deployers of high-risk AI systems. " + HIGH_RISK_DATES
     out = [
         control("EU AI Act", "Art. 12", "Record-keeping: automatic logging of events",
                 _status(ops > 0, chain_issues + s["signature_failures"]),
                 f"{ops} signed operational receipts; {len(chains)} chain(s); "
                 f"{len(anchored)} anchored to a checkpoint; {len(trusted)} with trusted time "
                 f"(TSA/witness); {s['unchained_operational_receipts']} receipts outside any chain.",
-                "Unchained receipts cannot show completeness." if s["unchained_operational_receipts"] else ""),
-        control("EU AI Act", "Art. 12(2)-(3)", "Logs identify situations, inputs and persons involved",
+                ("Unchained receipts cannot show completeness. " if s["unchained_operational_receipts"] else "")
+                + "Art. 12 is a design duty on the system; these receipts are evidence that "
+                  "logging operated, not a finding that the logging design is sufficient.",
+                high_risk),
+        control("EU AI Act", "Art. 12(2)", "Logs enable risk identification, post-market and "
+                "deployer monitoring",
                 _status(s["with_context"] > 0, []),
                 f"{s['with_context']} receipts carry signed agent/principal/trace context; "
-                f"inputs and outputs committed by hash."),
-        control("EU AI Act", "Art. 14", "Human oversight",
+                f"inputs and outputs committed by hash.",
+                "The extra logging content of Art. 12(3) applies only to remote biometric "
+                "identification systems and is not assessed here.",
+                high_risk),
+        control("EU AI Act", "Art. 14 / 26(2)", "Human oversight",
                 _status(bool(trace["oversight"]), oversight_errors),
                 f"{len(trace['oversight'])} human decisions "
-                f"({sum(1 for o in trace['oversight'] if o['reviewer_signed'])} reviewer-signed)."),
+                f"({sum(1 for o in trace['oversight'] if o['reviewer_signed'])} reviewer-signed).",
+                "Records that oversight took place; whether the oversight measures and the "
+                "reviewers' competence meet Art. 14 and 26(2) is not assessed.",
+                "Art. 14: providers (design). Art. 26(2): deployers (assigning competent people). "
+                + HIGH_RISK_DATES),
         control("EU AI Act", "Art. 19 / 26(6)", "Logs kept for at least six months",
                 "evidence" if period_days >= 183 else ("no evidence" if ops == 0 else "partial"),
                 f"This pack covers {period_days} days ({s['period']['first']} .. {s['period']['last']}).",
-                "Retention is shown by the operator's archive and vault policy; a pack shows the period it covers."),
+                "Retention is shown by the operator's archive and vault policy; a pack shows the "
+                "period it covers. Art. 26(6) is subject to Union and national data-protection law, "
+                "and logs must be kept under the deployer's control.",
+                "Art. 19: providers. Art. 26(6): deployers. " + HIGH_RISK_DATES),
         control("EU AI Act", "Art. 26(5)", "Deployer monitoring of operation",
                 _status(ops > 0, authz_errors + policy_errors),
                 f"{len(trace['unprompted_tool_receipts'])} tool actions without a model cause; "
                 f"{sum(1 for c in trace['tool_calls'] if c['status'] == 'arguments_differ')} with changed arguments; "
                 f"{len(trace['unexecuted_tool_calls'])} requested calls not executed; "
-                f"{len(trace['policy_decisions'])} automated policy decisions."),
+                f"{len(trace['policy_decisions'])} automated policy decisions.",
+                "Monitoring must follow the provider's instructions for use; this is supporting "
+                "evidence only.",
+                deployer),
         control("EU AI Act", "Art. 72", "Post-market monitoring",
                 _status(s["by_type"].get("outcome", 0) + len(s["incidents"]) > 0, []),
-                f"{s['by_type'].get('outcome', 0)} outcome receipts; {len(s['incidents'])} incident(s)."),
+                f"{s['by_type'].get('outcome', 0)} outcome receipts; {len(s['incidents'])} incident(s).",
+                "Input to a post-market monitoring plan; not the plan itself.",
+                high_risk),
         control("EU AI Act", "Art. 73", "Serious incident reporting",
                 _status(any(i["category"] == "serious_incident" for i in s["incidents"]),
                         [m for m in missed if m.startswith("serious_incident")]),
                 f"{sum(1 for i in s['incidents'] if i['category'] == 'serious_incident')} serious incident(s) recorded.",
-                "No incidents recorded is not evidence that none occurred."),
-        control("GDPR", "Art. 5(1)(c), 25", "Data minimisation / privacy by design",
+                "No incidents recorded is not evidence that none occurred.",
+                high_risk + " Deployers inform the provider immediately (Art. 26(5))."),
+        control("GDPR", "Art. 5(1)(c), 25", "Supports data minimisation / data protection by design",
                 "evidence" if ops else "no evidence",
-                "Receipts hold hashes, not values; principals are keyed commitments. "
-                f"PII patterns seen in outbound payloads: {flows['pii_summary'] or 'none detected'}."),
-        control("GDPR", "Art. 17", "Right to erasure",
+                "Receipts hold hashes, not values; principals are keyed (pseudonymised) commitments. "
+                f"PII patterns seen in outbound payloads: {flows['pii_summary'] or 'none detected'}.",
+                "Pseudonymised data is still personal data (Art. 4(5), Recital 26). Hashes of short "
+                "or guessable values can be reversed by guessing.",
+                "Controllers processing personal data."),
+        control("GDPR", "Art. 17", "Supports the right to erasure",
                 _status(bool(s["erasures"]), []),
                 f"{len(s['erasures'])} signed erasure receipt(s) "
-                f"({sum(1 for e in s['erasures'] if e['retention_overridden'] == 'true')} overriding retention)."),
-        control("GDPR", "Art. 30, 44", "Records of processing / transfers",
+                f"({sum(1 for e in s['erasures'] if e['retention_overridden'] == 'true')} overriding retention).",
+                "Crypto-shredding is a technical erasure measure; it does not reach backups or copies "
+                "held by others. Refusing or delaying erasure must rest on an Art. 17(3) exception.",
+                "Controllers processing personal data."),
+        control("GDPR", "Art. 30, 44", "Input to records of processing / transfer assessment",
                 _status(flows["total_calls"] > 0, []),
                 f"{flows['total_calls']} outbound data flows to {len(flows['destinations'])} host(s); "
                 f"{flows['undeclared_calls']} to undeclared destinations.",
-                "Hosts are recorded; their jurisdictions must be mapped by the operator."),
-        control("GDPR", "Art. 33", "Personal data breach notification (72h)",
+                "Supporting input only: a record of processing needs purposes, categories and "
+                "recipients, and a host name does not establish where data is processed.",
+                "Controllers and processors."),
+        control("GDPR", "Art. 33 / 34", "Personal data breach notification",
                 _status(any(i["category"] == "personal_data_breach" for i in s["incidents"]),
                         [m for m in missed if m.startswith("personal_data_breach")]),
-                f"{sum(1 for i in s['incidents'] if i['category'] == 'personal_data_breach')} breach record(s)."),
-        control("NIS2", "Art. 23", "Incident reporting (24h / 72h)",
+                f"{sum(1 for i in s['incidents'] if i['category'] == 'personal_data_breach')} breach record(s).",
+                "Only the Art. 33 notification is checked against its deadline; Art. 34 "
+                "communication to data subjects is listed, not tracked.",
+                "Controllers; processors notify the controller (Art. 33(2))."),
+        control("NIS2", "Art. 23", "Significant incident reporting",
                 _status(any(i["category"] == "significant_incident" for i in s["incidents"]),
                         [m for m in missed if m.startswith("significant_incident")]),
-                f"{sum(1 for i in s['incidents'] if i['category'] == 'significant_incident')} significant incident(s)."),
+                f"{sum(1 for i in s['incidents'] if i['category'] == 'significant_incident')} significant incident(s).",
+                "Checked against the 24h/72h limits only; national transposition may differ.",
+                "Essential and important entities under national NIS2 law."),
+        control("DORA", "Art. 19", "Major ICT-related incident reporting",
+                _status(any(i["category"] == "major_ict_incident" for i in s["incidents"]),
+                        [m for m in missed if m.startswith("major_ict_incident")]),
+                f"{sum(1 for i in s['incidents'] if i['category'] == 'major_ict_incident')} major ICT incident(s).",
+                "Checked against the 24-hour outer limit only; the 4-hour limit runs from "
+                "classification, which is not recorded.",
+                "EU financial entities within DORA's scope."),
         control("ISO/IEC 42001", "Annex A", "AI system event logging and monitoring",
                 _status(ops > 0, chain_issues),
-                "Same evidence as EU AI Act Art. 12 and 26(5)."),
+                "Same evidence as EU AI Act Art. 12 and 26(5).",
+                "Voluntary standard; certification is a matter for an accredited body.",
+                "Organisations adopting the standard."),
         control("NIST AI RMF", "MEASURE / MANAGE", "Tracking, monitoring and incident response",
                 _status(ops > 0, chain_issues + missed),
-                "Same evidence as EU AI Act Art. 12, 72 and 73."),
+                "Same evidence as EU AI Act Art. 12, 72 and 73.",
+                "Voluntary framework.",
+                "Organisations adopting the framework."),
     ]
     return out
 
@@ -292,14 +351,15 @@ def render_markdown(s: dict[str, Any]) -> str:
     p = s["period"]
     lines.append(f"**Period:** {p['first']} .. {p['last']} ({p['days']} days)  ")
     lines.append(f"**Receipts:** {s['receipts']} ({s['valid_signatures']} with valid signatures)")
-    lines += ["", "> Informational mapping of verified evidence to obligations. Not a",
-              "> conformity assessment and not legal advice.", "", "## Controls", "",
-              "| Framework | Ref | Obligation | Status | Evidence |", "|---|---|---|---|---|"]
+    lines += ["", "> **Legal notice.** " + LEGAL_NOTICE, "", "## Controls", "",
+              "| Framework | Ref | Obligation | Applies to | Status | Evidence |",
+              "|---|---|---|---|---|---|"]
     for c in s["controls"]:
         note = f" _{c['notes']}_" if c["notes"] else ""
         problems = (" **Problems:** " + "; ".join(c["problems"][:3])) if c["problems"] else ""
         cell = f"{c['evidence']}{note}{problems}".replace("|", "\\|")
-        lines.append(f"| {c['framework']} | {c['ref']} | {c['title']} | **{c['status']}** | {cell} |")
+        who = c.get("applies_to", "").replace("|", "\\|")
+        lines.append(f"| {c['framework']} | {c['ref']} | {c['title']} | {who} | **{c['status']}** | {cell} |")
     lines += ["", "## Receipts by type", ""]
     lines += [f"- {t}: {n}" for t, n in s["by_type"].items()]
     lines += ["", "## Chains", ""]
@@ -342,8 +402,11 @@ def render_markdown(s: dict[str, Any]) -> str:
                      f"aware {i['aware_at']}, first reported {i['first_reported_at'] or 'not yet'}")
         for d in i["missed_deadlines"]:
             lines.append(f"  - MISSED: {d['basis']} due {d['due']}")
+        for o in i.get("related_obligations", []):
+            lines.append(f"  - Follow-up (not tracked): {o['basis']}: {o['step']} ({o['timing']})")
     if s["signature_failures"]:
         lines += ["", "## Signature failures", ""] + [f"- {e}" for e in s["signature_failures"]]
+    lines += ["", "## Legal notice", "", LEGAL_NOTICE]
     lines += ["", "## Verify this pack", "", "```bash", "traceseal-report verify-pack <this directory>", "```", ""]
     return "\n".join(lines)
 

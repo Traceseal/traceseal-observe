@@ -20,17 +20,28 @@ Each stage is its own chainable receipt, linked to the previous stage by
 `supersedes`. Receipts sign the deadlines `reporting_deadlines()`
 computed, so the record shows which deadline the operator worked to:
 
-| Category | Deadline from awareness | Basis |
-|---|---|---|
-| `serious_incident` | 15 days; 10 days if a death; 2 days if widespread or critical infrastructure | EU AI Act Art. 73(2)–(4) |
-| `personal_data_breach` | 72 hours | GDPR Art. 33(1) |
-| `significant_incident` | early warning 24 h, notification 72 h | NIS2 Art. 23(4) |
-| `major_ict_incident` | set by DORA's technical standards; not computed | DORA Art. 19 |
+| Category | Latest time from awareness | Governing rule | Basis |
+|---|---|---|---|
+| `serious_incident` | 15 days; 10 days if a death; 2 days if widespread or Art. 3(49)(b) | *immediately* once a causal link is established or reasonably likely; high-risk systems only, from 2 Dec 2027 (Annex III) / 2 Aug 2028 (Annex I) | EU AI Act Art. 73(2)–(4) |
+| `personal_data_breach` | 72 hours | *without undue delay* and, where feasible, within 72 h | GDPR Art. 33(1) |
+| `significant_incident` | early warning 24 h, notification 72 h | *without undue delay*; national transposition may add rules | NIS2 Art. 23(4) |
+| `major_ict_incident` | initial notification 24 h | 4 h from classification as major, no later than 24 h from awareness | DORA Art. 19; Delegated Regulation (EU) 2025/301 Art. 5 |
 
-These deadlines are informational, not legal advice. Check the
-regulation's current text and any national rules. `incident_status()`
-collapses the stages and reports deadlines that passed unreported or were
-reported late.
+Each deadline is signed with its `qualifier`. The due time is the **latest
+permissible** time: reporting at it can still be late where the law says
+"immediately" or "without undue delay". Report as early as you can.
+
+`related_obligations()` lists the follow-up duties that have no fixed time
+from awareness, and incident receipts carry them: AI Act Art. 26(5) and
+73(6); GDPR Art. 33(5) and 34; NIS2 Art. 23(1) and the intermediate and
+final reports; DORA intermediate and final reports and client
+information. They are listed, not checked.
+
+`incident_status()` collapses the stages and reports first notifications
+that passed unreported or were reported late. These deadlines are
+informational, not legal advice: whether a regime applies to you, national
+rules and later amendments must be checked with counsel. See
+[LEGAL.md](LEGAL.md).
 
 ## Evidence packs
 

@@ -2,9 +2,13 @@
 
 **Version:** 1.0 (additive to RECEIPT-SPEC.md v1.0)
 
-EU AI Act Art. 14 requires that people can understand, monitor, override
-and stop a high-risk AI system. Art. 26(2) requires deployers to assign
-that oversight to competent people. Two receipt types turn each
+EU AI Act Art. 14 requires that high-risk AI systems are designed so
+people can understand, monitor, override and stop them. Art. 26(2)
+requires deployers to assign that oversight to competent people. These
+duties apply to high-risk systems only: from 2 December 2027 (Annex III)
+and 2 August 2028 (Annex I), as amended by Regulation (EU) 2026/1744.
+Receipts record that oversight happened. Whether the oversight measures
+are adequate is not something a receipt can show. See [LEGAL.md](LEGAL.md). Two receipt types turn each
 intervention, human or automated, into a signed, chainable record that a
 verifier can hold the agent's actions against.
 
@@ -31,7 +35,7 @@ with caused_by(model_receipt, approval, tool_call_id="toolu_A"):
 | `decision` | one of the six decisions above |
 | `reviewer`, `reviewer_role` | principal commitment (AGENT-CONTEXT.md §2.1) and role |
 | `subject_receipt_hashes`, `tool_call_ids` | what the decision is about |
-| `presented_hash` | hash of what the reviewer was shown: evidence they could understand it (Art. 14(4)(a), (c)) |
+| `presented_hash` | hash of what the reviewer was shown: evidence of what they had in front of them (relevant to Art. 14(4)(a), (c); it does not show they understood it) |
 | `rationale_hash` | hash of the reviewer's reason |
 | `modified_input_hash` | with `modified`: the arguments the reviewer approved instead |
 | `review_started_at`, `decided_at`, `review_seconds` | signed review timing |

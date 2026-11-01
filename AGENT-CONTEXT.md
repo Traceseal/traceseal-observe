@@ -177,14 +177,22 @@ Authorisation **errors**:
 
 This mapping is informational, not legal advice.
 
-- **EU AI Act Art. 12(2) / 12(3):** logs that identify the situations,
-  inputs and persons involved; `agent`, `principal` and `trace` give that
-  identification.
+- **EU AI Act Art. 12(2)** (high-risk systems; from 2 December 2027 for
+  Annex III and 2 August 2028 for Annex I): logs that support identifying
+  risk situations and monitoring operation. `agent`, `principal` and
+  `trace` supply that context. The extra content listed in Art. 12(3)
+  applies only to remote biometric identification systems.
 - **Art. 14 human oversight:** `granted_by` and `authorization` record who
-  authorised the agent. Dedicated human-approval receipts are on the
-  roadmap.
+  authorised the agent. Human decisions are recorded with `oversight`
+  receipts ([HUMAN-OVERSIGHT](HUMAN-OVERSIGHT.md)).
 - **Art. 26(5)–(6) deployer monitoring:** `unprompted_tool_receipts` and
-  `arguments_differ` are exactly the anomalies a deployer is expected to
-  notice.
-- **GDPR Art. 15 / 17:** principal commitments allow access lookups and
-  erasure by destroying the pepper; Art. 5(1)(c) data minimisation.
+  `arguments_differ` are anomalies a deployer would want to notice; they
+  support, and do not replace, monitoring under the provider's
+  instructions for use.
+- **GDPR Art. 15 / 17:** principal commitments allow access lookups.
+  Destroying the pepper removes the ability to link *every* commitment
+  under it to a person. Whether that amounts to erasure, or makes the
+  data anonymous, is a legal assessment. Until then, commitments are
+  **pseudonymised personal data** for whoever holds the pepper (GDPR
+  Art. 4(5), Recital 26), and so are hashes of guessable values.
+  Art. 5(1)(c): receipts hold hashes and commitments, not values.

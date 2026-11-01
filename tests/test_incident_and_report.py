@@ -39,9 +39,36 @@ class TestDeadlines:
         assert reporting_deadlines("personal_data_breach", aware)[0]["due"] == "2026-10-04T09:00:00Z"
         nis2 = reporting_deadlines("significant_incident", aware)
         assert [d["due"] for d in nis2] == ["2026-10-02T09:00:00Z", "2026-10-04T09:00:00Z"]
-        assert reporting_deadlines("major_ict_incident", aware) == []
+        dora = reporting_deadlines("major_ict_incident", aware)
+        assert [d["due"] for d in dora] == ["2026-10-02T09:00:00Z"]
+        assert "4 hours of classifying" in dora[0]["qualifier"]
+        assert reporting_deadlines("malfunction", aware) == []
         with pytest.raises(ValueError):
             reporting_deadlines("bad", aware)
+
+    def test_every_deadline_carries_its_legal_qualifier(self):
+        aware = "2026-10-01T09:00:00Z"
+        for cat in ("serious_incident", "personal_data_breach", "significant_incident",
+                    "major_ict_incident"):
+            for d in reporting_deadlines(cat, aware):
+                assert d["qualifier"]
+        ai = reporting_deadlines("serious_incident", aware)[0]["qualifier"]
+        assert "immediately" in ai and "2026/1744" in ai and "high-risk" in ai
+        assert "undue delay" in reporting_deadlines("personal_data_breach", aware)[0]["qualifier"]
+
+    def test_related_obligations(self):
+        aware = "2026-10-01T09:00:00Z"
+        from traceseal_observe import related_obligations
+        bases = {o["basis"] for o in related_obligations("personal_data_breach")}
+        assert "GDPR Art. 34" in bases
+        assert any(o["step"] == "final report" for o in related_obligations("significant_incident"))
+        assert any(o["step"] == "final report" for o in related_obligations("major_ict_incident"))
+        assert any("26(5)" in o["basis"] for o in related_obligations("serious_incident"))
+        assert related_obligations("other") == []
+        r = sign_incident(category="personal_data_breach", severity="high", status="detected",
+                          aware_at=aware, operator_key=OperatorKey.generate())
+        assert r.execution["related_obligations"][0]["basis"] == "GDPR Art. 34"
+        assert incident_status([r])[0]["related_obligations"]
 
 
 class TestIncidents:
@@ -125,8 +152,13 @@ class TestEvidencePack:
         assert s["chains"]["support-agent"]["checkpoint"]["anchored"]
         controls = {c["ref"]: c for c in s["controls"]}
         assert controls["Art. 12"]["status"] == "evidence"
-        assert controls["Art. 14"]["status"] == "evidence"
+        assert controls["Art. 14 / 26(2)"]["status"] == "evidence"
         assert controls["Art. 73"]["status"] == "no evidence"
+        assert "Art. 12(3)" not in controls
+        assert all(c["applies_to"] for c in s["controls"])
+        assert "2 December 2027" in controls["Art. 12"]["applies_to"]
+        assert "not legal advice" in s["legal_notice"]
+        assert "pseudonymised" in controls["Art. 5(1)(c), 25"]["evidence"]
         assert "email" in controls["Art. 5(1)(c), 25"]["evidence"]
 
     def test_gap_and_oversight_issues_surface(self, tmp_path):
@@ -136,7 +168,7 @@ class TestEvidencePack:
         controls = {c["ref"]: c for c in s["controls"]}
         assert not s["ok"]
         assert controls["Art. 12"]["status"] == "issues"
-        assert controls["Art. 14"]["status"] == "issues"
+        assert controls["Art. 14 / 26(2)"]["status"] == "issues"
 
     def test_build_and_verify_pack(self, tmp_path):
         key, _, paths, cp = _scenario(tmp_path)
@@ -144,7 +176,7 @@ class TestEvidencePack:
                              require_approval={"issue_refund"})
         assert summary["ok"]
         md = (tmp_path / "pack" / "report.md").read_text()
-        assert "all checks passed" in md and "| EU AI Act | Art. 14 |" in md
+        assert "all checks passed" in md and "| EU AI Act | Art. 14 / 26(2) |" in md and "Legal notice" in md
         assert json.loads((tmp_path / "pack" / "report.json").read_text())["ok"]
         result = verify_pack(tmp_path / "pack")
         assert result["ok"] and result["signed"]
