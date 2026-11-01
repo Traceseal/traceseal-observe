@@ -141,6 +141,21 @@ class TestOversightChecks:
         report = verify_trace([model, tool], require_approval={"issue_refund"})
         assert any("requires human approval" in e for e in report["errors"])
 
+    def test_approval_is_bound_to_its_subject_model_receipt(self, key):
+        """An approval for one model response must not cover another response
+        that happens to reuse the same tool_call_id (review finding)."""
+        approved_model = _model(key)
+        other_model = observe_anthropic(FakeAnthropic(Obj(RESPONSE)), {"model": "other"}, key)[1]
+        assert other_model.receipt_hash != approved_model.receipt_hash
+        approval = sign_oversight(decision="approved", operator_key=key, reviewer=REVIEWER,
+                                  subjects=[approved_model], tool_call_ids=["toolu_A"])
+        tool = _run(key, other_model, approval)
+        report = verify_trace([approved_model, other_model, approval, tool],
+                              require_approval={"issue_refund"})
+        assert any("requires human approval" in e for e in report["errors"])
+        ok = _run(key, approved_model, approval)
+        assert verify_trace([approved_model, approval, ok], require_approval={"issue_refund"})["ok"]
+
     def test_approval_for_another_call_does_not_count(self, key):
         model = _model(key)
         approval = sign_oversight(decision="approved", operator_key=key, reviewer=REVIEWER,

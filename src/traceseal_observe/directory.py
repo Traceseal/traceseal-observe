@@ -209,11 +209,32 @@ def fetch_directory(domain: str, *, timeout: float = 10.0) -> dict[str, Any]:
     return verify_directory(document, domain=domain)
 
 
+_SIGNED_TIME_FIELDS = ("chained_at", "started_at", "observed_at", "decided_at",
+                       "recorded_at", "verified_at", "reobserved_at")
+
+
+def _signed_time(receipt: Any) -> str | None:
+    """A signing-time claim from inside the signed payload.
+
+    attestation.attested_at is outside the v1 signature, so anyone holding a
+    receipt can edit it; it is never used for key-validity decisions.
+    """
+    for field in _SIGNED_TIME_FIELDS:
+        value = receipt.execution.get(field)
+        if isinstance(value, str) and _UTC_RE.fullmatch(value):
+            return value
+    return None
+
+
 def check_receipts(receipts: list[Any], report: dict[str, Any]) -> list[dict[str, Any]]:
-    """Status of each receipt's signing key at its signing time."""
+    """Status of each receipt's signing key at its signed time.
+
+    Receipts with no signed time report "unknown_time": their key validity
+    cannot be decided from tamper-evident data.
+    """
     out = []
     for r in receipts:
-        when = r.execution.get("chained_at") or r.attestation.get("attested_at")
+        when = _signed_time(r)
         pk = r.attestation.get("operator_public_key", "")
         status = key_status_at(report, pk, when) if isinstance(when, str) else "unknown_time"
         out.append({"receipt": r.receipt_hash, "public_key": pk, "status": status})

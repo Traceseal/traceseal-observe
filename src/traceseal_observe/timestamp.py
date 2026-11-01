@@ -299,18 +299,47 @@ def _issued_by(child: x509.Certificate, issuer: x509.Certificate) -> bool:
         return False
 
 
+def _path_length(cert: x509.Certificate) -> int | None:
+    try:
+        return cert.extensions.get_extension_for_oid(
+            ExtensionOID.BASIC_CONSTRAINTS).value.path_length
+    except x509.ExtensionNotFound:
+        return None
+
+
+def _can_sign_certs(cert: x509.Certificate) -> bool:
+    try:
+        return bool(cert.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value.key_cert_sign)
+    except x509.ExtensionNotFound:
+        return True
+
+
+def _check_path_constraints(path: list[x509.Certificate]) -> list[x509.Certificate]:
+    """RFC 5280 §6.1.4: each CA's pathLenConstraint bounds the number of
+    intermediate CA certificates below it (the end-entity cert not counted);
+    CAs with a KeyUsage extension must assert keyCertSign."""
+    for index, ca in enumerate(path[1:], start=1):
+        if not _can_sign_certs(ca):
+            raise TimestampError("a CA in the path lacks keyCertSign")
+        limit = _path_length(ca)
+        below = index - 1  # CA certificates between this CA and the TSA cert
+        if limit is not None and below > limit:
+            raise TimestampError("certificate path length constraint violated")
+    return path
+
+
 def _build_path(leaf, pool, anchors, when) -> list[x509.Certificate]:
     anchor_der = {a.public_bytes(_der()) for a in anchors}
     path = [leaf]
     current = leaf
     for _ in range(_MAX_CHAIN_DEPTH):
         if current.public_bytes(_der()) in anchor_der:
-            return path
+            return _check_path_constraints(path)
         for anchor in anchors:
             if _issued_by(current, anchor):
                 if not _valid_at(anchor, when) or not _is_ca(anchor):
                     raise TimestampError("trust anchor is not a CA valid at genTime")
-                return path + [anchor]
+                return _check_path_constraints(path + [anchor])
         issuer = next(
             (c for c in pool if c is not current and _issued_by(current, c)), None
         )

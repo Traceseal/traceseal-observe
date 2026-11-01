@@ -250,6 +250,11 @@ class TestVerifyChain:
         assert not verify_chain(a, chain_id="other")["ok"]
         assert not verify_chain(a, operator_public_key="00" * 32)["ok"]
 
+    def test_key_hex_case_is_not_a_key_change(self, key):
+        _, rs = _make(key, 2)
+        rs[1].attestation["operator_public_key"] = rs[1].attestation["operator_public_key"].upper()
+        assert verify_chain(rs)["ok"]
+
     def test_unchained_receipt_rejected(self, key):
         report = verify_chain([_tool(key, 0)])
         assert not report["ok"] and "not a chained receipt" in report["errors"][0]

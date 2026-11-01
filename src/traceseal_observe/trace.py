@@ -348,9 +348,14 @@ def verify_trace(
                 errors.append(f"{label}: does not cite a passing {wanted!r} policy decision")
 
         # -- human oversight cited by this action --------------------------
+        # A decision covers this action only if it names this call (when it
+        # names calls) and is about a model response this action cites (when
+        # it names subjects). Tool-call ids are unique per response, not
+        # globally, so an id alone must not carry an approval across responses.
         cited = [
             oversight[c] for c in causes if c in oversight
             and (not oversight[c]["tool_call_ids"] or call_id in oversight[c]["tool_call_ids"])
+            and (not oversight[c]["subjects"] or set(oversight[c]["subjects"]) & set(causes))
         ]
         approvals = [o for o in cited if o["decision"] in ("approved", "modified")]
         for o in cited:

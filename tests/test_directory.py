@@ -98,6 +98,20 @@ class TestDirectory:
         assert dir_mod.main(["verify", "--domain", "example.com", "--file", str(tmp_path / "dir.json"),
                              str(tmp_path / "s.json")]) == 1
 
+    def test_key_status_uses_signed_time_only(self, keys):
+        """attestation.attested_at is outside the signature, so editing it must
+        not change a key's status (review finding)."""
+        k1, k2, old = keys
+        report = verify_directory(_doc(keys))
+        r = observe_tool("t", old, lambda: 1)[1]  # signed now, after revocation
+        assert check_receipts([r], report)[0]["status"] == "compromised"
+        r.attestation["attested_at"] = "2025-06-01T00:00:00Z"  # holder back-dates it
+        assert check_receipts([r], report)[0]["status"] == "compromised"  # not "valid"
+        from traceseal_observe import sign_execution_receipt
+
+        untimed = sign_execution_receipt({"receipt_type": "tool"}, {}, old)
+        assert check_receipts([untimed], report)[0]["status"] == "unknown_time"
+
     def test_fetch_uses_https_well_known(self, keys, monkeypatch):
         seen = {}
 

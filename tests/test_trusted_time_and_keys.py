@@ -53,7 +53,8 @@ def _name(cn):
 
 
 def _cert(subject, issuer, public_key, signing_key, *, ca, eku=None, eku_critical=True,
-          not_before=NOW - dt.timedelta(days=365), not_after=NOW + dt.timedelta(days=365)):
+          not_before=NOW - dt.timedelta(days=365), not_after=NOW + dt.timedelta(days=365),
+          path_length=None):
     b = (
         x509.CertificateBuilder()
         .subject_name(_name(subject))
@@ -62,7 +63,8 @@ def _cert(subject, issuer, public_key, signing_key, *, ca, eku=None, eku_critica
         .serial_number(x509.random_serial_number())
         .not_valid_before(not_before)
         .not_valid_after(not_after)
-        .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+        .add_extension(x509.BasicConstraints(ca=ca, path_length=path_length if ca else None),
+                       critical=True)
     )
     if eku is not None:
         b = b.add_extension(x509.ExtendedKeyUsage(eku), critical=eku_critical)
@@ -242,6 +244,30 @@ class TestTimestampTokens:
             t = TSA(**kw)
             with pytest.raises(TimestampError, match="EKU|extended key usage"):
                 verify_timestamp_token(t.token(data=b"a"), data=b"a", trust_anchors=[t.root])
+
+    def test_path_length_constraint_enforced(self):
+        """A CA with pathLenConstraint=0 may not issue further CAs (review finding)."""
+        t = TSA()
+        constrained_key = ec.generate_private_key(ec.SECP256R1())
+        constrained = _cert("Constrained CA", "Test Root", constrained_key.public_key(),
+                            t.root_key, ca=True, path_length=0)
+        rogue_key = ec.generate_private_key(ec.SECP256R1())
+        rogue = _cert("Test Intermediate", "Constrained CA", rogue_key.public_key(),
+                      constrained_key, ca=True)
+        t.cert = _cert("Test TSA", "Test Intermediate", t.key.public_key(), rogue_key,
+                       ca=False, eku=[ExtendedKeyUsageOID.TIME_STAMPING])
+        token = t.token(data=b"a", include_intermediate=False)
+        with pytest.raises(TimestampError, match="path length"):
+            verify_timestamp_token(token, data=b"a", trust_anchors=[t.root],
+                                   intermediates=[rogue, constrained])
+        # pathLenConstraint=0 still allows issuing the end-entity TSA cert.
+        ok = TSA()
+        ok_int_key = ec.generate_private_key(ec.SECP256R1())
+        ok.intermediate = _cert("Test Intermediate", "Test Root", ok_int_key.public_key(),
+                                ok.root_key, ca=True, path_length=0)
+        ok.cert = _cert("Test TSA", "Test Intermediate", ok.key.public_key(), ok_int_key,
+                        ca=False, eku=[ExtendedKeyUsageOID.TIME_STAMPING])
+        assert verify_timestamp_token(ok.token(data=b"a"), data=b"a", trust_anchors=[ok.root])
 
     def test_cert_must_be_valid_at_gen_time(self):
         t = TSA(not_before=NOW + dt.timedelta(days=1))

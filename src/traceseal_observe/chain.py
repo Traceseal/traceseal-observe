@@ -764,7 +764,7 @@ def _check_rotation(receipt: Receipt) -> dict[str, Any]:
     previous, nxt = ex.get("previous_public_key"), ex.get("next_public_key")
     _check_public_key_hex(previous)
     next_bytes = _check_public_key_hex(nxt)
-    if previous != receipt.attestation.get("operator_public_key"):
+    if previous != str(receipt.attestation.get("operator_public_key", "")).lower():
         raise ChainError("rotation is not signed by the key it hands over from")
     if previous == nxt:
         raise ChainError("rotation does not change the key")
@@ -965,7 +965,9 @@ def verify_chain(
     report["head_hash"] = by_seq[seqs[-1]][1]
 
     def signer_of(s: int) -> str:
-        return by_seq[s][0].attestation["operator_public_key"]
+        # Hex is case-insensitive: compare keys in one canonical form so an
+        # equivalent encoding is not mistaken for a key change.
+        return by_seq[s][0].attestation["operator_public_key"].lower()
 
     root_key = signer_of(seqs[0])
     report["operator_public_key"] = root_key
