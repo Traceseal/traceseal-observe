@@ -159,18 +159,21 @@ class TestObserveModelCall:
         def fake_api_call():
             raise RuntimeError("API call failed")
 
-        response, receipt = observe_model_call(
-            provider="openai",
-            model="gpt-4",
-            api_endpoint="https://api.openai.com/v1/chat/completions",
-            operator_key=key,
-            call=fake_api_call,
-            serialize_request=lambda: {"model": "gpt-4"},
-        )
+        from traceseal_observe import error_text
+
+        with error_text("scrubbed"):  # opt in to recording the message text
+            response, receipt = observe_model_call(
+                provider="openai",
+                model="gpt-4",
+                api_endpoint="https://api.openai.com/v1/chat/completions",
+                operator_key=key,
+                call=fake_api_call,
+                serialize_request=lambda: {"model": "gpt-4"},
+            )
 
         assert response is None
         assert receipt.execution["ok"] == "false"
-        assert "API call failed" in receipt.execution["error_message"]
+        assert receipt.execution["error_message"] == "RuntimeError: API call failed"
         # Receipt is still signed — even failures are sealed
         assert len(receipt.attestation["signature"]) == 128
 

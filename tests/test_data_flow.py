@@ -291,7 +291,7 @@ class TestObserveDataFlow:
         )
         assert response is None
         assert receipt.execution["ok"] == "false"
-        assert "unreachable" in receipt.execution["error_message"]
+        assert receipt.execution["error_message"].startswith("ConnectionError (sha256:")
         assert receipt.execution["status_code"] == 0
 
     def test_non_2xx_status_marked_not_ok(self, key):

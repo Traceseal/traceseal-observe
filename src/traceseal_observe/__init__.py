@@ -60,21 +60,246 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 RECEIPT_VERSION = "1.0"
 
-# Matches a URL query string so credentials passed as query params
-# (?api_key=..., ?token=..., &sig=...) never get baked into a signed,
-# publicly-shareable receipt's error_message. Errors from HTTP libraries
-# routinely embed the full request URL.
-_QUERY_STRING_RE = __import__("re").compile(r"\?[^\s\"']*")
+# ---------------------------------------------------------------------------
+# What may be written into a signed receipt: URLs and error text
+# ---------------------------------------------------------------------------
+#
+# Receipts are signed and meant to be shared, so anything written into them
+# cannot be taken back. URLs and exception messages are the two places where
+# secrets (userinfo passwords, ?api_key=, webhook tokens in paths, bearer
+# tokens) and personal data (pydantic echoes of the rejected input) leak in.
+
+import contextvars as _contextvars
+import re as _re
+
+REDACTED = "{redacted}"
+
+_SCHEME_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+# Path segments that are credentials by shape.
+_TOKEN_SEGMENT_RE = _re.compile(
+    r"^(?:"
+    r"(?:sk|pk|rk|api|key|tok|token|secret|ghp|gho|ghs|ghu|github_pat|glpat|xox[abpsr])[-_][A-Za-z0-9_-]{6,}"
+    r"|bot[0-9]{5,}:[A-Za-z0-9_-]{20,}"                 # Telegram bot token
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}"
+    r"|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"  # JWT
+    r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"  # UUID
+    r")$"
+)
+# A segment named like this is followed by a secret (".../key/<secret>").
+_SECRET_MARKER_SEGMENTS = frozenset({
+    "key", "keys", "token", "tokens", "secret", "apikey", "api_key", "api-key",
+    "access_token", "auth", "sig", "signature", "password", "credentials",
+})
+# Everything after one of these segments is a webhook capability.
+_WEBHOOK_MARKER_SEGMENTS = frozenset({"hooks", "hook", "webhook", "webhooks", "catch", "trigger"})
+# Hosts whose whole path (after the first segment) is the capability.
+_WEBHOOK_HOST_RE = _re.compile(
+    r"^(?:hooks\.slack\.com|hooks\.zapier\.com|maker\.ifttt\.com|.*\.webhook\.office\.com"
+    r"|outlook\.office(?:365)?\.com|discord(?:app)?\.com|.*\.logic\.azure\.com"
+    r"|events\.pagerduty\.com|api\.telegram\.org|chat\.googleapis\.com)$"
+)
 
 
-def _redact_error(message: str, limit: int = 200) -> str:
-    """Scrub URL query strings from an exception message and bound its length.
+def _entropy(text: str) -> float:
+    import math
 
-    Receipt error messages are signed and shareable, so a leaked
-    ?api_key=... in a library exception would become a published credential.
+    counts: dict[str, int] = {}
+    for ch in text:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(text)
+    return -sum(c / n * math.log2(c / n) for c in counts.values())
+
+
+def _secret_segment(segment: str) -> bool:
+    """True if a URL path segment looks like a credential or an identifier
+    that should not be published (token, key, UUID, email, card number...)."""
+    from urllib.parse import unquote
+
+    text = unquote(segment)
+    if not text:
+        return False
+    if _TOKEN_SEGMENT_RE.match(text):
+        return True
+    for name, pattern in _PII_PATTERNS.items():
+        for m in pattern.finditer(text):
+            validator = _PII_VALIDATORS.get(name)
+            if validator is None or validator(m.group()):
+                return True
+    for chunk in _re.split(r"[-_.:~+=,]", text):
+        has_digit = any(c.isdigit() for c in chunk)
+        has_alpha = any(c.isalpha() for c in chunk)
+        if len(chunk) >= 32 and _re.fullmatch(r"[A-Za-z0-9/+]+", chunk):
+            return True
+        if len(chunk) >= 16 and has_digit and has_alpha:
+            return True
+        if (len(chunk) >= 20 and any(c.isupper() for c in chunk)
+                and any(c.islower() for c in chunk) and _entropy(chunk) >= 3.5):
+            return True
+    return False
+
+
+def sanitize_url(url: Any, *, host_only: bool = False) -> str:
+    """The form of a URL that may be written into a signed receipt.
+
+    Rebuilt from scheme, host, port and path only: userinfo, query string,
+    fragment and ;params are dropped, and path segments that look like
+    secrets (long high-entropy tokens, API-key shapes, UUIDs, PII, webhook
+    capabilities such as hooks.slack.com/services/...) are replaced with
+    "{redacted}". host_only=True keeps just scheme://host[:port].
+    An unparseable URL becomes "{redacted}".
     """
-    scrubbed = _QUERY_STRING_RE.sub("?<redacted>", message)
-    return scrubbed[:limit]
+    from urllib.parse import urlsplit
+
+    raw = str(url).strip()
+    try:
+        has_scheme = bool(_SCHEME_RE.match(raw))
+        parts = urlsplit(raw if has_scheme else "//" + raw)
+        scheme = parts.scheme.lower() if has_scheme else ""
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return REDACTED
+    if not host or any(c in host for c in "@/\\ \t\r\n?#"):
+        return REDACTED
+    if ":" in host:
+        host = f"[{host}]"
+    prefix = (f"{scheme}://" if scheme else "") + host + (f":{port}" if port else "")
+    if host_only:
+        return prefix
+    segments = parts.path.split("/")
+    webhook_host = _WEBHOOK_HOST_RE.match(host.strip("[]")) is not None
+    out: list[str] = []
+    redact_rest = False
+    seen_named = 0
+    for i, segment in enumerate(segments):
+        segment = segment.split(";", 1)[0]  # drop ;params
+        if i == 0 or segment == "":
+            out.append(segment)
+            continue
+        seen_named += 1
+        previous = out[-1].lower() if out else ""
+        if (redact_rest or _secret_segment(segment)
+                or previous in _SECRET_MARKER_SEGMENTS
+                or (webhook_host and seen_named > 1)):
+            out.append(REDACTED)
+        else:
+            out.append(segment)
+        if segment.lower() in _WEBHOOK_MARKER_SEGMENTS:
+            redact_rest = True
+    return prefix + "/".join(out)
+
+
+def _record_endpoint(endpoint: str) -> str:
+    """Endpoints that are URLs are recorded sanitised; other identifiers
+    ("mcp://server" is a URL too, "git commit" is not) are kept."""
+    if isinstance(endpoint, str) and _SCHEME_RE.match(endpoint):
+        return sanitize_url(endpoint)
+    return endpoint
+
+
+# Kept for callers of the pre-1.6 name. It used to strip only the query.
+_strip_query = sanitize_url
+
+
+# -- error text ---------------------------------------------------------------
+
+ERROR_TEXT_MODES = frozenset({"hash", "scrubbed"})
+_ERROR_TEXT_DEFAULT = ["hash"]
+_ERROR_TEXT: _contextvars.ContextVar[str | None] = _contextvars.ContextVar(
+    "traceseal_error_text", default=None
+)
+_ERROR_PREFIX_RE = _re.compile(r"^([A-Za-z_][A-Za-z0-9_.]{0,127})(?:: ?(.*))?$", _re.DOTALL)
+
+
+def set_error_text(mode: str) -> None:
+    """Process-wide choice of what failure receipts record as error_message.
+
+    "hash" (default): the exception type and a short hash of the message,
+      e.g. "ValueError (sha256:1f3a9c0b7d2e)". The text itself is never
+      recorded; the hash lets whoever holds the log line match it.
+    "scrubbed": the type and the message with credentials, URL userinfo,
+      query strings, fragments, pydantic input_value=... and PII-pattern
+      matches removed. Scrubbing is heuristic: only opt in if you accept
+      that an unrecognised secret or personal detail may be signed.
+    """
+    if mode not in ERROR_TEXT_MODES:
+        raise ValueError(f"error text mode must be one of {sorted(ERROR_TEXT_MODES)}")
+    _ERROR_TEXT_DEFAULT[0] = mode
+
+
+def error_text(mode: str):
+    """Context manager: use `mode` (see set_error_text) inside the block."""
+    from contextlib import contextmanager
+
+    if mode not in ERROR_TEXT_MODES:
+        raise ValueError(f"error text mode must be one of {sorted(ERROR_TEXT_MODES)}")
+
+    @contextmanager
+    def _scope():
+        token = _ERROR_TEXT.set(mode)
+        try:
+            yield
+        finally:
+            _ERROR_TEXT.reset(token)
+
+    return _scope()
+
+
+_URL_IN_TEXT_RE = _re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>()\[\]{}]+")
+_USERINFO_RE = _re.compile(r"(?<![\w/])[^\s/@:'\"]+:[^\s/@'\"]+@(?=[A-Za-z0-9\[])")
+_AUTH_HEADER_RE = _re.compile(
+    r"(?i)((?:proxy-)?authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie)"
+    r"(['\"]?\s*[:=]\s*['\"]?)(?!\{redacted\})[^'\"\n,}]+"
+)
+_AUTH_SCHEME_RE = _re.compile(r"(?i)\b(bearer|basic|token|digest)\s+[A-Za-z0-9._~+/=-]{4,}")
+_CREDENTIAL_PAIR_RE = _re.compile(
+    r"(?i)\b([\w-]*(?:api[_-]?key|apikey|token|secret|passw(?:or)?d|passwd|pwd|credential|"
+    r"session[_-]?id|signature|sig|auth|private[_-]?key|client[_-]?secret)[\w-]*)"
+    r"(['\"]?\s*[=:]\s*)(?!['\"]?\{redacted\})(\"[^\"]*\"|'[^']*'|[^\s&'\",;}\])]+)"
+)
+_INPUT_VALUE_RE = _re.compile(r"input_value=.*?(?=, input_type=|\]|$)", _re.MULTILINE)
+
+
+def _scrub_error_text(text: str) -> str:
+    text = _INPUT_VALUE_RE.sub("input_value=" + REDACTED, text)
+    text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    text = _AUTH_SCHEME_RE.sub(lambda m: m.group(1) + " " + REDACTED, text)
+    text = _URL_IN_TEXT_RE.sub(lambda m: sanitize_url(m.group()), text)
+    text = _USERINFO_RE.sub(REDACTED + "@", text)
+    text = _CREDENTIAL_PAIR_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    for name, pattern in _PII_PATTERNS.items():
+        validator = _PII_VALIDATORS.get(name)
+        text = pattern.sub(
+            lambda m, n=name, v=validator: m.group() if v and not v(m.group()) else "{" + n + "}",
+            text,
+        )
+    return text
+
+
+def _redact_error(message: Any, limit: int = 200, *, mode: str | None = None) -> str:
+    """The error_message recorded in a failure receipt.
+
+    `message` is an exception, or a string of the form "TypeName: text"
+    (what f"{type(exc).__name__}: {exc}" produces). By default only the
+    type and a short hash of the text are recorded; see set_error_text()
+    and error_text() to keep scrubbed text instead.
+    """
+    if isinstance(message, BaseException):
+        kind, text = type(message).__name__, str(message)
+    else:
+        message = str(message)
+        m = _ERROR_PREFIX_RE.match(message)
+        kind, text = (m.group(1), m.group(2) or "") if m else ("Error", message)
+    mode = mode or _ERROR_TEXT.get() or _ERROR_TEXT_DEFAULT[0]
+    if mode not in ERROR_TEXT_MODES:
+        raise ValueError(f"error text mode must be one of {sorted(ERROR_TEXT_MODES)}")
+    if mode == "hash":
+        if not text:
+            return kind[:limit]
+        digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+        return f"{kind} (sha256:{digest})"[:limit]
+    scrubbed = _scrub_error_text(text)
+    return (f"{kind}: {scrubbed}" if scrubbed else kind)[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -756,7 +981,7 @@ def _start_model_call(provider, model, api_endpoint, serialize_request, tools) -
     return _ModelCallState(
         provider=provider,
         model=model,
-        api_endpoint=api_endpoint,
+        api_endpoint=_record_endpoint(api_endpoint),
         input_hash=input_hash,
         started_at=started_at,
         t_start=t_start,
@@ -883,22 +1108,15 @@ def _fail_model_call(state: _ModelCallState, exc: Exception, operator_key: Opera
 
 def _client_endpoint(client: Any, default_base: str, path: str) -> str:
     """The real endpoint for an SDK client, honouring a custom base_url
-    (gateways, Bedrock/Vertex/Azure-compatible proxies). Credentials and
-    query strings in the base URL are never recorded."""
-    from urllib.parse import urlsplit, urlunsplit
-
+    (gateways, Bedrock/Vertex/Azure-compatible proxies). The base URL goes
+    through sanitize_url: credentials, query strings, fragments, ;params and
+    secret-looking path segments are never recorded."""
     base = getattr(client, "base_url", None)
     raw = str(base) if base else default_base
-    try:
-        parts = urlsplit(raw)
-        host = parts.hostname or ""
-        if ":" in host:
-            host = f"[{host}]"
-        netloc = host + (f":{parts.port}" if parts.port else "")
-        clean = urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
-    except ValueError:
-        clean = default_base.rstrip("/")
-    return clean + "/" + path.lstrip("/")
+    clean = sanitize_url(raw)
+    if clean == REDACTED or not _SCHEME_RE.match(clean):
+        clean = default_base
+    return clean.rstrip("/") + "/" + path.lstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -1058,7 +1276,7 @@ class ObservedModelStream:
     ):
         self._provider = provider
         self._model = model
-        self._api_endpoint = api_endpoint
+        self._api_endpoint = _record_endpoint(api_endpoint)
         self._operator_key = operator_key
         self._input_hash = input_hash
         self._started_at = started_at
@@ -1573,7 +1791,7 @@ def _start_tool_call(tool_name, transport, args, tool_version, endpoint,
     else:
         input_hash = "sha256:empty"
     return _ToolCallState(tool_name, transport, input_hash, started_at, t_start,
-                          tool_version, endpoint, tool_definition_hash)
+                          tool_version, _record_endpoint(endpoint), tool_definition_hash)
 
 
 def _finish_tool_call(state: _ToolCallState, result: Any, operator_key: OperatorKey,
@@ -1840,6 +2058,7 @@ def observe_http_tool(
     headers: dict | None = None,
     tool_version: str = "",
     serialize_output: Callable[[Any], Any] | None = None,
+    host_only: bool = False,
 ) -> tuple[Any, Receipt]:
     """Wrap an HTTP API call that is NOT a model call.
 
@@ -1858,6 +2077,11 @@ def observe_http_tool(
             headers in the input hash, pass them in request_body.
         tool_version: Optional.
         serialize_output: Optional output canonicalizer.
+        host_only: Record only scheme://host[:port] as the endpoint.
+
+    The recorded `endpoint` is sanitize_url(url): no userinfo, query,
+    fragment or secret-looking path segments. The full URL only enters the
+    input hash.
 
     Example:
         import requests
@@ -1886,7 +2110,7 @@ def observe_http_tool(
         transport="http",
         args=input_repr,
         tool_version=tool_version,
-        endpoint=url,
+        endpoint=sanitize_url(url, host_only=host_only),
         serialize_output=serialize_output,
     )
 
@@ -2680,6 +2904,46 @@ def _valid_ipv4(candidate: str) -> bool:
 _PII_VALIDATORS = {"iban": _valid_iban, "ipv4": _valid_ipv4}
 
 
+_JSON_ESCAPE_RE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|.)")
+_MAX_PII_STRINGS = 100_000
+
+
+def _pii_strings(value: Any, out: list[str], depth: int = 0) -> None:
+    """Collect the decoded strings (keys, values, numbers) of a JSON-like value."""
+    if len(out) >= _MAX_PII_STRINGS or depth > 64:
+        return
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, bool) or value is None:
+        return
+    elif isinstance(value, (int, float)):
+        out.append(str(value))
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            _pii_strings(k, out, depth + 1)
+            _pii_strings(v, out, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _pii_strings(item, out, depth + 1)
+    elif isinstance(value, bytes):
+        _pii_text_or_json(value.decode("utf-8", errors="replace"), out, depth)
+    else:
+        out.append(str(value))
+
+
+def _pii_text_or_json(text: str, out: list[str], depth: int = 0) -> None:
+    stripped = text.lstrip()
+    if stripped[:1] in ("{", "[", '"'):
+        try:
+            _pii_strings(json.loads(text), out, depth + 1)
+            return
+        except (ValueError, RecursionError):
+            pass
+    # Not (complete) JSON: treat backslash escapes (\n, \t, \u0040...) as
+    # separators so they can't glue a value to a word character.
+    out.append(_JSON_ESCAPE_RE.sub(" ", text))
+
+
 def fingerprint_pii(payload: Any) -> dict[str, int]:
     """Scan a payload for PII-like patterns. Returns {pattern_name: count}.
 
@@ -2687,25 +2951,23 @@ def fingerprint_pii(payload: Any) -> dict[str, int]:
     An empty dict means no known PII patterns matched (which does NOT
     mean the payload is PII-free — only that nothing familiar was found).
 
-    The payload is converted to a string representation before scanning.
-    For dicts and lists, canonical JSON is used.
+    Dicts and lists are walked and every decoded string (keys and values,
+    and numbers) is scanned on its own. Bytes and strings that hold JSON are
+    decoded first; other bytes are decoded as UTF-8 text and backslash
+    escapes are treated as separators.
     """
     if payload is None:
         return {}
 
-    if isinstance(payload, bytes):
-        try:
-            text = payload.decode("utf-8", errors="replace")
-        except Exception:
-            return {}
+    strings: list[str] = []
+    if isinstance(payload, (bytes, bytearray)):
+        _pii_text_or_json(bytes(payload).decode("utf-8", errors="replace"), strings)
     elif isinstance(payload, str):
-        text = payload
-    elif isinstance(payload, (dict, list)):
-        text = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        )
+        _pii_text_or_json(payload, strings)
     else:
-        text = str(payload)
+        _pii_strings(payload, strings)
+    # NUL never matches \s or a word character, so patterns can't span two values.
+    text = "\x00".join(strings)
 
     findings: dict[str, int] = {}
     # A valid IBAN is counted once, as an IBAN: mask it so its digits are
@@ -2736,7 +2998,8 @@ class DataFlowRecord:
     """The host portion of the destination URL. E.g. "api.openai.com"."""
 
     destination_url: str
-    """Full URL, minus query string for privacy. E.g. "https://api.openai.com/v1/chat/completions"."""
+    """sanitize_url() of the URL: no userinfo, query, fragment or secret-looking
+    path segments. E.g. "https://api.openai.com/v1/chat/completions"."""
 
     method: str
     """HTTP method."""
@@ -2779,6 +3042,12 @@ class DataFlowRecord:
     error_message: str = ""
     """If ok=False, short error description."""
 
+    pii_scan_truncated: bool = False
+    """True if only the first pii_scan_bytes of the payload were scanned."""
+
+    pii_scan_bytes: int = 0
+    """Bytes scanned for PII when the scan was truncated."""
+
 
 def sign_data_flow(
     record: DataFlowRecord,
@@ -2809,6 +3078,10 @@ def sign_data_flow(
         execution["pii_fingerprint"] = dict(
             sorted(record.pii_fingerprint.items())
         )
+    if record.pii_scan_truncated:
+        # Receipt bodies carry no booleans: "true" / "false" strings.
+        execution["pii_scan_truncated"] = "true"
+        execution["pii_scan_bytes"] = record.pii_scan_bytes
     if record.declared_allow_list:
         execution["declared_allow_list"] = sorted(record.declared_allow_list)
     if record.error_message:
@@ -2829,16 +3102,6 @@ def _parse_host(url: str) -> str:
         return urlparse(url).hostname or ""
     except Exception:
         return ""
-
-
-def _strip_query(url: str) -> str:
-    """Return the URL without its query string (for privacy)."""
-    try:
-        from urllib.parse import urlparse, urlunparse
-        parts = urlparse(url)
-        return urlunparse((parts.scheme, parts.netloc, parts.path, "", "", ""))
-    except Exception:
-        return url
 
 
 def _coerce_to_bytes(data: Any) -> bytes:
@@ -2867,6 +3130,7 @@ def observe_data_flow(
     scan_pii: bool = True,
     extract_status: Callable[[Any], int] | None = None,
     extract_response_body: Callable[[Any], Any] | None = None,
+    host_only: bool = False,
 ) -> tuple[Any, Receipt]:
     """Wrap an outbound HTTP request, producing a signed data flow receipt.
 
@@ -2892,6 +3156,8 @@ def observe_data_flow(
         extract_response_body: Optional function to extract response body
             for hashing. If None, we try common attributes (.content,
             .text, .json()).
+        host_only: Record only scheme://host[:port] as destination_url.
+            Otherwise the URL is recorded through sanitize_url().
 
     Returns:
         (response, receipt) on success; (None, receipt_with_ok_false)
@@ -2927,7 +3193,7 @@ def observe_data_flow(
 
     # Allow-list check
     destination_host = _parse_host(url)
-    destination_url = _strip_query(url)
+    destination_url = sanitize_url(url, host_only=host_only)
     if declared_allow_list is not None:
         destination_declared = destination_host in declared_allow_list
     else:
