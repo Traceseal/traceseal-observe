@@ -4,19 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "traceseal-observe"
-version = "1.4.0"
-description = "Signed execution receipts for AI model calls and tool invocations"
+version = "1.5.0"
+description = "Verifiable, hash-chained, timestamped evidence of what AI agents did: signed receipts for model calls, tools, data flows, human oversight and compliance"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
-keywords = ["ai", "agents", "observability", "receipts", "ed25519", "traceseal", "anthropic", "openai"]
+keywords = ["ai", "agents", "observability", "receipts", "ed25519", "traceseal", "anthropic", "openai", "audit", "compliance", "eu-ai-act", "gdpr", "transparency-log", "rfc3161"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Topic :: Security :: Cryptography",
 ]
-dependencies = ["cryptography>=41.0"]
+dependencies = ["cryptography>=42.0"]
 
 [project.scripts]
 traceseal-resolution = "traceseal_observe.resolution:main"
@@ -25,9 +25,22 @@ publisher-attest = "traceseal_observe.publisher:main"
 publisher-bind = "traceseal_observe.binding:main"
 publisher-key = "traceseal_observe.history:main"
 traceseal-selection = "traceseal_observe.selection:main"
+traceseal-chain = "traceseal_observe.chain:main"
+traceseal-trace = "traceseal_observe.trace:main"
+traceseal-report = "traceseal_observe.report:main"
+traceseal-keys = "traceseal_observe.directory:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+timestamp = ["asn1crypto>=1.5"]
+otel = ["opentelemetry-api>=1.20"]
+disclosure = ["cryptography>=47.0"]
+dev = [
+    "pytest>=7.0",
+    "asn1crypto>=1.5",
+    "anthropic",
+    "openai",
+    "opentelemetry-sdk>=1.20",
+]
 
 [project.urls]
 Homepage = "https://traceseal.io"

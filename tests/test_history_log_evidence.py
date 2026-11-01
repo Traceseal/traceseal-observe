@@ -43,9 +43,11 @@ from traceseal_observe.source_identity import (
 # implements verification and never imports the append-capable log package.
 _LOG_DIR = Path(__file__).resolve().parents[2] / "traceseal-log"
 sys.path.insert(0, str(_LOG_DIR))
-import make_checkpoint  # noqa: E402
-import publisher_history_log as publication  # noqa: E402
-import tlog_note  # noqa: E402
+# The append-capable log package is a separate, private checkout. Skip
+# (rather than error the whole run) when it isn't next to this repository.
+make_checkpoint = pytest.importorskip("make_checkpoint", reason="traceseal-log checkout not present")
+publication = pytest.importorskip("publisher_history_log", reason="traceseal-log checkout not present")
+tlog_note = pytest.importorskip("tlog_note", reason="traceseal-log checkout not present")
 
 
 ORIGIN = "log.publisher-history.integration.test"
