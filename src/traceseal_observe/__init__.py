@@ -47,6 +47,7 @@ __version__ = "1.6.0"
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -753,6 +754,8 @@ def _forbidden_json_value(value: Any, path: str = "") -> str | None:
     def walk(item: Any, where: str, depth: int) -> str | None:
         if item is None or isinstance(item, bool):
             return where or "/"
+        if isinstance(item, float) and not math.isfinite(item):
+            return f"{where or '/'} (non-finite number)"
         if isinstance(item, (dict, list, tuple)):
             if depth > 64:
                 return f"{where or '/'} (nested too deeply)"

@@ -460,3 +460,19 @@ def test_tuple_with_boolean_is_refused_at_signing():
     with pytest.raises(ValueError, match="RECEIPT-SPEC"):
         sign_execution_receipt({"receipt_type": "tool", "metadata": (True,)},
                                {"provenance_version": "1.0"}, k)
+
+
+def test_non_finite_numbers_refused_and_unverifiable():
+    import math
+    import pytest
+    from traceseal_observe import OperatorKey, sign_execution_receipt, verify_receipt_signature
+
+    k = OperatorKey.generate()
+    for bad in (float("nan"), float("inf"), -math.inf):
+        with pytest.raises(ValueError, match="non-finite"):
+            sign_execution_receipt({"receipt_type": "tool", "latency": bad},
+                                   {"provenance_version": "1.0"}, k)
+    r = sign_execution_receipt({"receipt_type": "tool", "latency": 1.5}, {"provenance_version": "1.0"}, k)
+    r.execution["latency"] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        verify_receipt_signature(r)
