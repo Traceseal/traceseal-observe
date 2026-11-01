@@ -232,14 +232,16 @@ class TestEvidencePack:
         md = (tmp_path / "pack" / "report.md").read_text()
         assert "all checks passed" in md and "| EU AI Act | Art. 14 / 26(2) |" in md and "Legal notice" in md
         assert json.loads((tmp_path / "pack" / "report.json").read_text())["ok"]
-        result = verify_pack(tmp_path / "pack")
-        assert result["ok"] and result["signed"]
+        pk = key.public_key_hex
+        result = verify_pack(tmp_path / "pack", [pk])
+        assert result["ok"] and result["signed"] and result["pinned"], result["problems"]
+        assert result["pack_result"] == "passed"
 
         (tmp_path / "pack" / "report.md").write_text(md.replace("all checks passed", "fine"))
-        assert "file changed: report.md" in verify_pack(tmp_path / "pack")["problems"]
+        assert "file changed: report.md" in verify_pack(tmp_path / "pack", [pk])["problems"]
         (tmp_path / "pack" / "report.md").write_text(md)
         (tmp_path / "pack" / "receipts" / "extra.json").write_text("{}")
-        assert any("not in manifest" in p for p in verify_pack(tmp_path / "pack")["problems"])
+        assert any("not in manifest" in p for p in verify_pack(tmp_path / "pack", [pk])["problems"])
 
     def test_pack_refuses_non_empty_output(self, tmp_path):
         _, _, paths, _ = _scenario(tmp_path)
@@ -258,4 +260,14 @@ class TestEvidencePack:
                               "--checkpoint", str(cp), "--operator-key", str(keyfile)])
         out = capsys.readouterr().out
         assert rc == 1 and "EU AI Act Art. 12: issues" in out  # the gap is reported
-        assert report_mod.main(["verify-pack", str(tmp_path / "pack")]) == 0
+        # no pinned signer: refused
+        assert report_mod.main(["verify-pack", str(tmp_path / "pack")]) == 2
+        assert "--operator-pubkey" in capsys.readouterr().err
+        # intact pack, but the pack's own findings show issues: exit 3, shown as such
+        assert report_mod.main(["verify-pack", str(tmp_path / "pack"),
+                                "--operator-pubkey", key.public_key_hex]) == 3
+        out = capsys.readouterr().out
+        assert "[OK]" in out and "pack result: ISSUES FOUND" in out and "(pinned)" in out
+        assert report_mod.main(["verify-pack", str(tmp_path / "pack"), "--trust-signer-in-pack"]) == 3
+        out = capsys.readouterr().out
+        assert "NOT PINNED" in out and "pack result: ISSUES FOUND" in out
