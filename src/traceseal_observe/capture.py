@@ -12,13 +12,20 @@ everything:
                                  allow_hosts=["api.anthropic.com"], block_undeclared=True)
     client = anthropic.Anthropic(http_client=httpx2.Client(transport=transport))
 
-Each request gets a data_flow receipt: destination host and URL (query
-string removed), method, SHA-256 and size of the request body and of the
+Each request gets a data_flow receipt: destination host and URL (passed
+through sanitize_url: no userinfo, query, fragment, ;params or
+secret-looking path segments; host_only=True keeps just the host), method, SHA-256 and size of the request body and of the
 response body as received (before content decoding), status, latency, the
 PII-pattern fingerprint of the request, and whether the host was on the
-allow-list. Headers (API keys) are never hashed or recorded. With
-`block_undeclared=True`, a request to an unlisted host is refused before
-anything is sent, and the refusal is itself receipted.
+allow-list. Headers (API keys) are never hashed or recorded. Allow-list
+entries match scheme, host and port: a bare host means https on port 443;
+write "http://host:port" to allow plain HTTP. With `block_undeclared=True`,
+a request to an unlisted destination is refused before anything is sent,
+and the refusal is itself receipted.
+
+Requests that httpx routes around the client's transport (`mounts=`,
+`proxy=`) are NOT seen and NOT receipted. receipted_client() builds a
+client and warns about such routes; check_client() checks an existing one.
 
 Response bodies are hashed as they stream, so server-sent-event streams are
 covered. The receipt is signed when the response is closed, which SDKs do
@@ -33,23 +40,59 @@ from __future__ import annotations
 import hashlib
 import sys
 import time
+import warnings
 from typing import Any, Callable, Iterable
+from urllib.parse import urlsplit
 
 from traceseal_observe import (
     DataFlowRecord,
     OperatorKey,
     _now_iso,
     _redact_error,
-    _strip_query,
     fingerprint_pii,
+    sanitize_url,
     sign_data_flow,
 )
 
 _MAX_PII_SCAN = 1 << 20
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 class UndeclaredDestination(Exception):
     """Raised (after receipting) when block_undeclared refuses a request."""
+
+
+class UnreceiptedRouteWarning(UserWarning):
+    """A client has routes (mounts=, proxy=) that bypass the ReceiptTransport."""
+
+
+def _allow_entry(entry: str) -> tuple[str, str, int]:
+    """("https", "api.example.com", 443) for "api.example.com"; an explicit
+    "http://host:port" or "https://host:port" keeps its scheme and port."""
+    if not isinstance(entry, str) or not entry.strip():
+        raise ValueError("allow_hosts entries must be non-empty strings")
+    text = entry.strip()
+    has_scheme = "://" in text
+    try:
+        parts = urlsplit(text if has_scheme else "//" + text)
+        port = parts.port
+    except ValueError:
+        raise ValueError(f"allow_hosts entry {entry!r} is not a host or URL") from None
+    scheme = parts.scheme.lower() if has_scheme else "https"
+    if scheme not in _DEFAULT_PORTS:
+        raise ValueError(f"allow_hosts entry {entry!r}: scheme must be http or https")
+    if (parts.username or parts.password or parts.query or parts.fragment
+            or parts.path not in ("", "/") or not parts.hostname):
+        raise ValueError(f"allow_hosts entry {entry!r} must be a host, or scheme://host[:port]")
+    return scheme, parts.hostname.lower(), port or _DEFAULT_PORTS[scheme]
+
+
+def _entry_label(entry: tuple[str, str, int]) -> str:
+    scheme, host, port = entry
+    if (scheme, port) == ("https", 443):
+        return host
+    shown = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{shown}:{port}"
 
 
 def _lib(obj: Any):
@@ -59,27 +102,41 @@ def _lib(obj: Any):
 
 class _Capture:
     def __init__(self, operator_key: OperatorKey, on_receipt: Callable[[Any], None],
-                 allow_hosts: Iterable[str] | None, block_undeclared: bool, scan_pii: bool):
+                 allow_hosts: Iterable[str] | None, block_undeclared: bool, scan_pii: bool,
+                 host_only: bool = False):
         self.operator_key = operator_key
         self.on_receipt = on_receipt
-        self.allow_hosts = sorted({h.lower() for h in allow_hosts}) if allow_hosts else []
+        if isinstance(allow_hosts, str):
+            raise ValueError("allow_hosts must be a list of hosts, not a string")
+        self._allowed = {_allow_entry(h) for h in allow_hosts} if allow_hosts else set()
+        self.allow_hosts = sorted(_entry_label(e) for e in self._allowed)
         self.block_undeclared = block_undeclared
         self.scan_pii = scan_pii
+        self.host_only = host_only
         if block_undeclared and not self.allow_hosts:
             raise ValueError("block_undeclared needs allow_hosts")
+
+    def declared(self, request: Any) -> bool:
+        if not self._allowed:
+            return True
+        scheme = (request.url.scheme or "").lower()
+        host = (request.url.host or "").lower()
+        port = request.url.port or _DEFAULT_PORTS.get(scheme)
+        return (scheme, host, port) in self._allowed
 
     def begin(self, request: Any, body: bytes) -> dict[str, Any]:
         url = str(request.url)
         host = (request.url.host or "").lower()
-        declared = not self.allow_hosts or host in self.allow_hosts
+        truncated = len(body) > _MAX_PII_SCAN
         return {
             "host": host,
-            "url": _strip_query(url),
+            "url": sanitize_url(url, host_only=self.host_only),
             "method": request.method,
             "request_hash": "sha256:" + hashlib.sha256(body).hexdigest() if body else "sha256:empty",
             "request_bytes": len(body),
             "pii": fingerprint_pii(body[:_MAX_PII_SCAN]) if self.scan_pii and body else {},
-            "declared": declared,
+            "pii_truncated": bool(self.scan_pii and truncated),
+            "declared": self.declared(request),
             "started_at": _now_iso(),
             "t0": time.monotonic(),
         }
@@ -102,13 +159,15 @@ class _Capture:
             destination_declared=state["declared"],
             declared_allow_list=list(self.allow_hosts),
             error_message=error,
+            pii_scan_truncated=state["pii_truncated"],
+            pii_scan_bytes=_MAX_PII_SCAN if state["pii_truncated"] else 0,
         )
         self.on_receipt(sign_data_flow(record, self.operator_key))
 
     def refuse(self, state: dict[str, Any]) -> None:
         self.finish(state, status=0, response_hash="sha256:empty", response_bytes=0,
                     error=f"blocked: {state['host']} is not an allowed destination")
-        raise UndeclaredDestination(f"{state['host']} is not in allow_hosts")
+        raise UndeclaredDestination(f"{state['host']} (scheme and port included) is not in allow_hosts")
 
 
 def _hashing_stream(lib: Any, inner: Any, capture: _Capture, state: dict[str, Any],
@@ -172,9 +231,11 @@ class ReceiptTransport:
 
     def __init__(self, inner: Any, *, operator_key: OperatorKey,
                  on_receipt: Callable[[Any], None], allow_hosts: Iterable[str] | None = None,
-                 block_undeclared: bool = False, scan_pii: bool = True):
+                 block_undeclared: bool = False, scan_pii: bool = True,
+                 host_only: bool = False):
         self._inner = inner
-        self._capture = _Capture(operator_key, on_receipt, allow_hosts, block_undeclared, scan_pii)
+        self._capture = _Capture(operator_key, on_receipt, allow_hosts, block_undeclared, scan_pii,
+                                 host_only)
 
     def handle_request(self, request: Any) -> Any:
         body = request.read()
@@ -212,9 +273,11 @@ class AsyncReceiptTransport:
 
     def __init__(self, inner: Any, *, operator_key: OperatorKey,
                  on_receipt: Callable[[Any], None], allow_hosts: Iterable[str] | None = None,
-                 block_undeclared: bool = False, scan_pii: bool = True):
+                 block_undeclared: bool = False, scan_pii: bool = True,
+                 host_only: bool = False):
         self._inner = inner
-        self._capture = _Capture(operator_key, on_receipt, allow_hosts, block_undeclared, scan_pii)
+        self._capture = _Capture(operator_key, on_receipt, allow_hosts, block_undeclared, scan_pii,
+                                 host_only)
 
     async def handle_async_request(self, request: Any) -> Any:
         body = await request.aread()
@@ -239,3 +302,49 @@ class AsyncReceiptTransport:
 
     async def aclose(self) -> None:
         await self._inner.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Routes that bypass the transport
+# ---------------------------------------------------------------------------
+
+
+def check_client(client: Any) -> list[str]:
+    """Warn (UnreceiptedRouteWarning) about routes of an httpx/httpx2 client
+    that bypass its ReceiptTransport: `mounts=` entries and `proxy=` (which
+    httpx installs as a mount). Returns the URL patterns that bypass it.
+
+    Relies on httpx's private `_mounts` / `_transport` attributes; returns
+    [] for clients that don't have them.
+    """
+    receipting = (ReceiptTransport, AsyncReceiptTransport)
+    bypass = []
+    transport = getattr(client, "_transport", None)
+    if transport is not None and not isinstance(transport, receipting):
+        bypass.append("default transport")
+    for pattern, mounted in (getattr(client, "_mounts", None) or {}).items():
+        if mounted is not None and not isinstance(mounted, receipting):
+            bypass.append(getattr(pattern, "pattern", str(pattern)))
+    if bypass:
+        warnings.warn(
+            "requests matching these routes bypass the ReceiptTransport and are "
+            f"not receipted: {', '.join(sorted(bypass))}",
+            UnreceiptedRouteWarning, stacklevel=2,
+        )
+    return bypass
+
+
+def receipted_client(client_cls: Any, inner: Any, *, operator_key: OperatorKey,
+                     on_receipt: Callable[[Any], None], allow_hosts: Iterable[str] | None = None,
+                     block_undeclared: bool = False, scan_pii: bool = True,
+                     host_only: bool = False, **client_kwargs: Any) -> Any:
+    """client_cls(transport=<receipting wrapper of inner>, **client_kwargs),
+    for httpx/httpx2 Client or AsyncClient, then check_client() on it."""
+    is_async = "Async" in getattr(client_cls, "__name__", "")
+    wrapper = AsyncReceiptTransport if is_async else ReceiptTransport
+    transport = wrapper(inner, operator_key=operator_key, on_receipt=on_receipt,
+                        allow_hosts=allow_hosts, block_undeclared=block_undeclared,
+                        scan_pii=scan_pii, host_only=host_only)
+    client = client_cls(transport=transport, **client_kwargs)
+    check_client(client)
+    return client

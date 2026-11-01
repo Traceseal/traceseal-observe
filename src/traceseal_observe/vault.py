@@ -27,9 +27,16 @@ response. The vault keeps those payloads so that:
 
 Shredding caveat: deleting files is not secure erasure on SSDs, snapshots or
 backups. Crypto-shredding works because the DEK is gone. A deleted *wrapped*
-DEK recovered from a backup can still be unwrapped while the KEK survives,
-so after shredding, call rotate_kek() and destroy the old KEK, or keep DEKs
-in a KMS (see KMSKEK).
+DEK recovered from a backup can still be unwrapped while the KEK survives.
+That holds for KMSKEK too: it only wraps, and the wrapped DEKs live in this
+directory, so a pre-shred backup plus the same KMS key restores everything.
+After shredding, call rotate_kek(new_kek) and then destroy the old KEK (the
+old KMS key version) for the shred to reach backups.
+
+Erasure receipts identify the domain by HMAC-SHA256 under a per-vault secret
+salt (vault.json), not by a plain hash, so a receipt holder can't confirm a
+guessed domain name. The vault directory itself is not anonymised: domain
+records hold the name in clear and are filed under sha256(name).
 """
 
 from __future__ import annotations
@@ -49,9 +56,10 @@ from typing import Any, Callable
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-VAULT_VERSION = "1.0"
+VAULT_VERSION = "1.1"  # 1.1: vault.json holds domain_salt
+_READABLE_VAULT_VERSIONS = frozenset({"1.0", "1.1"})
 DISCLOSURE_VERSION = "1.0"
-ERASURE_VERSION = "1.0"
+ERASURE_VERSION = "1.1"  # 1.1: domain_hash is HMAC-SHA256 under the vault salt
 ERASURE_REASONS = frozenset({"data_subject_request", "retention_expired", "other"})
 
 _DOMAIN_RE = re.compile(r"^[!-~]{1,200}$")
@@ -156,6 +164,11 @@ class KMSKEK:
 
     For example Google Cloud KMS encrypt/decrypt with additional authenticated
     data, AWS KMS Encrypt/Decrypt with an EncryptionContext built from `aad`.
+
+    This does not by itself make shredding reach backups: the wrapped DEKs
+    are stored in the vault directory, so a backup plus this KMS key can
+    still unwrap a shredded domain's DEK. Use rotate_kek() to a new KMS key
+    (version) and destroy the old one.
     """
 
     def __init__(self, wrap_fn: Callable[[bytes, bytes], bytes],
@@ -198,13 +211,22 @@ class EvidenceVault:
         (self.dir / "domains").mkdir(parents=True, exist_ok=True)
         (self.dir / "objects").mkdir(parents=True, exist_ok=True)
         meta = self.dir / "vault.json"
+        data: dict[str, Any] = {}
         if meta.exists():
             data = json.loads(meta.read_text("utf-8"))
-            if data.get("vault_version") != VAULT_VERSION:
+            if data.get("vault_version") not in _READABLE_VAULT_VERSIONS:
                 raise VaultError("unsupported vault version")
             self.min_retention_days = max(min_retention_days, int(data.get("min_retention_days", 0)))
-        self._write_json(meta, {"vault_version": VAULT_VERSION,
-                                "min_retention_days": self.min_retention_days})
+        # Secret salt for erasure receipts' domain_hash; created on first open
+        # (also for vaults written before 1.1). Version 1.1 makes older
+        # releases refuse the vault rather than silently drop the salt.
+        salt = data.get("domain_salt")
+        self._domain_salt = _unb64(salt) if salt else secrets.token_bytes(32)
+        if len(self._domain_salt) < 16:
+            raise VaultError("vault.json domain_salt is malformed")
+        self._write_json(meta, {**data, "vault_version": VAULT_VERSION,
+                                "min_retention_days": self.min_retention_days,
+                                "domain_salt": _b64(self._domain_salt)})
 
     @classmethod
     def open(cls, directory: Path | str, kek: Any, *, min_retention_days: int = 0) -> EvidenceVault:
@@ -230,6 +252,11 @@ class EvidenceVault:
 
     def _objects_dir(self, name: str) -> Path:
         return self.dir / "objects" / self._domain_id(name)
+
+    def domain_hash(self, name: str) -> str:
+        """What erasure receipts record for a domain: HMAC-SHA256 under this
+        vault's secret salt. Only the vault holder can link it to a name."""
+        return erasure_domain_hash(name, self._domain_salt)
 
     def _aad(self, name: str, purpose: str, extra: str = "") -> bytes:
         return f"traceseal-vault/1|{purpose}|{self._domain_id(name)}|{extra}".encode()
@@ -394,9 +421,14 @@ class EvidenceVault:
         Refused under legal hold. Refused before retain_until unless
         override_retention=True, which is recorded in the receipt: a legal
         retention obligation can outweigh an erasure request (GDPR Art. 17(3)(b)).
+        override_retention=True requires operator_key, so an override always
+        leaves a signed record.
         """
         if reason not in ERASURE_REASONS:
             raise VaultError(f"reason must be one of {sorted(ERASURE_REASONS)}")
+        if override_retention and operator_key is None:
+            raise VaultError("override_retention=True needs operator_key: "
+                             "overriding retention must leave a signed erasure receipt")
         with self._lock:
             record = self._record(name)
             if record["legal_hold"]:
@@ -423,7 +455,8 @@ class EvidenceVault:
         if operator_key is None:
             return None
         return sign_erasure(domain=name, object_hashes=hashes, reason=reason,
-                            retention_overridden=early, operator_key=operator_key)
+                            retention_overridden=early, operator_key=operator_key,
+                            domain_salt=self._domain_salt)
 
     def enforce_retention(self, *, operator_key: Any = None, now: str | None = None) -> list[Any]:
         """Shred every domain past delete_after and not under legal hold."""
@@ -436,8 +469,10 @@ class EvidenceVault:
 
     def rotate_kek(self, new_kek: Any) -> int:
         """Re-wrap every live data key under new_kek. Destroy the old KEK
-        afterwards so wrapped keys of shredded domains in old backups can no
-        longer be unwrapped. Returns the number of domains re-wrapped."""
+        (for KMSKEK: the old KMS key or key version) afterwards so wrapped
+        keys of shredded domains in old backups can no longer be unwrapped.
+        Until then a shred does not reach backups. Returns the number of
+        domains re-wrapped."""
         with self._lock:
             count = 0
             for d in self.domains():
@@ -463,11 +498,22 @@ def objects_root(object_hashes: list[str]) -> str:
     return sha256_of(sorted(object_hashes))
 
 
+def erasure_domain_hash(domain: str, salt: bytes) -> str:
+    """"hmac-sha256:<hex>" of the domain name under a secret salt."""
+    import hmac
+
+    if not isinstance(salt, (bytes, bytearray)) or len(salt) < 16:
+        raise VaultError("domain_salt must be at least 16 secret bytes")
+    return "hmac-sha256:" + hmac.new(bytes(salt), domain.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def sign_erasure(*, domain: str, object_hashes: list[str], reason: str,
-                 retention_overridden: bool, operator_key: Any) -> Any:
-    """Sign an `erasure` receipt. Records a hash of the domain name, never
-    the name, and a commitment to the destroyed payload hashes, so anyone
-    holding a receipt can later show its payload was in the erased set."""
+                 retention_overridden: bool, operator_key: Any, domain_salt: bytes) -> Any:
+    """Sign an `erasure` receipt. Records a keyed hash of the domain name
+    (HMAC-SHA256 under domain_salt, never the name or a plain hash a
+    receipt holder could confirm guesses against) and a commitment to the
+    destroyed payload hashes, so anyone holding a receipt can later show
+    its payload was in the erased set."""
     from traceseal_observe import sign_execution_receipt
 
     if reason not in ERASURE_REASONS:
@@ -475,7 +521,7 @@ def sign_erasure(*, domain: str, object_hashes: list[str], reason: str,
     execution = {
         "receipt_type": "erasure",
         "erasure_version": ERASURE_VERSION,
-        "domain_hash": "sha256:" + hashlib.sha256(domain.encode("utf-8")).hexdigest(),
+        "domain_hash": erasure_domain_hash(domain, domain_salt),
         "object_count": len(object_hashes),
         "objects_root": objects_root(object_hashes),
         "reason": reason,
