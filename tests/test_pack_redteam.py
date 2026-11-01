@@ -647,8 +647,18 @@ class TestAuditorControlsTheAnalysis:
     def test_back_dated_before_own_receipts_fails(self, tmp_path):
         from traceseal_observe.report import verify_pack
 
-        key = self._incident_pack(tmp_path, now="2025-06-01T00:00:00Z")
-        r = verify_pack(tmp_path / "pack", [key.public_key_hex])
+        # build refuses a back-dated analysis outright...
+        with pytest.raises(ValueError, match="back-dated"):
+            self._incident_pack(tmp_path, now="2025-06-01T00:00:00Z")
+        # ...and verify-pack rejects one a forger produced by hand.
+        key = self._incident_pack(tmp_path)
+        pack = tmp_path / "pack"
+        rep = json.loads((pack / "report.json").read_text())
+        rep["analysis_options"]["now"] = "2025-06-01T00:00:00Z"
+        (pack / "report.json").write_text(json.dumps(rep, indent=2, sort_keys=True))
+        _remanifest(pack)
+        _resign(pack, key)
+        r = verify_pack(pack, [key.public_key_hex])
         assert not r["ok"] and any("back-dated analysis" in p for p in r["problems"])
 
     def test_auditor_adds_requirements(self, tmp_path):
@@ -815,3 +825,13 @@ def test_codex_round_n_fixes(tmp_path):
 
     # pins given as an iterator are not consumed before use
     assert verify_pack(tmp_path / "pack", iter([pk]))["pinned"] is True
+
+
+def test_explicit_now_none_builds_a_verifiable_pack(tmp_path):
+    key = OperatorKey.generate()
+    paths = _write(tmp_path, [_tool(key, "t", {})])
+    s = build_pack(tmp_path / "pack", paths, operator_key=key,
+                   operator_keys=[key.public_key_hex], now=None)
+    assert s["analysis_options"]["now"] == s["generated_at"]
+    r = verify_pack(tmp_path / "pack", [key.public_key_hex])
+    assert r["ok"], r["problems"]

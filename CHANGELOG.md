@@ -83,6 +83,9 @@ still verify.
   rejected (RECEIPT-SPEC §3). Hostile input no longer crashes the
   verifiers.
 
+- `build` derives its findings with the same code `verify-pack` runs, refuses a
+  back-dated `now`, and verifies the pack it just built (a signed pack that
+  would not re-derive consistently is an error, never an output).
 - `sign_execution_receipt` refuses booleans, nulls and circular values,
   which every verifier rejects (RECEIPT-SPEC §3).
 - Stop/resume decisions ordered only by signed times (different chains)

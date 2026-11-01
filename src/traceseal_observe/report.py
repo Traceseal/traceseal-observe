@@ -755,7 +755,8 @@ def build_pack(
         cp_records.append({"file": rel, "timestamps": token_rels})
     generated_at = datetime.now(timezone.utc).strftime(_UTC_FMT)
     kwargs = dict(analysis_kwargs)
-    kwargs.setdefault("now", generated_at)
+    if kwargs.get("now") is None:  # absent or explicitly None: the build time
+        kwargs["now"] = generated_at
     if kwargs.get("operator_keys") is not None:
         kwargs["operator_keys"] = _normalise_keys(kwargs["operator_keys"], "operator_keys")
     approval = kwargs.get("require_approval") or ()
@@ -780,6 +781,12 @@ def build_pack(
     receipt_files = sorted(rel for rel in contents if rel.startswith("receipts/"))
     receipts = _pack_receipts(contents, receipt_files)
     summary = _derive(contents, receipts, options)
+    latest = _parse_time(summary["period"].get("last"))
+    as_of = _parse_time(options.get("now"))
+    if latest is not None and as_of is not None and as_of < latest:
+        shutil.rmtree(out)
+        raise ValueError(f"now={options['now']} is before the latest receipt in the pack "
+                         f"({summary['period']['last']}): an analysis cannot be back-dated")
     summary["pack_version"] = PACK_VERSION
     summary["generated_at"] = generated_at
     summary["analysis_options"] = options
@@ -811,6 +818,16 @@ def build_pack(
             operator_key,
         )
         (out / "pack.receipt.json").write_bytes(receipt.to_json().encode("utf-8"))
+        # Self-check: the pack must re-derive exactly as verify-pack will
+        # re-derive it. Problems that come from the input receipts themselves
+        # (bad signatures, unreadable files) are pack content, not build bugs.
+        check = _verify_pack(out, [operator_key.public_key_hex], now=kwargs["now"])
+        inconsistent = [p for p in check["problems"] if any(marker in p for marker in (
+            "re-derived", "does not match", "analysis_options", "back-dated",
+            "verification_ok", "could not be re-derived", "pack receipt records"))]
+        if inconsistent:
+            raise RuntimeError("internal error: the built pack does not verify consistently: "
+                               + "; ".join(inconsistent[:3]))
     return summary
 
 
