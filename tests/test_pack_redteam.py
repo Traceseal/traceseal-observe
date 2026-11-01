@@ -312,7 +312,7 @@ class TestHostileJson:
         d = _bare(tmp_path, {})
         (d / "pack.receipt.json").write_text("{")
         result = verify_pack(d, None, trust_signer_in_pack=True)
-        assert "pack receipt: not valid JSON" in result["problems"]
+        assert any(p.startswith("pack receipt: not valid JSON") for p in result["problems"])
 
     @pytest.mark.parametrize("body", [
         {"receipt_version": "1.0", "execution": {}, "provenance": {}, "attestation": []},
@@ -730,3 +730,27 @@ def test_pack_built_with_platform_newline_translation_still_verifies(tmp_path, m
     monkeypatch.setattr(_P, "write_text", real)
     assert b"\r" not in (tmp_path / "pack" / "report.md").read_bytes()
     assert verify_pack(tmp_path / "pack", [key.public_key_hex])["ok"]
+
+
+def test_crlf_checkpoint_build_and_verify_agree(tmp_path):
+    from test_incident_and_report import _scenario
+
+    key, _, paths, cp = _scenario(tmp_path)
+    crlf = tmp_path / "cp-crlf.txt"
+    crlf.write_bytes(cp.read_bytes().replace(b"\n", b"\r\n"))
+    pack = tmp_path / "pack"
+    s = build_pack(pack, paths, operator_key=key, checkpoint_paths=[crlf],
+                   require_approval=["issue_refund"], operator_keys=[key.public_key_hex])
+    assert s["ok"] and any(rep.get("checkpoint", {}).get("anchored") for rep in s["chains"].values())
+    r = verify_pack(pack, [key.public_key_hex])
+    assert r["ok"] and r["pack_result"] == "passed", r["problems"]
+
+
+def test_single_string_approval_enforced_at_build_and_verify(tmp_path):
+    key = OperatorKey.generate()
+    paths = _write(tmp_path, [_tool(key, "refund", {})])
+    s = build_pack(tmp_path / "pack", paths, operator_key=key,
+                   operator_keys=[key.public_key_hex], require_approval="refund")
+    assert not s["ok"]  # 'refund' requires approval and cites none
+    r = verify_pack(tmp_path / "pack", [key.public_key_hex])
+    assert r["ok"] and r["pack_result"] == "ISSUES FOUND", r["problems"]

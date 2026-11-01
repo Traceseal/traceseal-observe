@@ -771,7 +771,15 @@ def build_pack(
         "operator_keys": kwargs.get("operator_keys"),
         "reviewer_keys": _registry_json(kwargs.get("reviewer_keys")),
     }
-    summary = analyse(receipts, checkpoints=notes, checkpoint_timestamps=stamps, **kwargs)
+    # Round-trip the options through JSON (as report.json stores them) and
+    # derive the findings from the files as stored in the pack: the same
+    # code verify_pack runs.
+    options = json.loads(json.dumps(options, default=str))
+    contents = {p.relative_to(out).as_posix(): p.read_bytes()
+                for p in sorted(out.rglob("*")) if p.is_file()}
+    receipt_files = sorted(rel for rel in contents if rel.startswith("receipts/"))
+    receipts = _pack_receipts(contents, receipt_files)
+    summary = _derive(contents, receipts, options)
     summary["pack_version"] = PACK_VERSION
     summary["generated_at"] = generated_at
     summary["analysis_options"] = options
@@ -871,12 +879,63 @@ def _walk(root: Path, problems: list[str]) -> set[str]:
     return found
 
 
+def _pack_inputs(contents: dict[str, bytes], options: dict[str, Any]) -> tuple[list, dict, list]:
+    """Checkpoint notes, their timestamp tokens and TSA roots, exactly as
+    stored in the pack. Used by build_pack and verify_pack alike."""
+    from traceseal_observe.timestamp import load_certificates
+
+    notes: list[str] = []
+    stamps: dict[str, list[bytes]] = {}
+    for cp in options.get("checkpoints") or []:
+        # Normalise newlines: a CRLF checkpoint file is the same note.
+        note = contents[cp["file"]].decode("utf-8").replace("\r\n", "\n")
+        notes.append(note)
+        stamps.setdefault(note, []).extend(contents[t] for t in cp.get("timestamps") or [])
+    anchors: list[Any] = []
+    for pem in options.get("tsa_trust_anchors_pem") or []:
+        anchors.extend(load_certificates(pem.encode("ascii")))
+    return notes, stamps, anchors
+
+
+def _derive(contents: dict[str, bytes], receipts: list[Receipt],
+            options: dict[str, Any]) -> dict[str, Any]:
+    """The pack's findings from its stored files and recorded options. The
+    ONLY derivation: build_pack writes what this returns and verify_pack
+    re-runs it, so the two can never disagree."""
+    notes, stamps, anchors = _pack_inputs(contents, options)
+    return analyse(
+        receipts, checkpoints=notes, checkpoint_timestamps=stamps,
+        tsa_trust_anchors=anchors, witness_vkeys=options.get("witness_vkeys") or [],
+        required_scopes=options.get("required_scopes"),
+        require_approval=options.get("require_approval") or [],
+        require_policy=options.get("require_policy"),
+        min_review_seconds=options.get("min_review_seconds"),
+        now=options.get("now"), operator_keys=options.get("operator_keys"),
+        reviewer_keys=options.get("reviewer_keys"),
+    )
+
+
+def _pack_receipts(contents: dict[str, bytes], receipt_files: list[str],
+                   problems: list[str] | None = None) -> list[Receipt]:
+    out = []
+    for rel in receipt_files:
+        try:
+            out.append(_receipt_from_bytes(contents[rel], rel))
+        except ValueError as exc:
+            if problems is not None:
+                problems.append(str(exc))
+            out.append(Receipt(_UNREADABLE, _UNREADABLE, _UNREADABLE, _UNREADABLE))
+    return out
+
+
 def _receipt_from_bytes(data: bytes, label: str) -> Receipt:
     """Parse a receipt; raises ValueError (never anything else) if it is not one."""
+    from traceseal_observe import loads_receipt_json
+
     try:
-        obj = json.loads(data.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        raise ValueError(f"{label}: not valid JSON") from None
+        obj = loads_receipt_json(data)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{label}: not valid JSON ({exc})") from None
     if not isinstance(obj, dict):
         raise ValueError(f"{label}: not a JSON object")
     try:
@@ -1022,14 +1081,10 @@ def verify_pack(
                             "key; confirm this key belongs to the operator out of band.")
 
     # -- receipts ---------------------------------------------------------------
-    receipts = []
-    for rel in receipt_files:
-        try:
-            r = _receipt_from_bytes(contents[rel], rel)
-        except ValueError as exc:
-            problems.append(str(exc))
-            r = Receipt(_UNREADABLE, _UNREADABLE, _UNREADABLE, _UNREADABLE)  # as build_pack does
-        receipts.append(r)
+    receipts = _pack_receipts(contents, receipt_files, problems)
+    for rel, r in zip(receipt_files, receipts):
+        if r.execution is _UNREADABLE:
+            continue
         try:
             _check_receipt(r, rel)
         except ValueError as exc:
@@ -1054,24 +1109,8 @@ def verify_pack(
                             "its findings cannot be re-derived")
         else:
             try:
-                notes, stamps = [], {}
-                for cp in options.get("checkpoints") or []:
-                    note = contents[cp["file"]].decode("utf-8")
-                    notes.append(note)
-                    stamps.setdefault(note, []).extend(contents[t] for t in cp.get("timestamps") or [])
-                anchors = []
-                for pem in options.get("tsa_trust_anchors_pem") or []:
-                    anchors.extend(load_certificates(pem.encode("ascii")))
-                derived = analyse(
-                    receipts, checkpoints=notes, checkpoint_timestamps=stamps,
-                    tsa_trust_anchors=anchors, witness_vkeys=options.get("witness_vkeys") or [],
-                    required_scopes=options.get("required_scopes"),
-                    require_approval=options.get("require_approval") or [],
-                    require_policy=options.get("require_policy"),
-                    min_review_seconds=options.get("min_review_seconds"),
-                    now=options.get("now"), operator_keys=options.get("operator_keys"),
-                    reviewer_keys=options.get("reviewer_keys"),
-                )
+                notes, stamps, anchors = _pack_inputs(contents, options)
+                derived = _derive(contents, receipts, options)
             except Exception as exc:
                 problems.append(f"findings could not be re-derived ({type(exc).__name__}: {exc})")
             else:
