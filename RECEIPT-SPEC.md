@@ -6,9 +6,10 @@
 
 ## Abstract
 
-An Execution Receipt is a signed, self-contained JSON document that
-proves a specific piece of code ran inside a specific sandbox and
-produced a specific result. A third party can verify the receipt
+An Execution Receipt is a signed, self-contained JSON document in
+which an operator attests that a specific piece of code ran inside a
+specific sandbox and produced a specific result. It is an attestation
+by the operator, not a proof of execution (see §5 Step 7 and §6.1). A third party can verify the receipt
 without access to the operator's machine, the original code, or
 any private keys. Verification requires only the receipt file itself.
 
@@ -147,8 +148,10 @@ inputs and outputs, not the values themselves. A verifier who has the
 original input can recompute `inputs_hash` and confirm it matches the
 receipt, proving "this specific input was used." A verifier without
 the original input can only confirm "some input with this hash was
-used." This is deliberate: receipts can be shared publicly without
-leaking the data that was processed.
+used." This is deliberate: the values themselves are not in the
+receipt. Hashes of short or guessable values can be reversed by
+guessing, and some metadata is in clear text, so review receipts
+before sharing them (see §6.4).
 
 ### 2.3 provenance
 
@@ -424,8 +427,12 @@ semantics outside the signed payload.
 ### 6.4 Privacy
 
 Receipts contain hashes of inputs and outputs, not the values
-themselves. This allows receipts to be shared publicly or submitted
-to compliance systems without leaking the data that was processed.
+themselves, plus some clear-text metadata (for example tool names,
+endpoints, error descriptions, tenant and session identifiers).
+Hashes of short or guessable values can be reversed by guessing, and
+pseudonymous identifiers let one user's receipts be linked together.
+Treat receipts as potentially personal data, and review them before
+publishing.
 If a verifier needs to confirm specific input/output content, the
 operator provides the original data separately and the verifier
 recomputes the hash.
