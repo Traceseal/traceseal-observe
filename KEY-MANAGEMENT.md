@@ -118,9 +118,46 @@ Compromise checklist:
 3. Publish and timestamp a fresh checkpoint.
 4. Tell the auditors and customers who hold your earlier checkpoints.
 
+## Operator key directory
+
+A receipt names the key that signed it; it cannot say whether that key
+belongs to the organisation it claims to come from. `directory.py` and
+the `traceseal-keys` command publish and check that binding:
+
+```bash
+traceseal-keys publish --domain example.com --keys keys.json \
+    --signing-key active1.key --output operator-keys.json
+# serve it at https://example.com/.well-known/traceseal/operator-keys.json
+traceseal-keys verify --domain example.com receipts/*.json          # fetch over HTTPS
+traceseal-keys verify --domain example.com --file operator-keys.json receipts/*.json
+```
+
+- The directory lists each key with `status` (`active`, `retired`,
+  `revoked`), `valid_from` and, as applicable, `valid_until`,
+  `revoked_at` and `compromised_after`. Every active key must sign it, and
+  the signed `domain` field stops it being replayed on another domain.
+- `check_receipts` (and `traceseal-keys verify`) first verifies each
+  receipt's signature and reports `invalid_signature` for any that fail; a
+  forged receipt naming your key is never reported `valid`. It then judges
+  the key at the receipt's **signed** time (`chained_at`, `started_at`,
+  ...). The unsigned `attestation.attested_at` is never used; a receipt
+  without a signed time is `unknown_time`.
+- A **revoked key without `compromised_after`** gives no safe cut-off:
+  whoever holds the key can sign a new receipt that claims an earlier time.
+  For such a key a self-claimed time before revocation is reported
+  `revoked_time_unproven` (not valid). Pass `trusted_times` (receipt hash →
+  a time proven independently, e.g. by a TSA token or witness cosignature
+  over a checkpoint covering it) to decide it. When you revoke a key, set
+  `compromised_after` to the last moment you can vouch for.
+- Exit code is 1 unless every receipt is `valid`.
+
+Limits: the domain binding is only as strong as the HTTPS/WebPKI chain of
+the domain that serves the file; a legal identity binding needs, in
+addition, an eIDAS qualified electronic seal over the directory, which is
+out of scope. Trust in the directory itself is established by fetching it
+from the organisation's domain, not by anything inside a receipt.
+
 ## Not yet covered
 
-- A published operator-key directory (for example a `.well-known`
-  document bound to the organisation's domain or an eIDAS electronic seal).
-  Today, a verifier's trust in the *first* key is established out of band.
+- An eIDAS qualified-seal binding for the operator key directory.
 - Hybrid or post-quantum signatures.

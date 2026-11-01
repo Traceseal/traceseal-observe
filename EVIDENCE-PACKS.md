@@ -1,4 +1,4 @@
-# Incidents and Compliance Evidence Packs
+# Incidents and Evidence Packs
 
 ## Incident receipts
 
@@ -49,35 +49,105 @@ rules and later amendments must be checked with counsel. See
 traceseal-report build receipts/ \
     --checkpoint cp.txt --checkpoint-timestamp cp.txt=cp.tsr --tsa-root tsa-root.pem \
     --require-approval issue_refund --require-policy send_email=pii-filter \
+    --operator-pubkey <operator public key hex> \
     --operator-key ops.key --output pack/
-traceseal-report verify-pack pack/
+traceseal-report verify-pack pack/ --operator-pubkey <operator public key hex>
 ```
 
-`build` runs every verifier over the receipts:
-- signatures;
+`build` runs these verifiers over the receipts:
+- signatures (receipts whose JSON is not a valid receipt are reported as
+  signature failures, never a crash);
+- with `--operator-pubkey` (repeatable; `operator_keys=` in Python), the
+  signer pin: receipts signed by any other key are listed under
+  `foreign_key_receipts`, excluded from the analysis, and make the pack
+  fail. Keys reached by a chain rotation must be pinned too. Without a pin,
+  receipts from more than one key that are not linked by a verified chain
+  rotation produce a warning, because anyone can add receipts signed by a
+  key of their own;
 - `verify_chain` per chain, with whichever supplied checkpoint belongs to
   that chain, including key rotations;
 - `verify_trace` for causality, authorisation, oversight and policy;
 - incident deadlines;
 - data-flow summaries.
 
+A receipt that makes a verifier raise is skipped and reported under
+`analysis_failures`, which fails the pack.
+
+The period a pack covers comes only from **signed** time fields
+(`chained_at`, `started_at`, `observed_at`, `decided_at`, `aware_at`,
+`recorded_at`, `verified_at`, `reobserved_at`). The unsigned
+`attestation.attested_at` is never used, and a missing or malformed time
+counts as unknown. These are still the operator's own clock: see trusted
+time below.
+
 It then writes:
 
 ```
 pack/
   report.md          findings and the control map, for people
-  report.json        the same plus every verifier report, for machines
+  report.json        the same plus every verifier report and the analysis
+                     options used (analysis_options), for machines
   receipts/          copies of every receipt examined
   checkpoints/       checkpoints and timestamp tokens supplied
   manifest.json      SHA-256 of every file
-  pack.receipt.json  operator-signed evidence_pack receipt over the manifest
+  pack.receipt.json  operator-signed evidence_pack receipt over the manifest,
+                     with file and receipt counts and the overall result
 ```
 
-`verify-pack` re-checks everything offline:
-- every file against the manifest;
-- that no unlisted file was added;
-- the pack signature;
-- every receipt signature.
+A pack built without `--operator-key` is unsigned, and `verify-pack`
+rejects it.
+
+### What `verify-pack` checks
+
+`verify-pack` works offline. You must say whose signature you expect:
+pass the operator's public key, obtained **out of band** (from their
+operator key directory, a contract, a previous audit — not from the pack),
+with `--operator-pubkey` (repeatable). Without it the command refuses and
+exits 2. `--trust-signer-in-pack` accepts whichever key signed the pack;
+the result is then reported as `pinned: false` with a warning, because
+anyone can re-sign a pack with a key of their own.
+
+It checks:
+- **paths:** every manifest path is relative, has no `..` component and
+  resolves inside the pack; symlinks are never followed, whether listed in
+  the manifest or found anywhere in the pack (including `receipts/`);
+- every file against the manifest, and that no unlisted file was added;
+- the **pack signature, which is mandatory:** `pack.receipt.json` must
+  exist, verify, be signed by a pinned key, and cover this manifest, its
+  file count and the number of receipts in `receipts/` (so removing a
+  receipt together with its manifest entry is detected);
+- every receipt signature;
+- **the findings:** it re-runs the analysis over `receipts/` and
+  `checkpoints/` with the options recorded in `report.json`
+  (checkpoints and their timestamp tokens, TSA roots, witness keys,
+  required approvals, scopes and policies, minimum review time, the
+  operator-key pin, and the analysis time), and requires the overall
+  result, every control status, the receipt counts and the period to
+  match `report.json`, and the pack receipt's `verification_ok` to match.
+  Each mismatch is reported as a problem. Packs without recorded options
+  (built before 1.6.0) fail this check.
+
+Hostile content (a manifest that is a list, a pack receipt that is not
+JSON, fields of the wrong type) is reported as a problem, never a crash.
+
+The output shows both whether the pack is intact and what the pack itself
+found:
+
+```
+[OK] 6 files, 4 receipts, pack signature: valid by 1f2e3d4c5b6a7980… (pinned)
+  pack result: ISSUES FOUND
+```
+
+Exit codes: `0` intact and the pack's findings passed; `3` intact but the
+pack reports issues; `1` the pack failed verification; `2` usage error
+(including no pinned signer).
+
+What `verify-pack` does **not** do: it does not make the operator's
+receipts true. It shows that the pack is unmodified since the pinned key
+signed it and that its findings follow from the receipts and options it
+contains. Whether the options (which approvals were required, which TSA
+roots were trusted) are the right ones is for the auditor to judge; they
+are listed in `report.json`.
 
 ### The control map
 
@@ -88,8 +158,24 @@ problems found:
 |---|---|
 | `evidence` | relevant evidence exists and the verifiers found no problem with it |
 | `issues` | the verifiers found problems; they are listed in the row |
-| `partial` | some evidence, but not enough on its own, e.g. a pack covering less than six months for Art. 19 |
+| `partial` | some evidence, but not enough on its own (see the rules below) |
 | `no evidence` | nothing in this pack speaks to it |
+
+Rules worth knowing:
+- **Trace errors are never dropped.** Errors that a specific row claims
+  (oversight on Art. 14 / 26(2)) appear there; every trace error appears
+  on Art. 26(5) and NIST AI RMF, and any error no specific row claims also
+  appears on Art. 12 and ISO/IEC 42001. Signature failures, analysis
+  failures and receipts from unpinned keys appear on Art. 12, 26(5),
+  ISO/IEC 42001 and NIST.
+- **Art. 12** is `partial`, not `evidence`, when any operational receipt
+  is outside a chain: unchained receipts cannot show completeness.
+- **Art. 19 / 26(6)** is `evidence` only when the period is at least 183
+  days **and** rests on trusted time: a chain spanning at least 183 days
+  whose checkpoint anchors its receipts and carries a verified RFC 3161
+  timestamp or witness cosignature. Otherwise it is `partial`. A
+  checkpoint's trusted time proves that the receipts existed by then, not
+  when each one was made.
 
 Rows cover:
 - **EU AI Act:** Art. 12, 12(2)–(3), 14, 19 / 26(6), 26(5), 72, 73;
