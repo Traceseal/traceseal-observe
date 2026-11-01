@@ -13,9 +13,12 @@ signed, chainable record of each stage, pointing at the receipts involved.
     update = sign_incident(..., status="reported", supersedes=incident,
                            report_reference=submitted_report, regulator="DE-MSA")
 
-reporting_deadlines() computes the statutory deadlines that run from
-awareness. They are informational, not legal advice. Check the current text
-of the regulation and any national rules before relying on them.
+reporting_deadlines() computes the latest permissible times for the
+statutory notifications that run from awareness, each with the legal
+qualifier ("immediately", "without undue delay") that governs it.
+related_obligations() lists the follow-up duties. All of it is
+informational, not legal advice: whether a regime applies to you, national
+rules and later amendments must be checked with counsel.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ INCIDENT_CATEGORIES = frozenset({
     "serious_incident",       # EU AI Act Art. 3(49), reported under Art. 73
     "personal_data_breach",   # GDPR Art. 4(12), Art. 33
     "significant_incident",   # NIS2 Art. 23
-    "major_ict_incident",     # DORA Art. 19 (timelines set by its technical standards)
+    "major_ict_incident",     # DORA Art. 19; timelines in Delegated Regulation (EU) 2025/301
     "malfunction",
     "other",
 })
@@ -50,20 +53,51 @@ def _fmt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Where an obligation applies at all depends on who you are (provider,
+# deployer, controller, processor, essential/important entity, financial
+# entity), on national transposition, and, for the AI Act, on whether the
+# system is high-risk. These notes travel with every computed deadline.
+AI_ACT_HIGH_RISK_APPLICATION = (
+    "Applies to providers of high-risk AI systems (deployers inform the provider "
+    "immediately, Art. 26(5)). As amended by Regulation (EU) 2026/1744: from "
+    "2 December 2027 for Annex III systems and 2 August 2028 for Annex I systems."
+)
+LEGAL_NOTICE = (
+    "Informational, not legal advice. Deadlines are computed from aware_at as "
+    "the latest permissible time; the law asks for notification without undue "
+    "delay or immediately, so report as early as you can. Whether a regime "
+    "applies, national rules and any later amendment must be checked with "
+    "counsel. Only the first report is checked against deadlines; follow-up "
+    "obligations are listed, not tracked."
+)
+
+
 def reporting_deadlines(
     category: str, aware_at: str, *, death: bool = False, widespread: bool = False
 ) -> list[dict[str, str]]:
     """Statutory notification deadlines that run from awareness.
 
-    serious_incident (EU AI Act Art. 73): 15 days (73(2)); 2 days for a
-      widespread infringement or critical-infrastructure disruption (73(3));
-      10 days in the event of a death (73(4)). The shortest applicable applies.
-    personal_data_breach (GDPR Art. 33(1)): 72 hours.
-    significant_incident (NIS2 Art. 23(4)): early warning 24 hours, incident
-      notification 72 hours (final report one month after the notification,
-      not computed here).
-    major_ict_incident (DORA): set by the delegated technical standards; not
-      computed.
+    Every entry is the *latest* permissible time ("due") with the legal
+    qualifier that governs it ("qualifier"). Reporting at the due time can
+    still be late where the law says "immediately" or "without undue delay".
+
+    serious_incident (EU AI Act Art. 73, high-risk systems only): immediately
+      after a causal link is established or reasonably likely, and no later
+      than 15 days (73(2)); 2 days for a widespread infringement or a serious
+      incident under Art. 3(49)(b) (73(3)); 10 days in the event of a death
+      (73(4)). The shortest applicable applies.
+    personal_data_breach (GDPR Art. 33(1)): without undue delay and, where
+      feasible, not later than 72 hours.
+    significant_incident (NIS2 Art. 23(4)): early warning without undue delay
+      and within 24 hours, incident notification within 72 hours.
+    major_ict_incident (DORA Art. 19, Delegated Regulation (EU) 2025/301
+      Art. 5): initial notification within 4 hours of classifying the
+      incident as major and no later than 24 hours after awareness. Only the
+      24-hour outer limit can be computed from aware_at.
+
+    Follow-up obligations without a fixed time from awareness (GDPR Art. 34,
+    NIS2 final report, DORA intermediate and final reports) are returned by
+    related_obligations().
     """
     if category not in INCIDENT_CATEGORIES:
         raise ValueError(f"category must be one of {sorted(INCIDENT_CATEGORIES)}")
@@ -76,16 +110,89 @@ def reporting_deadlines(
         if widespread:
             days, basis = 2, "EU AI Act Art. 73(3)"
         out.append({"regime": "EU AI Act", "step": "report to market surveillance authority",
-                    "basis": basis, "due": _fmt(aware + timedelta(days=days))})
+                    "basis": basis, "due": _fmt(aware + timedelta(days=days)),
+                    "qualifier": "immediately after establishing a causal link or its reasonable "
+                                 "likelihood, and no later than the due time; an initial "
+                                 "incomplete report may be followed by a complete one (73(5)). "
+                                 + AI_ACT_HIGH_RISK_APPLICATION})
     elif category == "personal_data_breach":
         out.append({"regime": "GDPR", "step": "notify supervisory authority",
-                    "basis": "GDPR Art. 33(1)", "due": _fmt(aware + timedelta(hours=72))})
+                    "basis": "GDPR Art. 33(1)", "due": _fmt(aware + timedelta(hours=72)),
+                    "qualifier": "without undue delay and, where feasible, not later than 72 hours; "
+                                 "not required where the breach is unlikely to result in a risk; "
+                                 "a late notification must give the reasons for the delay. "
+                                 "Controllers only; processors notify the controller (33(2))."})
     elif category == "significant_incident":
         out.append({"regime": "NIS2", "step": "early warning", "basis": "NIS2 Art. 23(4)(a)",
-                    "due": _fmt(aware + timedelta(hours=24))})
+                    "due": _fmt(aware + timedelta(hours=24)),
+                    "qualifier": "without undue delay and in any event within 24 hours; "
+                                 "national transposition and CSIRT procedures may add requirements."})
         out.append({"regime": "NIS2", "step": "incident notification", "basis": "NIS2 Art. 23(4)(b)",
-                    "due": _fmt(aware + timedelta(hours=72))})
+                    "due": _fmt(aware + timedelta(hours=72)),
+                    "qualifier": "without undue delay and in any event within 72 hours; "
+                                 "national transposition may add requirements."})
+    elif category == "major_ict_incident":
+        out.append({"regime": "DORA", "step": "initial notification",
+                    "basis": "DORA Art. 19(4); Delegated Regulation (EU) 2025/301 Art. 5",
+                    "due": _fmt(aware + timedelta(hours=24)),
+                    "qualifier": "within 4 hours of classifying the incident as major, and no later "
+                                 "than 24 hours after awareness; the due time is the 24-hour outer "
+                                 "limit only. Check the current RTS text and your competent "
+                                 "authority's procedures."})
     return out
+
+
+def related_obligations(category: str) -> list[dict[str, str]]:
+    """Follow-up obligations with no fixed time from awareness. Listed in
+    incident receipts and evidence packs so they are not forgotten; they are
+    not checked against reports."""
+    if category not in INCIDENT_CATEGORIES:
+        raise ValueError(f"category must be one of {sorted(INCIDENT_CATEGORIES)}")
+    if category == "serious_incident":
+        return [
+            {"regime": "EU AI Act", "basis": "EU AI Act Art. 26(5)",
+             "step": "deployer informs the provider, then importer/distributor and authority",
+             "timing": "immediately"},
+            {"regime": "EU AI Act", "basis": "EU AI Act Art. 73(6)",
+             "step": "investigation, risk assessment and corrective action; do not alter the "
+                     "system in a way that affects later evaluation before informing authorities",
+             "timing": "without delay"},
+        ]
+    if category == "personal_data_breach":
+        return [
+            {"regime": "GDPR", "basis": "GDPR Art. 34",
+             "step": "communicate to data subjects where the breach is likely to result in a "
+                     "high risk to their rights and freedoms",
+             "timing": "without undue delay"},
+            {"regime": "GDPR", "basis": "GDPR Art. 33(5)",
+             "step": "document the breach, its effects and the remedial action",
+             "timing": "always, including breaches not notified"},
+        ]
+    if category == "significant_incident":
+        return [
+            {"regime": "NIS2", "basis": "NIS2 Art. 23(1)",
+             "step": "notify recipients of the service where the incident is likely to "
+                     "adversely affect them",
+             "timing": "without undue delay"},
+            {"regime": "NIS2", "basis": "NIS2 Art. 23(4)(c)",
+             "step": "intermediate report", "timing": "on request of the CSIRT or authority"},
+            {"regime": "NIS2", "basis": "NIS2 Art. 23(4)(d)",
+             "step": "final report",
+             "timing": "no later than one month after the incident notification"},
+        ]
+    if category == "major_ict_incident":
+        return [
+            {"regime": "DORA", "basis": "Delegated Regulation (EU) 2025/301 Art. 5",
+             "step": "intermediate report",
+             "timing": "within 72 hours of the initial notification, and when status changes"},
+            {"regime": "DORA", "basis": "Delegated Regulation (EU) 2025/301 Art. 5",
+             "step": "final report",
+             "timing": "within one month of the latest intermediate report"},
+            {"regime": "DORA", "basis": "DORA Art. 19(3)",
+             "step": "inform affected clients where the incident affects their financial interests",
+             "timing": "without undue delay"},
+        ]
+    return []
 
 
 def sign_incident(
@@ -165,6 +272,9 @@ def sign_incident(
     deadlines = reporting_deadlines(category, aware_at, death=death, widespread=widespread)
     if deadlines:
         execution["deadlines"] = deadlines
+    related = related_obligations(category)
+    if related:
+        execution["related_obligations"] = related
     provenance = {"provenance_version": "1.0", "provider_attestation": "none"}
     return sign_execution_receipt(execution, provenance, operator_key)
 
@@ -207,6 +317,7 @@ def incident_status(incidents: list[Any], *, now: str | None = None) -> list[dic
             "stages": len(history),
             "deadlines": r.execution.get("deadlines", []),
             "missed_deadlines": overdue,
+            "related_obligations": r.execution.get("related_obligations", []),
             "affected_receipts": r.execution.get("affected_receipt_hashes", []),
         })
     return out

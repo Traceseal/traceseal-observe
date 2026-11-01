@@ -43,7 +43,7 @@ trust primitive the operator can produce without provider cooperation.
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 import hashlib
 import json
@@ -3200,7 +3200,12 @@ from traceseal_observe.context import (  # noqa: E402
     caused_by,
     requested_tool_calls,
 )
-from traceseal_observe.incident import reporting_deadlines, sign_incident  # noqa: E402
+from traceseal_observe.incident import (  # noqa: E402
+    LEGAL_NOTICE,
+    related_obligations,
+    reporting_deadlines,
+    sign_incident,
+)
 from traceseal_observe.oversight import (  # noqa: E402
     observe_policy,
     sign_oversight,

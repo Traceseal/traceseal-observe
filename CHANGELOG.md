@@ -5,6 +5,42 @@ All notable changes to `traceseal-observe`. Format follows
 keeps the `RECEIPT-SPEC.md` v1.0 envelope: receipts from earlier versions
 verify unchanged, and new receipts verify with any v1 verifier.
 
+## [1.5.1] — 2026-11-01
+
+Legal-accuracy review of every regulatory reference. No change to receipt
+formats or signatures: receipts from 1.5.0 verify unchanged.
+
+### Changed
+- **EU AI Act dates.** The Digital Omnibus on AI (Regulation (EU) 2026/1744)
+  postponed the high-risk obligations to 2 December 2027 (Annex III) and
+  2 August 2028 (Annex I). The docs, deadlines and evidence packs now say
+  so, and that Arts. 12, 14, 19, 26, 72 and 73 apply to high-risk systems
+  only.
+- **Deadlines carry their legal qualifier.** Every deadline from
+  `reporting_deadlines()` now includes a `qualifier` ("immediately",
+  "without undue delay", "where feasible"), and the docs say the due time
+  is the latest permissible time, not a target.
+- **Evidence-pack controls** now say who each obligation applies to
+  (`applies_to`), carry a full legal notice (`legal_notice`), and are
+  reworded where they overstated:
+  - Art. 12(3) dropped: it covers remote biometric identification only.
+  - Art. 14 became "Art. 14 / 26(2)".
+  - GDPR Art. 30/44 data flows are marked as supporting input only.
+  - Principal commitments are described as pseudonymised, not anonymised.
+  - Crypto-shredding is described as a technical erasure measure.
+- `CAPTURE.md` no longer claims the transport proves nothing left the
+  system. It records what passes through clients configured with it.
+
+### Added
+- **DORA.** `major_ict_incident` computes the 24-hour outer limit for the
+  initial notification (Delegated Regulation (EU) 2025/301 Art. 5).
+- **`related_obligations()`** lists follow-up duties, and incident receipts
+  carry them: AI Act Art. 26(5) and 73(6); GDPR Art. 33(5) and 34; NIS2
+  Art. 23(1) and the final report; DORA intermediate and final reports.
+- **`LEGAL.md`**: scope, no warranty, what the evidence can and cannot show,
+  status of each regime, personal data. It ships in the package.
+- New `DORA Art. 19` control in evidence packs.
+
 ## [1.5.0] — 2026-11-01
 
 ### Added

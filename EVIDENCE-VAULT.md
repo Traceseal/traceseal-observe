@@ -23,7 +23,7 @@ vault.put_for(receipt, "output_hash", response.model_dump(), domain=f"tenant:{te
 | Encrypted at rest | AES-256-GCM per payload. The associated data binds the domain and the hash, so ciphertexts can't be swapped. |
 | Erasable at the right granularity | One data key per **shred domain**: a tenant, a user (use the principal commitment), or a retention period. |
 | KMS-ready | Data keys are wrapped by a key-encryption key: `LocalKEK`, or `KMSKEK(wrap_fn, unwrap_fn)` for a cloud KMS or HSM. |
-| Retention | `min_retention_days` sets a floor (AI Act Art. 19 / 26(6): at least six months for logs). A reopened vault can't lower it. Optional per-domain `delete_after` (GDPR Art. 5(1)(e)) is applied by `enforce_retention()`. |
+| Retention | `min_retention_days` sets a floor (AI Act Art. 19 / 26(6), for high-risk systems: at least six months for logs, unless Union or national law, in particular data-protection law, provides otherwise). A reopened vault can't lower it. Optional per-domain `delete_after` (GDPR Art. 5(1)(e)) is applied by `enforce_retention()`. |
 | Legal hold | `set_legal_hold(domain)` blocks every shred, including expiry and overrides. |
 | Disclosure | `disclose(hash, auditor_public_key)` seals one payload with HPKE (RFC 9180): X25519, or the post-quantum hybrid ML-KEM-768+X25519. The auditor runs `open_disclosure()`, which re-checks the hash. |
 
@@ -45,7 +45,8 @@ erasure_receipt = vault.shred("principal:hmac-sha256:…", operator_key=chain.si
    - `retention_overridden`: `"true"` if the shred happened before
      `retain_until` with `override_retention=True`. A legal retention duty
      can outweigh an erasure request (GDPR Art. 17(3)(b)), so this choice
-     is recorded rather than hidden.
+     is recorded rather than hidden. Keeping data after an erasure request
+     must rest on an Art. 17(3) exception that applies to you.
 
 All receipts remain valid after shredding: the signatures were over
 hashes. `erasure_covers(erasure_receipt, hashes, h)` shows a given payload

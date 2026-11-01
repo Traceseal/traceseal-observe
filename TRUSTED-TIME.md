@@ -111,9 +111,13 @@ only by anchoring to a trusted-list entry.
 This mapping is informational, not legal advice.
 
 - **EU AI Act Art. 12 (record-keeping) and Art. 19 / 26(6) (keeping logs
-  for at least 6 months):** independent evidence of *when* logged events
-  occurred, and that the log wasn't rewritten afterwards.
+  for at least 6 months), for high-risk systems from 2 December 2027
+  (Annex III) / 2 August 2028 (Annex I):** independent evidence of *when*
+  logged events occurred, and that the log wasn't rewritten afterwards.
 - **eIDAS Art. 41(2):** the legal presumption applies to qualified time
-  stamps only.
+  stamps only, from a provider on the EU trusted list at the time. The
+  ETSI signals this library reads are asserted by the TSA; they are not
+  proof of qualified status. Non-qualified time stamps are still
+  admissible as evidence (Art. 41(1)) but carry no presumption.
 - **DORA / NIS2 incident timelines:** a timestamped checkpoint fixes the
   state of the agent's log before an incident report was written.

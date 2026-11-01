@@ -39,8 +39,10 @@ Headers, and so API keys, are never hashed or recorded.
 - The transport is duck-typed: it works with `httpx` and `httpx2`
   transports alike.
 
-The transport is the safety net: it proves nothing left the system
-unrecorded. The `observe_*` wrappers add the semantic receipts on top:
+The transport is the safety net: every request sent through a client
+configured with it is recorded. It cannot see traffic sent through other
+clients, processes or channels, so it does not prove that nothing else
+left the system. The `observe_*` wrappers add the semantic receipts on top:
 model, served model, tool calls and causality.
 
 ## Async

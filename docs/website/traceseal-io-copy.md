@@ -32,9 +32,12 @@ auditor verifies it on their own machine, without access to yours.
 > model, on whose behalf, who approved it, what data left your systems,
 > and prove nothing is missing."
 
-The EU AI Act asks for automatic logs (Art. 12), human oversight
-(Art. 14), at least six months of retention (Art. 19, 26), and incident
-reports within days (Art. 73). GDPR, NIS2 and DORA add their own clocks.
+For high-risk AI systems, the EU AI Act asks for automatic logs
+(Art. 12), human oversight (Art. 14), at least six months of retention
+(Art. 19, 26) and serious-incident reports within days (Art. 73). As
+amended by Regulation (EU) 2026/1744, these apply from 2 December 2027
+(Annex III systems) and 2 August 2028 (Annex I systems). GDPR, NIS2 and
+DORA already apply, with their own reporting clocks.
 Customers are writing the same questions into procurement forms.
 "Trust our logs" doesn't answer them.
 
@@ -113,13 +116,21 @@ Keep the disclaimer next to this table.
 
 | | |
 |---|---|
-| EU AI Act | Art. 12, 14, 19, 26, 72, 73 |
-| GDPR | Art. 5, 15, 17, 25, 30, 33 |
+| EU AI Act (high-risk systems, from Dec 2027 / Aug 2028) | Art. 12, 14, 19, 26, 72, 73 |
+| GDPR | Art. 5, 15, 17, 25, 30, 33, 34 |
 | NIS2 / DORA | incident reporting |
-| ISO/IEC 42001 · NIST AI RMF | logging, monitoring, incident response |
+| ISO/IEC 42001 · NIST AI RMF (voluntary) | logging, monitoring, incident response |
 
-*Disclaimer:* TraceSeal produces verifiable evidence. It is not a
-conformity assessment or legal advice.
+*Disclaimer:* TraceSeal produces verifiable evidence. It is not legal
+advice, a conformity assessment or a certification, and using it does not
+by itself make you compliant. Whether an obligation applies depends on your
+role and your system. Provided as is, without warranty. Full notice:
+[LEGAL.md](https://github.com/Traceseal/traceseal-observe/blob/main/LEGAL.md).
+
+Do **not** link receipts to EU AI Act Art. 50. Art. 50 is about telling
+people they are dealing with AI and marking AI-generated content, which
+receipts do not do. Do not say the high-risk obligations "apply now" or
+"have applied since 2 August 2026": the Digital Omnibus postponed them.
 
 ---
 
