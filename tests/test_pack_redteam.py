@@ -691,3 +691,42 @@ def test_auditor_scope_requirement_adds_to_recorded_one(tmp_path):
     r = verify_pack(tmp_path / "pack", [key.public_key_hex],
                     required_scopes={"refund": "audit:read"})
     assert r["auditor_result"] == "ISSUES FOUND"
+
+
+def test_auditor_policy_requirement_cannot_erase_recorded_failure(tmp_path):
+    from traceseal_observe.oversight import sign_policy_decision
+    from traceseal_observe.report import build_pack, verify_pack
+
+    key = OperatorKey.generate()
+    audit = sign_policy_decision(policy_id="audit", decision="allow", stage="input",
+                                 decided_at="2026-10-01T11:59:00Z", operator_key=key)
+    tool = _tool(key, "refund", {}, caused_by=[audit.receipt_hash])
+    paths = _write(tmp_path, [audit, tool])
+    build_pack(tmp_path / "pack", paths, operator_key=key, operator_keys=[key.public_key_hex],
+               require_policy={"refund": "fraud"})
+    # sanity: the cited audit decision alone satisfies an "audit" requirement
+    from traceseal_observe.report import analyse
+    from traceseal_observe.trace import verify_trace
+    assert verify_trace([audit, tool], require_policy={"refund": "audit"})["ok"]
+    r = verify_pack(tmp_path / "pack", [key.public_key_hex], require_policy={"refund": "audit"})
+    assert r["pack_result"] == "ISSUES FOUND"
+    assert r["auditor_result"] == "ISSUES FOUND"
+
+
+def test_pack_built_with_platform_newline_translation_still_verifies(tmp_path, monkeypatch):
+    """Windows text mode writes CRLF; report files must be written as bytes."""
+    from pathlib import Path as _P
+    from traceseal_observe.report import build_pack, verify_pack
+
+    real = _P.write_text
+
+    def crlf(self, data, *a, **k):
+        return real(self, data.replace("\n", "\r\n"), *a, **k)
+
+    monkeypatch.setattr(_P, "write_text", crlf)
+    key = OperatorKey.generate()
+    paths = _write(tmp_path, [_tool(key, "t", {})])
+    build_pack(tmp_path / "pack", paths, operator_key=key, operator_keys=[key.public_key_hex])
+    monkeypatch.setattr(_P, "write_text", real)
+    assert b"\r" not in (tmp_path / "pack" / "report.md").read_bytes()
+    assert verify_pack(tmp_path / "pack", [key.public_key_hex])["ok"]

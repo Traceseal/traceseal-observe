@@ -776,14 +776,17 @@ def build_pack(
     summary["generated_at"] = generated_at
     summary["analysis_options"] = options
     summary["pack_signer"] = operator_key.public_key_hex if operator_key is not None else None
-    (out / "report.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str))
-    (out / "report.md").write_text(render_markdown(summary))
+    # Exact UTF-8 bytes with LF newlines on every platform: verify-pack
+    # compares these files byte for byte.
+    (out / "report.json").write_bytes(
+        json.dumps(summary, indent=2, sort_keys=True, default=str).encode("utf-8"))
+    (out / "report.md").write_bytes(render_markdown(summary).encode("utf-8"))
     files = sorted(p for p in out.rglob("*") if p.is_file())
     manifest = {
         "pack_version": PACK_VERSION,
         "files": {p.relative_to(out).as_posix(): _sha256_file(p) for p in files},
     }
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    (out / "manifest.json").write_bytes(json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
     if operator_key is not None:
         receipt = sign_execution_receipt(
             {
@@ -799,7 +802,7 @@ def build_pack(
             {"provenance_version": "1.0", "provider_attestation": "none"},
             operator_key,
         )
-        (out / "pack.receipt.json").write_text(receipt.to_json())
+        (out / "pack.receipt.json").write_bytes(receipt.to_json().encode("utf-8"))
     return summary
 
 
@@ -1092,31 +1095,37 @@ def verify_pack(
                     warnings.append("the pack was built without an operator key pin: receipts from "
                                     "any signer were analysed")
                 # -- the auditor's own analysis ------------------------------------
+                # Recorded requirements and the auditor's are checked in
+                # separate runs; the auditor result passes only if every run
+                # passes, so nothing an auditor adds can remove a failure.
+                common = dict(
+                    checkpoints=notes, checkpoint_timestamps=stamps,
+                    tsa_trust_anchors=anchors, witness_vkeys=options.get("witness_vkeys") or [],
+                    now=now or _now_utc(),
+                    operator_keys=pins or options.get("operator_keys"),
+                    reviewer_keys=(reviewer_keys if reviewer_keys is not None
+                                   else options.get("reviewer_keys")),
+                )
+                runs = [dict(required_scopes=options.get("required_scopes"),
+                             require_approval=options.get("require_approval") or [],
+                             require_policy=options.get("require_policy"),
+                             min_review_seconds=options.get("min_review_seconds"))]
+                extra_approval = ([require_approval] if isinstance(require_approval, str)
+                                  else list(require_approval or ()))
+                if extra_approval or require_policy or required_scopes or min_review_seconds:
+                    runs.append(dict(required_scopes=required_scopes or None,
+                                     require_approval=extra_approval,
+                                     require_policy=require_policy or None,
+                                     min_review_seconds=min_review_seconds))
                 try:
-                    approvals = set(options.get("require_approval") or [])
-                    approvals |= {require_approval} if isinstance(require_approval, str) \
-                        else set(require_approval or ())
-                    auditor = analyse(
-                        receipts, checkpoints=notes, checkpoint_timestamps=stamps,
-                        tsa_trust_anchors=anchors, witness_vkeys=options.get("witness_vkeys") or [],
-                        required_scopes=_union_scopes(options.get("required_scopes"),
-                                                      required_scopes),
-                        require_approval=sorted(approvals),
-                        require_policy={**(options.get("require_policy") or {}),
-                                        **(require_policy or {})} or None,
-                        min_review_seconds=max(
-                            [v for v in (options.get("min_review_seconds"), min_review_seconds)
-                             if isinstance(v, int)], default=None),
-                        now=now or _now_utc(),
-                        operator_keys=pins or options.get("operator_keys"),
-                        reviewer_keys=(reviewer_keys if reviewer_keys is not None
-                                       else options.get("reviewer_keys")),
-                    )
+                    audits = [analyse(receipts, **common, **run) for run in runs]
                 except Exception as exc:
                     problems.append(f"auditor analysis failed ({type(exc).__name__}: {exc})")
                 else:
-                    result["auditor_result"] = "passed" if auditor["ok"] else "ISSUES FOUND"
-                    result["auditor_findings"] = _findings(auditor)
+                    passed = all(a["ok"] for a in audits)
+                    result["auditor_result"] = "passed" if passed else "ISSUES FOUND"
+                    result["auditor_findings"] = _dedupe(
+                        [f for a in audits for f in _findings(a)])
     problems[:] = _dedupe(problems)
     result["ok"] = not problems
     return result
