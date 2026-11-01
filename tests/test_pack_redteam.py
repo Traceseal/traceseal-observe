@@ -780,3 +780,38 @@ def test_deeply_nested_report_json_does_not_crash_verify(tmp_path):
     (pack / "pack.receipt.json").unlink()   # unsigned: must still not crash
     r = verify_pack(pack, [key.public_key_hex])
     assert not r["ok"] and any("nested too deeply" in p for p in r["problems"])
+
+
+def test_codex_round_n_fixes(tmp_path):
+    from traceseal_observe import verify_receipt_signature
+    from traceseal_observe.report import build_pack, main, verify_pack
+
+    key = OperatorKey.generate()
+    # signing and verification apply the same nesting limit
+    deep = cur = []
+    for _ in range(63):
+        nxt = []
+        cur.append(nxt)
+        cur = nxt
+    try:
+        r = sign_execution_receipt({"receipt_type": "tool", "x": deep}, PROV, key)
+    except ValueError:
+        pass
+    else:
+        verify_receipt_signature(r)  # whatever signing accepts, verification accepts
+
+    # repeated --require-scope for one tool accumulates
+    paths = _write(tmp_path, [_tool(key, "refund", {}, authorization={"scopes": ["audit:read"]})])
+    build_pack(tmp_path / "pack", paths, operator_key=key, operator_keys=[key.public_key_hex])
+    pk = key.public_key_hex
+    one = main(["verify-pack", str(tmp_path / "pack"), "--operator-pubkey", pk,
+                "--require-scope", "refund=refunds:write"])
+    both = main(["verify-pack", str(tmp_path / "pack"), "--operator-pubkey", pk,
+                 "--require-scope", "refund=refunds:write", "--require-scope", "refund=audit:read"])
+    ok_alone = main(["verify-pack", str(tmp_path / "pack"), "--operator-pubkey", pk,
+                     "--require-scope", "refund=audit:read"])
+    assert ok_alone == 0  # the receipt really holds audit:read
+    assert one == 3 and both == 3
+
+    # pins given as an iterator are not consumed before use
+    assert verify_pack(tmp_path / "pack", iter([pk]))["pinned"] is True

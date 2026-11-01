@@ -967,7 +967,8 @@ def verify_pack(directory: Path | str, expected_keys: Iterable[str] | str | None
     if not pins_given and not kwargs.get("trust_signer_in_pack"):
         return _verify_pack(directory, expected_keys, **kwargs)  # raises ValueError (usage)
     if pins_given:
-        _normalise_keys(expected_keys, "expected_keys")  # usage errors still raise
+        # Normalise once (an iterator can only be read once); usage errors raise.
+        expected_keys = _normalise_keys(expected_keys, "expected_keys")
     try:
         return _verify_pack(directory, expected_keys, **kwargs)
     except Exception as exc:  # noqa: BLE001 - fail closed on anything unexpected
@@ -1201,6 +1202,11 @@ def _verify_pack(
     return result
 
 
+def _scope_args(items: list[str]) -> dict[str, list[str]]:
+    """--require-scope TOOL=SCOPE (repeatable): every scope is kept."""
+    return _union_scopes(*({t: [sc]} for t, _, sc in (i.partition("=") for i in items))) or {}
+
+
 def _union_scopes(*maps: Any) -> dict[str, list[str]] | None:
     """Merge scope requirements per tool, keeping every scope from every
     map, so an auditor requirement can only add to the recorded ones."""
@@ -1355,6 +1361,12 @@ def main(argv: list[str] | None = None) -> int:
                   "can re-sign a pack).", file=sys.stderr)
             return 2
         vpairs = lambda items: {k: v for k, _, v in (i.partition("=") for i in items)}  # noqa: E731
+
+        policy_tools = [i.partition("=")[0] for i in args.require_policy]
+        if len(policy_tools) != len(set(policy_tools)):
+            print("traceseal-report verify-pack: --require-policy names the same tool twice; "
+                  "a tool can require one policy per run", file=sys.stderr)
+            return 2
         try:
             if args.now is not None and _parse_time(args.now) is None:
                 raise ValueError("--now must be UTC YYYY-MM-DDTHH:MM:SSZ")
@@ -1362,7 +1374,7 @@ def main(argv: list[str] | None = None) -> int:
                                  trust_signer_in_pack=args.trust_signer_in_pack,
                                  now=args.now, require_approval=args.require_approval,
                                  require_policy=vpairs(args.require_policy) or None,
-                                 required_scopes=vpairs(args.require_scope) or None,
+                                 required_scopes=_scope_args(args.require_scope) or None,
                                  reviewer_keys=_read_reviewer_keys(args.reviewer_keys),
                                  min_review_seconds=args.min_review_seconds)
         except ValueError as exc:
@@ -1408,7 +1420,7 @@ def main(argv: list[str] | None = None) -> int:
             operator_key=OperatorKey.load_from_file(args.operator_key) if args.operator_key else None,
             checkpoint_paths=[Path(c) for c in args.checkpoint], timestamp_paths=stamps,
             tsa_trust_anchors=_read_certs(args.tsa_root), witness_vkeys=args.witness_vkey,
-            required_scopes=pairs(args.require_scope), require_approval=args.require_approval,
+            required_scopes=_scope_args(args.require_scope), require_approval=args.require_approval,
             require_policy=pairs(args.require_policy), min_review_seconds=args.min_review_seconds,
             operator_keys=args.operator_pubkey or None,
             reviewer_keys=_read_reviewer_keys(args.reviewer_keys),

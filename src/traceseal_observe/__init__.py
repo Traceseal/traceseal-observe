@@ -860,8 +860,8 @@ def sign_execution_receipt(
         raise ValueError("execution.receipt_type is required")
     # Refuse what every verifier would reject (RECEIPT-SPEC §3): booleans,
     # nulls, circular values. Use strings such as "true" / "false".
-    forbidden = (_forbidden_json_value(execution, ".execution")
-                 or _forbidden_json_value(provenance, ".provenance"))
+    # Exactly the envelope the verifier checks (same depth accounting).
+    forbidden = _forbidden_json_value({"execution": execution, "provenance": provenance})
     if forbidden:
         raise ValueError(f"cannot sign: JSON boolean, null or circular value at {forbidden} "
                          "(RECEIPT-SPEC §3; use strings such as \"true\")")
