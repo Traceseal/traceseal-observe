@@ -83,6 +83,22 @@ class TestDeadlines:
                                 aware_at=aware, reported_at="2026-10-02T12:00:00Z", operator_key=key)
         st = incident_status([unknown])[0]
         assert st["missed_deadlines"] == [] and len(st["unconfirmed_deadlines"]) == 1
+        # a later stage that omits classified_at must not loosen the deadline
+        early = sign_incident(category="major_ict_incident", severity="high", status="reported",
+                              aware_at=aware, classified_at="2026-10-01T10:00:00Z",
+                              reported_at="2026-10-01T16:00:00Z", operator_key=key)
+        closed = sign_incident(category="major_ict_incident", severity="high", status="closed",
+                               aware_at=aware, supersedes=early, operator_key=key)
+        st = incident_status([early, closed])[0]
+        assert [d["due"] for d in st["missed_deadlines"]] == ["2026-10-01T14:00:00Z"]
+        assert st["unconfirmed_deadlines"] == []
+        # same for AI Act death flag set only on the first stage
+        first = sign_incident(category="serious_incident", severity="critical", status="detected",
+                              aware_at=aware, death=True, operator_key=key)
+        later = sign_incident(category="serious_incident", severity="critical", status="mitigated",
+                              aware_at=aware, supersedes=first, operator_key=key)
+        st = incident_status([first, later], now="2026-10-12T00:00:00Z")[0]
+        assert [d["due"] for d in st["missed_deadlines"]] == ["2026-10-11T09:00:00Z"]
         # a 1.5.1-style record (24-hour due, no flag) is never reported as missed
         from traceseal_observe import sign_execution_receipt
         legacy = sign_execution_receipt(

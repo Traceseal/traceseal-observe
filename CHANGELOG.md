@@ -17,6 +17,11 @@ verify unchanged, and new receipts verify with any v1 verifier.
   - Without it, the 24-hour limit is marked `"definitive": "false"`, and
     `incident_status()` reports it under `unconfirmed_deadlines`, never as
     missed. This also applies to records signed with 1.5.1.
+- **Deadlines across incident stages.** `incident_status()` read deadlines
+  from the latest stage only, so a later record that omitted `death`,
+  `widespread` or `classified_at` loosened the deadline and could turn a
+  failing pack into a passing one. Deadlines are now resolved across the
+  whole incident history, keeping the strictest one known.
 
 ## [1.5.1] — 2026-11-01
 

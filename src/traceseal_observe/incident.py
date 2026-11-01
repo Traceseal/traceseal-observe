@@ -302,6 +302,32 @@ def sign_incident(
     return sign_execution_receipt(execution, provenance, operator_key)
 
 
+def _definitive(d: dict[str, str], category: Any) -> bool:
+    # 1.5.1 DORA records carry no classification time and no flag.
+    if d.get("definitive") == "false":
+        return False
+    return not (category == "major_ict_incident" and "classified_at" not in d)
+
+
+def _strictest_deadlines(history: list[Any]) -> list[dict[str, str]]:
+    """Resolve each (regime, step) deadline across every stage of an incident.
+
+    A later stage must not loosen a deadline an earlier stage established
+    (for example a closing record that omits death, widespread or
+    classified_at). Definitive deadlines win over unconfirmed ones; among
+    the same kind, the earliest due time wins."""
+    best: dict[tuple[str, str], dict[str, str]] = {}
+    for h in history:
+        category = h.execution.get("category")
+        for d in h.execution.get("deadlines", []):
+            key = (d.get("regime", ""), d.get("step", ""))
+            rank = (0 if _definitive(d, category) else 1, _utc(d["due"], "due"))
+            cur = best.get(key)
+            if cur is None or rank < (0 if _definitive(cur, category) else 1, _utc(cur["due"], "due")):
+                best[key] = d
+    return list(best.values())
+
+
 def incident_status(incidents: list[Any], *, now: str | None = None) -> list[dict[str, Any]]:
     """Collapse incident receipts into current state per incident, and flag
     deadlines that passed without a 'reported' record."""
@@ -323,12 +349,10 @@ def incident_status(incidents: list[Any], *, now: str | None = None) -> list[dic
         first_report = min(reported) if reported else None
         overdue = []
         unconfirmed = []
-        for d in r.execution.get("deadlines", []):
+        deadlines = _strictest_deadlines(history)
+        for d in deadlines:
             due = _utc(d["due"], "due")
-            # 1.5.1 DORA records carry no classification time and no flag.
-            legacy_dora = (r.execution.get("category") == "major_ict_incident"
-                           and "classified_at" not in d)
-            if d.get("definitive") == "false" or legacy_dora:
+            if not _definitive(d, r.execution.get("category")):
                 # The real deadline depends on a fact the record doesn't hold
                 # (e.g. DORA classification time): never call it missed.
                 if (first_report is not None and _utc(first_report, "reported_at") > due) or (
@@ -349,7 +373,7 @@ def incident_status(incidents: list[Any], *, now: str | None = None) -> list[dic
             "aware_at": r.execution.get("aware_at"),
             "first_reported_at": first_report,
             "stages": len(history),
-            "deadlines": r.execution.get("deadlines", []),
+            "deadlines": deadlines,
             "missed_deadlines": overdue,
             "unconfirmed_deadlines": unconfirmed,
             "related_obligations": r.execution.get("related_obligations", []),
