@@ -56,6 +56,44 @@ class TestDeadlines:
         assert "immediately" in ai and "2026/1744" in ai and "high-risk" in ai
         assert "undue delay" in reporting_deadlines("personal_data_breach", aware)[0]["qualifier"]
 
+    def test_dora_classification(self):
+        aware = "2026-10-01T09:00:00Z"
+        # classified quickly: 4 hours from classification
+        d = reporting_deadlines("major_ict_incident", aware, classified_at="2026-10-01T10:00:00Z")[0]
+        assert d["due"] == "2026-10-01T14:00:00Z" and "definitive" not in d
+        # classified at hour 22: capped by the 24-hour limit
+        d = reporting_deadlines("major_ict_incident", aware, classified_at="2026-10-02T07:00:00Z")[0]
+        assert d["due"] == "2026-10-02T09:00:00Z"
+        # classified at hour 26 (Art. 5(2)): 4 hours from classification
+        d = reporting_deadlines("major_ict_incident", aware, classified_at="2026-10-02T11:00:00Z")[0]
+        assert d["due"] == "2026-10-02T15:00:00Z"
+        with pytest.raises(ValueError):
+            reporting_deadlines("major_ict_incident", aware, classified_at="2026-09-30T00:00:00Z")
+        with pytest.raises(ValueError):
+            reporting_deadlines("personal_data_breach", aware, classified_at=aware)
+        key = OperatorKey.generate()
+        # late classification, notified at hour 27: on time, not missed
+        late_class = sign_incident(category="major_ict_incident", severity="high", status="reported",
+                                   aware_at=aware, classified_at="2026-10-02T11:00:00Z",
+                                   reported_at="2026-10-02T12:00:00Z", operator_key=key)
+        st = incident_status([late_class])[0]
+        assert st["missed_deadlines"] == [] and st["unconfirmed_deadlines"] == []
+        # no classification time recorded: unconfirmed, never missed
+        unknown = sign_incident(category="major_ict_incident", severity="high", status="reported",
+                                aware_at=aware, reported_at="2026-10-02T12:00:00Z", operator_key=key)
+        st = incident_status([unknown])[0]
+        assert st["missed_deadlines"] == [] and len(st["unconfirmed_deadlines"]) == 1
+        # a 1.5.1-style record (24-hour due, no flag) is never reported as missed
+        from traceseal_observe import sign_execution_receipt
+        legacy = sign_execution_receipt(
+            {"receipt_type": "incident", "incident_version": "1.0", "category": "major_ict_incident",
+             "severity": "high", "status": "detected", "aware_at": aware,
+             "recorded_at": aware, "deadlines": [{"regime": "DORA", "step": "initial notification",
+                                                  "basis": "x", "due": "2026-10-02T09:00:00Z"}]},
+            {"provenance_version": "1.0", "provider_attestation": "none"}, key)
+        st = incident_status([legacy], now="2026-10-05T00:00:00Z")[0]
+        assert st["missed_deadlines"] == [] and len(st["unconfirmed_deadlines"]) == 1
+
     def test_related_obligations(self):
         aware = "2026-10-01T09:00:00Z"
         from traceseal_observe import related_obligations

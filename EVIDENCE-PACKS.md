@@ -25,7 +25,7 @@ computed, so the record shows which deadline the operator worked to:
 | `serious_incident` | 15 days; 10 days if a death; 2 days if widespread or Art. 3(49)(b) | *immediately* once a causal link is established or reasonably likely; high-risk systems only, from 2 Dec 2027 (Annex III) / 2 Aug 2028 (Annex I) | EU AI Act Art. 73(2)–(4) |
 | `personal_data_breach` | 72 hours | *without undue delay* and, where feasible, within 72 h | GDPR Art. 33(1) |
 | `significant_incident` | early warning 24 h, notification 72 h | *without undue delay*; national transposition may add rules | NIS2 Art. 23(4) |
-| `major_ict_incident` | initial notification 24 h | 4 h from classification as major, no later than 24 h from awareness | DORA Art. 19; Delegated Regulation (EU) 2025/301 Art. 5 |
+| `major_ict_incident` | initial notification: 4 h from classification, no later than 24 h from awareness; 4 h from a classification made after 24 h | pass `classified_at`; without it the 24 h limit is reported as *unconfirmed*, never as missed | DORA Art. 19; Delegated Regulation (EU) 2025/301 Art. 5(1)–(2) |
 
 Each deadline is signed with its `qualifier`. The due time is the **latest
 permissible** time: reporting at it can still be late where the law says

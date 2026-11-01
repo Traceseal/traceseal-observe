@@ -43,7 +43,7 @@ trust primitive the operator can produce without provider cooperation.
 
 from __future__ import annotations
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 import hashlib
 import json

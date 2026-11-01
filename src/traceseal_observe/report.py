@@ -323,8 +323,10 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
                 _status(any(i["category"] == "major_ict_incident" for i in s["incidents"]),
                         [m for m in missed if m.startswith("major_ict_incident")]),
                 f"{sum(1 for i in s['incidents'] if i['category'] == 'major_ict_incident')} major ICT incident(s).",
-                "Checked against the 24-hour outer limit only; the 4-hour limit runs from "
-                "classification, which is not recorded.",
+                "Checked against the 4-hour-from-classification rule where classified_at is "
+                "recorded; otherwise the 24-hour limit is shown as unconfirmed, not missed. "
+                + (f"{sum(len(i.get('unconfirmed_deadlines', [])) for i in s['incidents'])} "
+                   "unconfirmed deadline(s)." if any(i.get('unconfirmed_deadlines') for i in s['incidents']) else ""),
                 "EU financial entities within DORA's scope."),
         control("ISO/IEC 42001", "Annex A", "AI system event logging and monitoring",
                 _status(ops > 0, chain_issues),
@@ -402,6 +404,9 @@ def render_markdown(s: dict[str, Any]) -> str:
                      f"aware {i['aware_at']}, first reported {i['first_reported_at'] or 'not yet'}")
         for d in i["missed_deadlines"]:
             lines.append(f"  - MISSED: {d['basis']} due {d['due']}")
+        for d in i.get("unconfirmed_deadlines", []):
+            lines.append(f"  - UNCONFIRMED: {d['basis']} 24-hour limit {d['due']} passed before the "
+                         f"first report; record classified_at to check the actual deadline")
         for o in i.get("related_obligations", []):
             lines.append(f"  - Follow-up (not tracked): {o['basis']}: {o['step']} ({o['timing']})")
     if s["signature_failures"]:

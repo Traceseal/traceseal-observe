@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "traceseal-observe"
-version = "1.5.1"
+version = "1.5.2"
 description = "Verifiable, hash-chained, timestamped evidence of what AI agents did: signed receipts for model calls, tools, data flows, human oversight and compliance"
 readme = "README.md"
 license = "Apache-2.0"
