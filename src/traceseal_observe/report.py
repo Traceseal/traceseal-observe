@@ -685,6 +685,15 @@ def _pem(cert: Any) -> str:
     return cert.public_bytes(Encoding.PEM).decode("ascii")
 
 
+def _registry_json(registry: Any) -> Any:
+    """A reviewer key registry as plain JSON (sets and frozensets become
+    sorted lists), so it round-trips through report.json for verify-pack."""
+    if not isinstance(registry, dict):
+        return registry
+    return {ref: (sorted(v) if isinstance(v, (set, frozenset, list, tuple)) else v)
+            for ref, v in registry.items()}
+
+
 def _read_reviewer_keys(path: str | None) -> dict[str, Any] | None:
     if not path:
         return None
@@ -758,7 +767,7 @@ def build_pack(
         "min_review_seconds": kwargs.get("min_review_seconds"),
         "now": kwargs["now"],
         "operator_keys": kwargs.get("operator_keys"),
-        "reviewer_keys": kwargs.get("reviewer_keys"),
+        "reviewer_keys": _registry_json(kwargs.get("reviewer_keys")),
     }
     summary = analyse(receipts, checkpoints=notes, checkpoint_timestamps=stamps, **kwargs)
     summary["pack_version"] = PACK_VERSION

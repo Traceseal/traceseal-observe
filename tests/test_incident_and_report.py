@@ -376,3 +376,16 @@ class TestIncidentRedTeam:
             st = incident_status([bad], now=self.NOW)[0]
             assert any(needle in p for p in st["problems"]), (patch, st["problems"])
             assert not analyse([bad], now=self.NOW)["ok"]
+
+
+def test_unconfirmed_stage_estimate_never_replaces_definitive_dora_deadline():
+    key = OperatorKey.generate()
+    aware = "2026-10-01T00:00:00Z"
+    early = sign_incident(category="major_ict_incident", severity="high", status="detected",
+                          aware_at=aware, operator_key=key)  # unconfirmed 24h estimate
+    classified = sign_incident(category="major_ict_incident", severity="high", status="mitigated",
+                               aware_at=aware, classified_at="2026-10-02T06:00:00Z",
+                               supersedes=early, operator_key=key)
+    st = incident_status([early, classified], now="2026-10-03T00:00:00Z")[0]
+    assert [d["due"] for d in st["missed_deadlines"]] == ["2026-10-02T10:00:00Z"]
+    assert st["unconfirmed_deadlines"] == []

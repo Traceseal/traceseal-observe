@@ -378,7 +378,11 @@ def _resolve_deadlines(
                 best[key] = d  # an extra signed deadline only adds an obligation
                 continue
             new_rank, cur_rank = _rank(d, category), _rank(cur, category)
-            # Stricter only: an earlier due time, or the same due time made definitive.
+            # Stricter only, and never less certain: an unconfirmed estimate
+            # must not replace a definitive deadline, even if it is earlier
+            # (it would turn a missed definitive deadline into "unconfirmed").
+            if new_rank[0] > cur_rank[0]:
+                continue
             if new_rank[1] < cur_rank[1] or (new_rank[1] == cur_rank[1] and new_rank < cur_rank):
                 best[key] = d
     return list(best.values())

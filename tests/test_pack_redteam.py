@@ -605,3 +605,15 @@ def test_pack_reviewer_key_registry_is_recorded_and_rederived(tmp_path):
     s = build_pack(tmp_path / "pack", [], operator_key=key, reviewer_keys={})
     assert s["analysis_options"]["reviewer_keys"] == {}
     assert verify_pack(tmp_path / "pack", [key.public_key_hex])["ok"]
+
+
+def test_normalized_reviewer_registry_round_trips(tmp_path):
+    from traceseal_observe.oversight import normalize_reviewer_keys
+    from traceseal_observe.report import build_pack, verify_pack
+
+    key, rev = OperatorKey.generate(), OperatorKey.generate()
+    reg = normalize_reviewer_keys({"id:alice": [rev.public_key_hex]})
+    build_pack(tmp_path / "pack", [], operator_key=key, reviewer_keys=reg)
+    stored = json.loads((tmp_path / "pack" / "report.json").read_text())["analysis_options"]
+    assert stored["reviewer_keys"] == {"id:alice": [rev.public_key_hex]}
+    assert verify_pack(tmp_path / "pack", [key.public_key_hex])["ok"]
