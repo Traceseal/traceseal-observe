@@ -178,12 +178,21 @@ def _scenario(tmp_path, *, gap=False, rejected=False):
         receipts.append(observe_tool("lookup", s, lambda: 1)[1])
         receipts.append(observe_data_flow("https://api.example.com/v1", "POST", s, lambda: None,
                                           request_body={"email": "a@b.com"})[1])
+        from traceseal_observe import _now_iso, sha256_of, sign_execution_receipt
+        model = sign_execution_receipt(
+            {"receipt_type": "model", "provider": "anthropic", "model": "m",
+             "started_at": _now_iso(), "input_hash": sha256_of("in"), "output_hash": sha256_of("out"),
+             "requested_tool_calls": [{"id": "toolu_1", "name": "issue_refund",
+                                       "input_hash": sha256_of({"order": 1})}]},
+            {"provenance_version": "1.0", "provider_attestation": "none"}, s)
+        receipts.append(model)
         decision = "rejected" if rejected else "approved"
-        approval = sign_oversight(decision=decision, operator_key=s,
+        approval = sign_oversight(decision=decision, operator_key=s, subjects=[model],
+                                  tool_call_ids=["toolu_1"],
                                   reviewer=Principal.user("rev", pepper=PEPPER))
         receipts.append(approval)
-        with caused_by(approval):
-            receipts.append(observe_tool("issue_refund", s, lambda: 1)[1])
+        with caused_by(model, approval, tool_call_id="toolu_1"):
+            receipts.append(observe_tool("issue_refund", s, lambda: 1, args={"order": 1})[1])
     cp = chain.checkpoint()
     paths = []
     for i, r in enumerate(receipts):
@@ -259,3 +268,99 @@ class TestEvidencePack:
         out = capsys.readouterr().out
         assert rc == 1 and "EU AI Act Art. 12: issues" in out  # the gap is reported
         assert report_mod.main(["verify-pack", str(tmp_path / "pack")]) == 0
+
+
+class TestIncidentRedTeam:
+    """1.6.0: missed deadlines can't be hidden by later or hostile stages."""
+
+    NOW = "2026-10-01T00:00:00Z"
+    PROV = {"provenance_version": "1.0", "provider_attestation": "none"}
+
+    def _raw(self, key, receipt, **changes):
+        from traceseal_observe import sign_execution_receipt
+        return sign_execution_receipt(dict(receipt.execution, **changes), self.PROV, key)
+
+    def _root(self, key, **kw):
+        return sign_incident(category="serious_incident", severity="critical", status="detected",
+                             aware_at="2026-01-01T00:00:00Z", operator_key=key, **kw)
+
+    def _missed(self, incs):
+        return [d["basis"] for d in incident_status(incs, now=self.NOW)[0]["missed_deadlines"]]
+
+    def test_signed_deadlines_cannot_loosen_or_drop(self):
+        key = OperatorKey.generate()
+        root = self._root(key)
+        assert self._missed([self._raw(key, root, deadlines=[])]) == ["EU AI Act Art. 73(2)"]
+        moved = [dict(root.execution["deadlines"][0], due="2099-01-01T00:00:00Z")]
+        assert self._missed([self._raw(key, root, deadlines=moved)]) == ["EU AI Act Art. 73(2)"]
+        stripped = {k: v for k, v in root.execution.items() if k != "deadlines"}
+        from traceseal_observe import sign_execution_receipt
+        assert self._missed([sign_execution_receipt(stripped, self.PROV, key)]) == ["EU AI Act Art. 73(2)"]
+        # ...but a stricter signed deadline is kept.
+        tighter = [dict(root.execution["deadlines"][0], due="2026-01-02T00:00:00Z")]
+        st = incident_status([self._raw(key, root, deadlines=tighter)], now="2026-01-03T00:00:00Z")[0]
+        assert [d["due"] for d in st["missed_deadlines"]] == ["2026-01-02T00:00:00Z"]
+
+    def test_flags_are_signed_and_recomputed(self):
+        key = OperatorKey.generate()
+        root = self._root(key, death=True)
+        assert root.execution["death"] is True
+        st = incident_status([self._raw(key, root, deadlines=[])], now="2026-01-12T00:00:00Z")[0]
+        assert [d["due"] for d in st["missed_deadlines"]] == ["2026-01-11T00:00:00Z"]
+
+    def test_earliest_aware_at_and_reported_at_rules(self):
+        key = OperatorKey.generate()
+        root = self._root(key)
+        later_aware = sign_incident(category="serious_incident", severity="critical", status="mitigated",
+                                    aware_at="2026-06-01T00:00:00Z", supersedes=root, operator_key=key)
+        st = incident_status([root, later_aware], now=self.NOW)[0]
+        assert st["aware_at"] == "2026-01-01T00:00:00Z" and st["missed_deadlines"]
+        # reported_at on a stage that isn't status "reported" does not count.
+        mitigated = sign_incident(category="serious_incident", severity="critical", status="mitigated",
+                                  aware_at="2026-01-01T00:00:00Z", reported_at="2026-01-02T00:00:00Z",
+                                  supersedes=root, operator_key=key)
+        assert incident_status([root, mitigated], now=self.NOW)[0]["first_reported_at"] is None
+        # A back-dated stage claiming a report before the root's awareness is a problem.
+        upd = sign_incident(category="serious_incident", severity="critical", status="reported",
+                            aware_at="2025-12-01T00:00:00Z", reported_at="2025-12-02T00:00:00Z",
+                            supersedes=root, operator_key=key)
+        st = incident_status([root, upd], now=self.NOW)[0]
+        assert st["aware_at"] == "2025-12-01T00:00:00Z"
+        assert any("before the root stage's aware_at" in p for p in st["problems"])
+        assert not analyse([root, upd], now=self.NOW)["ok"]
+        # reported_at before the earliest aware_at is not counted.
+        early = self._raw(key, upd, aware_at="2026-01-01T00:00:00Z")
+        st = incident_status([root, early], now=self.NOW)[0]
+        assert st["first_reported_at"] is None and st["missed_deadlines"]
+
+    def test_category_change_is_an_error_and_root_category_kept(self):
+        key = OperatorKey.generate()
+        root = self._root(key)
+        with pytest.raises(ValueError, match="another category"):
+            sign_incident(category="other", severity="low", status="reported",
+                          aware_at="2026-01-01T00:00:00Z", supersedes=root, operator_key=key)
+        same = sign_incident(category="serious_incident", severity="low", status="reported",
+                             aware_at="2026-01-01T00:00:00Z", reported_at="2026-01-01T00:00:01Z",
+                             supersedes=root, operator_key=key)
+        other = self._raw(key, same, category="other")
+        st = incident_status([root, other], now=self.NOW)[0]
+        assert st["category"] == "serious_incident"
+        assert st["first_reported_at"] is None and st["missed_deadlines"]
+        assert any("changes the category" in p for p in st["problems"])
+        s = analyse([root, other], now=self.NOW)
+        assert not s["ok"]
+        assert [c["status"] for c in s["controls"] if c["ref"] == "Art. 73"] == ["issues"]
+
+    def test_hostile_values_do_not_crash(self):
+        key = OperatorKey.generate()
+        root = self._root(key)
+        for patch, needle in (({"reported_at": "yesterday", "status": "reported"}, "reported_at"),
+                              ({"supersedes": {"x": 1}}, "supersedes"),
+                              ({"deadlines": [{"regime": "x"}]}, "deadline"),
+                              ({"deadlines": "soon"}, "deadlines"),
+                              ({"aware_at": 5}, "aware_at"),
+                              ({"category": "nope"}, "category")):
+            bad = self._raw(key, root, **patch)
+            st = incident_status([bad], now=self.NOW)[0]
+            assert any(needle in p for p in st["problems"]), (patch, st["problems"])
+            assert not analyse([bad], now=self.NOW)["ok"]

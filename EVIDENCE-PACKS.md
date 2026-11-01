@@ -38,7 +38,29 @@ final reports; DORA intermediate and final reports and client
 information. They are listed, not checked.
 
 `incident_status()` collapses the stages and reports first notifications
-that passed unreported or were reported late. These deadlines are
+that passed unreported or were reported late. So that a later or edited
+stage can't hide a missed deadline:
+
+- An incident is identified by its **root** stage (the end of the
+  `supersedes` chain) and keeps the root's category. A stage of another
+  category in the chain is reported in `problems` (an error in evidence
+  packs), and `sign_incident` refuses to supersede a stage of another
+  category: open a new incident instead.
+- Deadlines are **recomputed** from the root category, the **earliest**
+  `aware_at` of any stage, and the strictest facts any stage signs
+  (`death`, `widespread`, the earliest `classified_at`). Signed `deadlines`
+  can only make a deadline stricter (an earlier due time); a later due
+  time, or an empty or missing `deadlines` field, changes nothing. Across
+  stages the strictest deadline wins.
+- Only stages with `status="reported"` of the root category count as a
+  report, and only with a `reported_at` at or after the earliest
+  `aware_at`. A report dated before the root stage's own `aware_at` is
+  reported in `problems`.
+- DORA deadlines without a classification time stay *unconfirmed*, never
+  missed.
+- Malformed values (a non-UTC `reported_at` or `aware_at`, a `supersedes`
+  that isn't a receipt hash, a deadline without `due`) never crash the
+  analysis: they are ignored and listed in `problems`. These deadlines are
 informational, not legal advice: whether a regime applies to you, national
 rules and later amendments must be checked with counsel. See
 [LEGAL.md](LEGAL.md).

@@ -17,7 +17,7 @@ oversight — a person decided something about an agent action:
         rationale="customer verified by phone",        # why (hashed)
         review_started_at="2026-10-01T12:00:00Z",
         reviewer_key=reviewer_personal_key,            # optional countersignature
-    )
+    )                                                  # (verified against a reviewer key registry)
     with caused_by(model_receipt, approval, tool_call_id="toolu_A"):
         observe_tool("issue_refund", key, run, args=call_input)
 
@@ -49,11 +49,14 @@ POLICY_STAGES = frozenset(
     {"input", "output", "tool_call", "retrieval", "data_flow", "other"}
 )
 _REVIEWER_PURPOSE = "traceseal-oversight-reviewer/1"
+_APPROVALS = frozenset({"approved", "modified"})
 
 _SHA_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 _TEXT_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 _LABEL_RE = re.compile(r"^[!-~]{1,128}$")
+_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+_REF_RE = re.compile(r"^(hmac-sha256:[0-9a-f]{64}|id:[^\x00-\x1f\x7f]{1,128})$")
 _MAX_LIST = 64
 
 # Fields of an oversight receipt the reviewer's countersignature covers.
@@ -93,6 +96,70 @@ def _hash_value(value: Any, label: str) -> str:
 
     _require_strict_json(value, label)
     return sha256_of(value)
+
+
+def _signed_time(receipt: Any) -> datetime | None:
+    """The receipt's own signed time (never the unsigned attested_at)."""
+    ex = receipt.execution
+    for key in ("started_at", "observed_at", "decided_at", "chained_at"):
+        if key in ex:
+            value = ex[key]
+            if isinstance(value, str) and _UTC_RE.fullmatch(value):
+                return _utc(value, key)
+            return None
+    return None
+
+
+def _check_subject_receipts(
+    decision: str, subjects: Any, decided: datetime, review_started_at: str | None
+) -> None:
+    """Refuse decisions whose subjects (given as Receipts) can't be right."""
+    from traceseal_observe import Receipt
+
+    started = _utc(review_started_at, "review_started_at") if review_started_at else None
+    for subject in subjects or ():
+        if not isinstance(subject, Receipt):
+            continue
+        rtype = subject.execution.get("receipt_type")
+        if decision in _APPROVALS and rtype != "model":
+            raise ValueError(f'decision="{decision}" subjects must be model receipts, got {rtype!r}')
+        if decision == "resumed" and not (
+                rtype == "oversight" and subject.execution.get("decision") == "stopped"):
+            raise ValueError('decision="resumed" subjects must be the "stopped" decisions it lifts')
+        if decision in _APPROVALS:
+            when = _signed_time(subject)
+            if when is None:
+                raise ValueError("subject model receipt has no valid signed time")
+            if started is not None and started < when:
+                raise ValueError("review_started_at is before the subject model receipt existed")
+            if decided < when:
+                raise ValueError("decided_at is before the subject model receipt existed")
+
+
+def normalize_reviewer_keys(registry: Any) -> dict[str, frozenset[str]]:
+    """Validate a reviewer key registry.
+
+    Maps a reviewer ref (the `reviewer.ref` of an oversight receipt, e.g.
+    Principal.user(id, pepper=...).ref, or "id:...") to the Ed25519 public
+    keys (64 hex characters, or a list of them) allowed to countersign for
+    that reviewer. Raises ValueError if malformed.
+    """
+    if not isinstance(registry, dict):
+        raise ValueError("reviewer key registry must map reviewer refs to public keys")
+    out: dict[str, frozenset[str]] = {}
+    for ref, keys in registry.items():
+        if not isinstance(ref, str) or _REF_RE.fullmatch(ref) is None:
+            raise ValueError(f"reviewer key registry: {ref!r} is not a reviewer ref")
+        if isinstance(keys, str):
+            keys = [keys]
+        elif isinstance(keys, (set, frozenset, tuple)):
+            keys = list(keys)
+        if not isinstance(keys, list) or not keys or any(
+                not isinstance(k, str) or _KEY_RE.fullmatch(k.lower()) is None for k in keys):
+            raise ValueError(
+                f"reviewer key registry: {ref!r} needs Ed25519 public keys as 64 hex characters")
+        out[ref] = frozenset(k.lower() for k in keys)
+    return out
 
 
 def reviewer_statement(execution: dict[str, Any]) -> bytes:
@@ -140,7 +207,14 @@ def sign_oversight(
         difference is signed as review_seconds.
     reviewer_key: the reviewer's own key (OperatorKey or RemoteOperatorKey,
         e.g. backed by a security key). If given, it countersigns the
-        decision, so the record no longer rests on the operator's word alone.
+        decision. It must not be the operator key. Verifiers count it as
+        the reviewer's only if the key is in their reviewer key registry
+        for this reviewer (see check_oversight).
+
+    approved/modified need subjects (model receipts) and tool_call_ids;
+    resumed needs the stopped decision(s) it lifts in subjects. Subject
+    receipts passed as Receipts must not be later than review_started_at
+    or decided_at.
     """
     from traceseal_observe import _now_iso, sign_execution_receipt
     from traceseal_observe.context import Principal
@@ -159,6 +233,14 @@ def sign_oversight(
         "decided_at": decided,
     }
     subject_hashes = _hashes(subjects, "subjects")
+    if decision in _APPROVALS and (not subject_hashes or not tool_call_ids):
+        raise ValueError(
+            f'decision="{decision}" needs subjects (the model receipt that requested the '
+            "call) and tool_call_ids: an approval is valid only for the response and calls it names"
+        )
+    if decision == "resumed" and not subject_hashes:
+        raise ValueError('decision="resumed" needs the stop receipt it lifts in subjects')
+    _check_subject_receipts(decision, subjects, decided_dt, review_started_at)
     if subject_hashes:
         execution["subject_receipt_hashes"] = subject_hashes
     if tool_call_ids:
@@ -197,6 +279,10 @@ def sign_oversight(
         execution["review_started_at"] = review_started_at
         execution["review_seconds"] = int((decided_dt - started).total_seconds())
     if reviewer_key is not None:
+        operator_hex = getattr(operator_key, "public_key_hex", None)
+        if operator_hex is not None and reviewer_key.public_key_hex.lower() == str(operator_hex).lower():
+            raise ValueError("reviewer_key is the operator key: a countersignature must come "
+                             "from the reviewer's own key")
         execution["reviewer_public_key"] = reviewer_key.public_key_hex
         execution["reviewer_signature"] = reviewer_key.sign(
             reviewer_statement(execution)
@@ -205,11 +291,27 @@ def sign_oversight(
     return sign_execution_receipt(execution, provenance, operator_key)
 
 
-def check_oversight(receipt: Any) -> dict[str, Any]:
+def check_oversight(
+    receipt: Any,
+    *,
+    reviewer_keys: Any = None,
+    operator_keys: Any = (),
+) -> dict[str, Any]:
     """Validate an oversight receipt's fields (signature checked elsewhere).
 
-    Returns a summary; raises ValueError if malformed or if a reviewer
-    countersignature is present but invalid.
+    reviewer_keys: optional reviewer key registry (see
+        normalize_reviewer_keys). A countersignature counts as
+        reviewer_signed=True only if its key is registered for the
+        receipt's reviewer.ref. Without a registry a valid countersignature
+        is reported as reviewer_signed="unverified": anyone, including the
+        operator, can make a key and countersign with it.
+    operator_keys: further operator public keys (hex) a countersignature
+        must not use; the receipt's own operator key is always refused.
+
+    Returns a summary; raises ValueError if malformed, if an approval does
+    not name its subject model receipt and tool_call_ids, or if a reviewer
+    countersignature is present but invalid, made with an operator key, or
+    (with a registry) made with a key not registered for the reviewer.
     """
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -220,7 +322,8 @@ def check_oversight(receipt: Any) -> dict[str, Any]:
     if ex.get("decision") not in OVERSIGHT_DECISIONS:
         raise ValueError("oversight decision is invalid")
     reviewer = ex.get("reviewer")
-    if not isinstance(reviewer, dict) or set(reviewer) != {"kind", "ref"}:
+    if not isinstance(reviewer, dict) or set(reviewer) != {"kind", "ref"} or not isinstance(
+            reviewer.get("ref"), str):
         raise ValueError("oversight reviewer is malformed")
     decided = _utc(ex.get("decided_at"), "decided_at")
     for key in ("subject_receipt_hashes",):
@@ -230,25 +333,44 @@ def check_oversight(receipt: Any) -> dict[str, Any]:
     if "tool_call_ids" in ex and (not isinstance(ex["tool_call_ids"], list) or any(
             not isinstance(i, str) for i in ex["tool_call_ids"])):
         raise ValueError("tool_call_ids is malformed")
+    if ex.get("tool_call_ids") and not ex.get("subject_receipt_hashes"):
+        raise ValueError("tool_call_ids without the model receipt in subject_receipt_hashes")
+    if ex["decision"] in _APPROVALS and not (
+            ex.get("subject_receipt_hashes") and ex.get("tool_call_ids")):
+        raise ValueError(f"human {ex['decision']!r} decision does not name its subject model "
+                         "receipt and tool_call_ids; it approves nothing")
     for key in ("presented_hash", "rationale_hash", "modified_input_hash"):
         if key in ex and not _SHA_RE.fullmatch(str(ex[key])):
             raise ValueError(f"{key} is malformed")
     if (ex["decision"] == "modified") != ("modified_input_hash" in ex):
         raise ValueError("modified_input_hash must appear exactly with decision 'modified'")
     review_seconds = None
+    started = None
     if "review_started_at" in ex:
         started = _utc(ex["review_started_at"], "review_started_at")
         review_seconds = int((decided - started).total_seconds())
         if review_seconds < 0 or ex.get("review_seconds") != review_seconds:
             raise ValueError("review_seconds does not match the review times")
-    reviewer_signed = False
+    reviewer_signed: bool | str = False
     if "reviewer_signature" in ex or "reviewer_public_key" in ex:
         try:
-            key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(ex["reviewer_public_key"]))
+            key_hex = str(ex["reviewer_public_key"]).lower()
+            key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(key_hex))
             key.verify(bytes.fromhex(ex["reviewer_signature"]), reviewer_statement(ex))
-        except (KeyError, ValueError, InvalidSignature):
+        except (KeyError, ValueError, TypeError, InvalidSignature):
             raise ValueError("reviewer countersignature is invalid") from None
-        reviewer_signed = True
+        forbidden = {str(k).lower() for k in operator_keys or ()}
+        forbidden.add(str((receipt.attestation or {}).get("operator_public_key", "")).lower())
+        if key_hex in forbidden:
+            raise ValueError("reviewer countersignature is made with the operator's own key; "
+                             "it is not a reviewer signature")
+        if reviewer_keys is None:
+            reviewer_signed = "unverified"
+        elif key_hex not in normalize_reviewer_keys(reviewer_keys).get(reviewer["ref"], ()):
+            raise ValueError("reviewer countersignature key is not registered for this "
+                             "reviewer in the reviewer key registry")
+        else:
+            reviewer_signed = True
     return {
         "hash": receipt.receipt_hash,
         "decision": ex["decision"],
@@ -259,6 +381,7 @@ def check_oversight(receipt: Any) -> dict[str, Any]:
         "modified_input_hash": ex.get("modified_input_hash"),
         "decided_at": ex["decided_at"],
         "decided_at_dt": decided,
+        "review_started_at_dt": started,
         "review_seconds": review_seconds,
         "reviewer_signed": reviewer_signed,
         "presented": "presented_hash" in ex,
@@ -285,16 +408,22 @@ def sign_policy_decision(
     categories: Any = (),
     rule_ids: Any = (),
     output: Any = None,
+    decided_at: str | None = None,
 ) -> Any:
     """Sign the outcome of an automated control (guardrail, filter, policy).
+
+    decided_at: when the control decided (UTC seconds, default now). Signed,
+        so verify_trace can order the decision against stops and expiry.
 
     subject / subject_hash: what was evaluated (hashed).
     policy_definition / policy_hash: the exact policy configuration, so a
         later change to the policy shows up as a different hash.
     output: for decision="modify", the content after modification (hashed).
     """
-    from traceseal_observe import sign_execution_receipt
+    from traceseal_observe import _now_iso, sign_execution_receipt
 
+    decided = decided_at or _now_iso()
+    _utc(decided, "decided_at")
     if decision not in POLICY_DECISIONS:
         raise ValueError(f"decision must be one of {sorted(POLICY_DECISIONS)}")
     if stage not in POLICY_STAGES:
@@ -307,6 +436,7 @@ def sign_policy_decision(
         "policy_id": policy_id,
         "decision": decision,
         "stage": stage,
+        "decided_at": decided,
     }
     if subject is not None and subject_hash is not None:
         raise ValueError("pass subject or subject_hash, not both")
@@ -402,6 +532,8 @@ def check_policy_decision(receipt: Any) -> dict[str, Any]:
             raise ValueError(f"{key} is malformed")
     if (ex["decision"] == "modify") != ("output_hash" in ex):
         raise ValueError("output_hash must appear exactly with decision 'modify'")
+    if "decided_at" in ex:
+        _utc(ex["decided_at"], "decided_at")
     return {
         "hash": receipt.receipt_hash,
         "policy_id": ex["policy_id"],

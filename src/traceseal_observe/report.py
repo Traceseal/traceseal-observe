@@ -187,7 +187,7 @@ def analyse(
         not signature_failures
         and all(rep["ok"] for rep in chain_reports.values())
         and trace["ok"]
-        and not any(i["missed_deadlines"] for i in incidents)
+        and not any(i["missed_deadlines"] or i.get("problems") for i in incidents)
     )
     return summary
 
@@ -217,7 +217,8 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
     authz_errors = [e for e in trace["errors"] if "scope" in e or "expired" in e]
     policy_errors = [e for e in trace["errors"] if "policy" in e]
     missed = [f"{i['category']} {i['head'][:15]}: {d['basis']} due {d['due']}"
-              for i in s["incidents"] for d in i["missed_deadlines"]]
+              for i in s["incidents"] for d in i["missed_deadlines"]] + [
+        f"{i['category']} {i['head'][:15]}: {p}" for i in s["incidents"] for p in i.get("problems", [])]
     ops = sum(n for t, n in s["by_type"].items() if t not in ("skill",))
     period_days = s["period"]["days"]
     flows = s["data_flows"]
@@ -253,7 +254,7 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
         control("EU AI Act", "Art. 14 / 26(2)", "Human oversight",
                 _status(bool(trace["oversight"]), oversight_errors),
                 f"{len(trace['oversight'])} human decisions "
-                f"({sum(1 for o in trace['oversight'] if o['reviewer_signed'])} reviewer-signed).",
+                f"({sum(1 for o in trace['oversight'] if o['reviewer_signed'] is True)} reviewer-signed).",
                 "Records that oversight took place; whether the oversight measures and the "
                 "reviewers' competence meet Art. 14 and 26(2) is not assessed.",
                 "Art. 14: providers (design). Art. 26(2): deployers (assigning competent people). "
