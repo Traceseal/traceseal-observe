@@ -3,7 +3,7 @@
 Every TraceSeal receipt carries the operator's own clock claim (`started_at`,
 `chained_at`, `attested_at`). Under a dispute or an audit, "our server's
 clock said so" is weak evidence. A **time-stamping authority (TSA)** is an
-independent party that signs "this hash existed at this time" (RFC 3161).
+independent party that signs "this hash existed by this time" (RFC 3161).
 In the EU, a *qualified* time stamp from a qualified trust service provider
 has a legal presumption that its date, time and data integrity are accurate
 (eIDAS Regulation (EU) 910/2014 as amended by (EU) 2024/1183, Art. 41(2)).
@@ -43,7 +43,7 @@ Individual receipts can also be stamped directly:
 |---|---|---|
 | Were these receipts created later and backdated? | the operator's clock | **No later than the TSA's genTime.** Receipt hashes are fixed by the token. |
 | Is anything from before the window hidden in it? | `chained_at` claims | **Provable** with a start checkpoint stamped before the window opened (`start_basis: "trusted_time"`, RECEIPT-CHAINS.md §1.4) |
-| Is the tail of the window complete? | `chained_at` claims | `published_checkpoint`. Still assumes the operator stamped its current checkpoint promptly; see RECEIPT-CHAINS.md §1.4. |
+| Is the tail of the window complete? | `chained_at` claims | **Not by a TSA token.** A token proves the checkpoint existed by genTime, not that it was the newest: an operator can have an old checkpoint stamped later. The end edge reports `checkpoint_time`, the window stays incomplete, and a warning says the end edge rests on operator honesty. Only a cosignature from a witness that enforces consistency (`consistency_witness`) closes it; see RECEIPT-CHAINS.md §1.4. |
 | Does the signer's clock run ahead? | undetectable | flagged when `chained_at` is later than a trusted time that already covers the receipt |
 
 ## Verifying
@@ -112,8 +112,9 @@ This mapping is informational, not legal advice.
 
 - **EU AI Act Art. 12 (record-keeping) and Art. 19 / 26(6) (keeping logs
   for at least 6 months), for high-risk systems from 2 December 2027
-  (Annex III) / 2 August 2028 (Annex I):** independent evidence of *when*
-  logged events occurred, and that the log wasn't rewritten afterwards.
+  (Annex III) / 2 August 2028 (Annex I):** independent evidence
+  that logged events had been recorded by a given time, and that the log
+  wasn't rewritten afterwards.
 - **eIDAS Art. 41(2):** the legal presumption applies to qualified time
   stamps only, from a provider on the EU trusted list at the time. The
   ETSI signals this library reads are asserted by the TSA; they are not

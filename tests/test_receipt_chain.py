@@ -244,7 +244,7 @@ class TestVerifyChain:
     def test_mixed_chains_and_keys_rejected(self, key):
         _, a = _make(key, 1, "a")
         _, b = _make(key, 1, "b")
-        _, c = _make(OperatorKey.generate(), 1, "a")
+        _, c = _make(OperatorKey.generate(), 1, "a", offset=7)
         assert not verify_chain(a + b)["ok"]
         assert not verify_chain(a + c)["ok"]
         assert not verify_chain(a, chain_id="other")["ok"]
@@ -361,7 +361,8 @@ class TestCheckpoints:
         vkey, cosign = _witness()
         note = cosign(chain.checkpoint(), 1_900_000_000)
         info = verify_chain_checkpoint(note, key.public_key_hex, "agent-1", witness_vkeys=[vkey])
-        assert info["witnesses"] == [{"name": "witness.example.com", "time": 1_900_000_000}]
+        assert info["witnesses"] == [{"name": "witness.example.com", "time": 1_900_000_000,
+                                      "enforces_consistency": False}]
         assert verify_chain(rs, checkpoint=note, witness_vkeys=[vkey])["ok"]
 
         # A required witness that did not cosign fails.
@@ -432,13 +433,29 @@ class TestWindow:
         end = "2026-10-01T16:00:00Z"
         late = 1790870400  # 2026-10-01T16:00:00Z
         note = cosign(chain.checkpoint(), late)
-        report = verify_chain(rs, checkpoint=note, witness_vkeys=[vkey],
+        report = verify_chain(rs, checkpoint=note, consistency_witness_vkeys=[vkey],
                               window=("2026-10-01T14:00:00Z", end))
         assert report["window"]["complete"]
+        assert report["window"]["end_basis"] == "consistency_witness"
+        assert report["window"]["end_note"]
         early = cosign(chain.checkpoint(), late - 1)
-        report = verify_chain(rs, checkpoint=early, witness_vkeys=[vkey],
+        report = verify_chain(rs, checkpoint=early, consistency_witness_vkeys=[vkey],
                               window=("2026-10-01T14:00:00Z", end))
         assert not report["window"]["complete"]
+
+    def test_window_end_not_closed_by_plain_witness(self, key):
+        """A witness not trusted to enforce consistency only shows the
+        checkpoint existed by then (red-team F5)."""
+        times = ["2026-10-01T13:00:00Z", "2026-10-01T15:00:00Z"]
+        chain, rs = self._chain_with_times(key, times)
+        vkey, cosign = _witness()
+        note = cosign(chain.checkpoint(), 1790870400)
+        report = verify_chain(rs, checkpoint=note, witness_vkeys=[vkey],
+                              window=("2026-10-01T14:00:00Z", "2026-10-01T16:00:00Z"))
+        assert report["ok"]
+        assert report["window"]["end_basis"] == "checkpoint_time"
+        assert not report["window"]["complete"] and not report["window"]["covers_end"]
+        assert any("operator honesty" in w for w in report["warnings"])
 
     def test_bad_window(self, key):
         _, rs = _make(key, 1)
