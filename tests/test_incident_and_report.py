@@ -316,7 +316,7 @@ class TestIncidentRedTeam:
     def test_flags_are_signed_and_recomputed(self):
         key = OperatorKey.generate()
         root = self._root(key, death=True)
-        assert root.execution["death"] is True
+        assert root.execution["death"] == "true"
         st = incident_status([self._raw(key, root, deadlines=[])], now="2026-01-12T00:00:00Z")[0]
         assert [d["due"] for d in st["missed_deadlines"]] == ["2026-01-11T00:00:00Z"]
 

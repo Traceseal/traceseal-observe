@@ -299,9 +299,9 @@ def sign_incident(
         execution["supersedes"] = _receipt_hash(supersedes)
     # Signed so incident_status() can recompute the deadlines from the facts.
     if death:
-        execution["death"] = True
+        execution["death"] = "true"
     if widespread:
-        execution["widespread"] = True
+        execution["widespread"] = "true"
     deadlines = reporting_deadlines(category, aware_at, death=death, widespread=widespread,
                                     classified_at=classified_at)
     if deadlines:
@@ -338,8 +338,8 @@ def _resolve_deadlines(
     (death, widespread, earliest classification). The signed `deadlines` of
     stages of the same category may only make a deadline stricter, never
     looser; an empty or missing `deadlines` field drops nothing."""
-    death = any(h.execution.get("death") is True for h in history)
-    widespread = any(h.execution.get("widespread") is True for h in history)
+    death = any(h.execution.get("death") == "true" for h in history)
+    widespread = any(h.execution.get("widespread") == "true" for h in history)
     classified = None
     if category == "major_ict_incident":
         aware = _utc(aware_at, "aware_at")

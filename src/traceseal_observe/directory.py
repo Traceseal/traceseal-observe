@@ -55,6 +55,16 @@ DIRECTORY_VERSION = "1.0"
 WELL_KNOWN_PATH = "/.well-known/traceseal/operator-keys.json"
 KEY_STATUSES = frozenset({"active", "retired", "revoked"})
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _weak(pk: str) -> bool:
+    from traceseal_observe import is_weak_ed25519_public_key
+    return is_weak_ed25519_public_key(pk)
+
+
+def _load_key(pk: str) -> Any:
+    from traceseal_observe import load_ed25519_public_key
+    return load_ed25519_public_key(pk)
 _UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _MAX_KEYS = 256
@@ -122,8 +132,8 @@ def _validate(document: Any, *, require_signatures: bool = True) -> None:
         if not isinstance(entry, dict):
             raise DirectoryError("key entries must be objects")
         pk = entry.get("public_key")
-        if not isinstance(pk, str) or not _HEX64.fullmatch(pk) or pk in seen:
-            raise DirectoryError("key public_key must be unique 64-hex")
+        if not isinstance(pk, str) or not _HEX64.fullmatch(pk) or pk in seen or _weak(pk):
+            raise DirectoryError("key public_key must be unique 64-hex and not a small-order Ed25519 key")
         seen.add(pk)
         if entry.get("status") not in KEY_STATUSES:
             raise DirectoryError("key status must be active, retired or revoked")
@@ -166,7 +176,7 @@ def verify_directory(document: Any, *, domain: str | None = None) -> dict[str, A
         if not isinstance(signature, str) or len(signature) != 128:
             raise DirectoryError(f"signature by {pk[:16]}… is malformed")
         try:
-            Ed25519PublicKey.from_public_bytes(bytes.fromhex(pk)).verify(
+            _load_key(pk).verify(
                 bytes.fromhex(signature), body)
         except (ValueError, InvalidSignature):
             raise DirectoryError(f"signature by {pk[:16]}… is invalid") from None

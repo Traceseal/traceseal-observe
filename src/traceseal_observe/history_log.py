@@ -134,6 +134,13 @@ def production_log_vkeys() -> tuple[dict[str, str], dict[str, str]]:
     )
 
 
+def _strict_key(raw: bytes) -> Ed25519PublicKey:
+    from traceseal_observe import is_weak_ed25519_public_key
+    if is_weak_ed25519_public_key(bytes(raw)):
+        _fail("checkpoint key is a small-order or non-canonical Ed25519 key", "checkpoint_key_invalid")
+    return Ed25519PublicKey.from_public_bytes(bytes(raw))
+
+
 def _fail(message: str, code: str = "publisher_history_log_invalid") -> None:
     raise HistoryLogError(message, code)
 
@@ -312,7 +319,7 @@ def _verify_checkpoint(
         _fail("checkpoint log key is invalid", "checkpoint_key_invalid")
     signature = _matching_signature(signatures, log_name, key_hash, 68)
     try:
-        Ed25519PublicKey.from_public_bytes(public_key).verify(
+        _strict_key(public_key).verify(
             signature[4:], body.encode("utf-8")
         )
     except InvalidSignature as exc:
@@ -328,7 +335,7 @@ def _verify_checkpoint(
     )
     signed_time = struct.unpack(">Q", cosignature[4:12])[0]
     try:
-        Ed25519PublicKey.from_public_bytes(witness_key).verify(
+        _strict_key(witness_key).verify(
             cosignature[12:],
             f"cosignature/v1\ntime {signed_time}\n{body}".encode("utf-8"),
         )

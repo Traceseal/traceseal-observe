@@ -355,7 +355,8 @@ def check_oversight(
     if "reviewer_signature" in ex or "reviewer_public_key" in ex:
         try:
             key_hex = str(ex["reviewer_public_key"]).lower()
-            key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(key_hex))
+            from traceseal_observe import load_ed25519_public_key
+            key = load_ed25519_public_key(key_hex, "reviewer public key")
             key.verify(bytes.fromhex(ex["reviewer_signature"]), reviewer_statement(ex))
         except (KeyError, ValueError, TypeError, InvalidSignature):
             raise ValueError("reviewer countersignature is invalid") from None

@@ -400,3 +400,41 @@ def test_private_key_roundtrip_unaffected():
     key = OperatorKey(name="x", private_key=sk, public_key=sk.public_key())
     r = observe_tool("t", key, lambda: 1)[1]
     verify_receipt_signature(r)
+
+
+def test_every_receipt_type_round_trips_through_a_file(tmp_path):
+    """RECEIPT-SPEC §3 forbids booleans/nulls in signed sections: receipts the
+    library itself signs must still load and verify from disk."""
+    from traceseal_observe import OperatorKey, sign_incident, verify_receipt_signature
+    from traceseal_observe.chain import load_receipt
+    from traceseal_observe.oversight import sign_policy_decision
+
+    k = OperatorKey.generate()
+    made = [
+        sign_incident(category="serious_incident", severity="high", status="detected",
+                      aware_at="2026-10-01T09:00:00Z", death=True, widespread=True, operator_key=k),
+        sign_incident(category="major_ict_incident", severity="high", status="detected",
+                      aware_at="2026-10-01T09:00:00Z", classified_at="2026-10-01T10:00:00Z",
+                      operator_key=k),
+        sign_policy_decision(policy_id="pii", decision="allow", stage="output", operator_key=k),
+    ]
+    for i, r in enumerate(made):
+        p = tmp_path / f"{i}.json"
+        p.write_text(r.to_json())
+        verify_receipt_signature(load_receipt(p))
+
+
+def test_directory_and_reviewer_reject_small_order_keys():
+    import pytest
+    from traceseal_observe import OperatorKey
+    from traceseal_observe.directory import DirectoryError, build_directory, verify_directory
+
+    identity = "01" + "00" * 31
+    k = OperatorKey.generate()
+    doc = build_directory("example.com", [
+        {"public_key": k.public_key_hex, "status": "active", "valid_from": "2026-01-01T00:00:00Z"},
+    ], [k], issued_at="2026-10-01T00:00:00Z")
+    doc["keys"].append({"public_key": identity, "status": "retired",
+                        "valid_from": "2025-01-01T00:00:00Z", "valid_until": "2025-06-01T00:00:00Z"})
+    with pytest.raises(DirectoryError, match="small-order"):
+        verify_directory(doc)
