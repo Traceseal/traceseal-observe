@@ -43,10 +43,11 @@ trust primitive the operator can produce without provider cooperation.
 
 from __future__ import annotations
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -60,21 +61,266 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 RECEIPT_VERSION = "1.0"
 
-# Matches a URL query string so credentials passed as query params
-# (?api_key=..., ?token=..., &sig=...) never get baked into a signed,
-# publicly-shareable receipt's error_message. Errors from HTTP libraries
-# routinely embed the full request URL.
-_QUERY_STRING_RE = __import__("re").compile(r"\?[^\s\"']*")
+# ---------------------------------------------------------------------------
+# What may be written into a signed receipt: URLs and error text
+# ---------------------------------------------------------------------------
+#
+# Receipts are signed and meant to be shared, so anything written into them
+# cannot be taken back. URLs and exception messages are the two places where
+# secrets (userinfo passwords, ?api_key=, webhook tokens in paths, bearer
+# tokens) and personal data (pydantic echoes of the rejected input) leak in.
+
+import contextvars as _contextvars
+import re as _re
+
+REDACTED = "{redacted}"
+
+_SCHEME_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+# Path segments that are credentials by shape.
+_TOKEN_SEGMENT_RE = _re.compile(
+    r"^(?:"
+    r"(?:sk|pk|rk|api|key|tok|token|secret|ghp|gho|ghs|ghu|github_pat|glpat|xox[abpsr])[-_][A-Za-z0-9_-]{6,}"
+    r"|bot[0-9]{5,}:[A-Za-z0-9_-]{20,}"                 # Telegram bot token
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}"
+    r"|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"  # JWT
+    r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"  # UUID
+    r")$"
+)
+# A segment named like this is followed by a secret (".../key/<secret>").
+_SECRET_MARKER_SEGMENTS = frozenset({
+    "key", "keys", "token", "tokens", "secret", "apikey", "api_key", "api-key",
+    "access_token", "auth", "sig", "signature", "password", "passwd", "pwd", "pass",
+    "credential", "credentials", "session", "sessionid", "private", "otp",
+})
+# A path segment like "api_key=..." or "password:..." carries its value inline.
+_CREDENTIAL_PAIR_SEGMENT_RE = _re.compile(
+    r"(?i)(api[_-]?key|access[_-]?key|token|secret|passw(or)?d|pwd|pass|auth|session|sig|signature|key)"
+    r"\s*[=:]")
+# Everything after one of these segments is a webhook capability.
+_WEBHOOK_MARKER_SEGMENTS = frozenset({"hooks", "hook", "webhook", "webhooks", "catch", "trigger"})
+# Hosts whose whole path (after the first segment) is the capability.
+_WEBHOOK_HOST_RE = _re.compile(
+    r"^(?:hooks\.slack\.com|hooks\.zapier\.com|maker\.ifttt\.com|.*\.webhook\.office\.com"
+    r"|outlook\.office(?:365)?\.com|discord(?:app)?\.com|.*\.logic\.azure\.com"
+    r"|events\.pagerduty\.com|api\.telegram\.org|chat\.googleapis\.com)$"
+)
 
 
-def _redact_error(message: str, limit: int = 200) -> str:
-    """Scrub URL query strings from an exception message and bound its length.
+def _entropy(text: str) -> float:
+    import math
 
-    Receipt error messages are signed and shareable, so a leaked
-    ?api_key=... in a library exception would become a published credential.
+    counts: dict[str, int] = {}
+    for ch in text:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(text)
+    return -sum(c / n * math.log2(c / n) for c in counts.values())
+
+
+def _secret_segment(segment: str) -> bool:
+    """True if a URL path segment looks like a credential or an identifier
+    that should not be published (token, key, UUID, email, card number...)."""
+    from urllib.parse import unquote
+
+    text = unquote(segment)
+    if not text:
+        return False
+    if _CREDENTIAL_PAIR_SEGMENT_RE.search(text):
+        return True
+    if _TOKEN_SEGMENT_RE.match(text):
+        return True
+    for name, pattern in _PII_PATTERNS.items():
+        for m in pattern.finditer(text):
+            validator = _PII_VALIDATORS.get(name)
+            if validator is None or validator(m.group()):
+                return True
+    for chunk in _re.split(r"[-_.:~+=,]", text):
+        has_digit = any(c.isdigit() for c in chunk)
+        has_alpha = any(c.isalpha() for c in chunk)
+        if len(chunk) >= 32 and _re.fullmatch(r"[A-Za-z0-9/+]+", chunk):
+            return True
+        if len(chunk) >= 16 and has_digit and has_alpha:
+            return True
+        if (len(chunk) >= 20 and any(c.isupper() for c in chunk)
+                and any(c.islower() for c in chunk) and _entropy(chunk) >= 3.5):
+            return True
+    return False
+
+
+def sanitize_url(url: Any, *, host_only: bool = False) -> str:
+    """The form of a URL that may be written into a signed receipt.
+
+    Rebuilt from scheme, host, port and path only: userinfo, query string,
+    fragment and ;params are dropped, and path segments that look like
+    secrets (long high-entropy tokens, API-key shapes, UUIDs, PII, webhook
+    capabilities such as hooks.slack.com/services/...) are replaced with
+    "{redacted}". host_only=True keeps just scheme://host[:port].
+    An unparseable URL becomes "{redacted}".
     """
-    scrubbed = _QUERY_STRING_RE.sub("?<redacted>", message)
-    return scrubbed[:limit]
+    from urllib.parse import urlsplit
+
+    raw = str(url).strip()
+    try:
+        has_scheme = bool(_SCHEME_RE.match(raw))
+        parts = urlsplit(raw if has_scheme else "//" + raw)
+        scheme = parts.scheme.lower() if has_scheme else ""
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return REDACTED
+    if not host or any(c in host for c in "@/\\ \t\r\n?#"):
+        return REDACTED
+    if ":" in host:
+        host = f"[{host}]"
+    prefix = (f"{scheme}://" if scheme else "") + host + (f":{port}" if port else "")
+    if host_only:
+        return prefix
+    segments = parts.path.split("/")
+    webhook_host = _WEBHOOK_HOST_RE.match(host.strip("[]")) is not None
+    out: list[str] = []
+    redact_rest = False
+    seen_named = 0
+    for i, segment in enumerate(segments):
+        # drop ;params, including a percent-encoded ";" (%3B)
+        segment = _re.split(r";|%3[bB]", segment, maxsplit=1)[0]
+        if i == 0 or segment == "":
+            out.append(segment)
+            continue
+        seen_named += 1
+        previous = out[-1].lower() if out else ""
+        if (redact_rest or _secret_segment(segment)
+                or previous in _SECRET_MARKER_SEGMENTS
+                or (webhook_host and seen_named > 1)):
+            out.append(REDACTED)
+        else:
+            out.append(segment)
+        if segment.lower() in _WEBHOOK_MARKER_SEGMENTS:
+            redact_rest = True
+    return prefix + "/".join(out)
+
+
+def _record_endpoint(endpoint: str) -> str:
+    """Endpoints that are URLs are recorded sanitised; other identifiers
+    ("mcp://server" is a URL too, "git commit" is not) are kept."""
+    if isinstance(endpoint, str) and _SCHEME_RE.match(endpoint):
+        return sanitize_url(endpoint)
+    return endpoint
+
+
+# Kept for callers of the pre-1.6 name. It used to strip only the query.
+_strip_query = sanitize_url
+
+
+# -- error text ---------------------------------------------------------------
+
+ERROR_TEXT_MODES = frozenset({"hash", "scrubbed"})
+_ERROR_TEXT_DEFAULT = ["hash"]
+_ERROR_TEXT: _contextvars.ContextVar[str | None] = _contextvars.ContextVar(
+    "traceseal_error_text", default=None
+)
+_ERROR_PREFIX_RE = _re.compile(r"^([A-Za-z_][A-Za-z0-9_.]{0,127})(?:: ?(.*))?$", _re.DOTALL)
+
+
+def set_error_text(mode: str) -> None:
+    """Process-wide choice of what failure receipts record as error_message.
+
+    "hash" (default): the exception type and a short hash of the message,
+      e.g. "ValueError (sha256:1f3a9c0b7d2e)". The text itself is never
+      recorded; the hash lets whoever holds the log line match it.
+    "scrubbed": the type and the message with credentials, URL userinfo,
+      query strings, fragments, pydantic input_value=... and PII-pattern
+      matches removed. Scrubbing is heuristic: only opt in if you accept
+      that an unrecognised secret or personal detail may be signed.
+    """
+    if mode not in ERROR_TEXT_MODES:
+        raise ValueError(f"error text mode must be one of {sorted(ERROR_TEXT_MODES)}")
+    _ERROR_TEXT_DEFAULT[0] = mode
+
+
+def error_text(mode: str):
+    """Context manager: use `mode` (see set_error_text) inside the block."""
+    from contextlib import contextmanager
+
+    if mode not in ERROR_TEXT_MODES:
+        raise ValueError(f"error text mode must be one of {sorted(ERROR_TEXT_MODES)}")
+
+    @contextmanager
+    def _scope():
+        token = _ERROR_TEXT.set(mode)
+        try:
+            yield
+        finally:
+            _ERROR_TEXT.reset(token)
+
+    return _scope()
+
+
+_URL_IN_TEXT_RE = _re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>()\[\]{}]+")
+_USERINFO_RE = _re.compile(r"(?<![\w/])[^\s/@:'\"]+:[^\s/@'\"]+@(?=[A-Za-z0-9\[])")
+_AUTH_HEADER_RE = _re.compile(
+    r"(?i)((?:proxy-)?authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie)"
+    r"(['\"]?\s*[:=]\s*['\"]?)(?!\{redacted\})[^'\"\n,}]+"
+)
+_AUTH_SCHEME_RE = _re.compile(r"(?i)\b(bearer|basic|token|digest)\s+[A-Za-z0-9._~+/=-]{4,}")
+_CREDENTIAL_PAIR_RE = _re.compile(
+    r"(?i)\b([\w-]*(?:api[_-]?key|apikey|token|secret|passw(?:or)?d|passwd|pwd|credential|"
+    r"session[_-]?id|signature|sig|auth|private[_-]?key|client[_-]?secret)[\w-]*)"
+    r"(['\"]?\s*[=:]\s*)(?!['\"]?\{redacted\})(\"[^\"]*\"|'[^']*'|[^\s&'\",;}\])]+)"
+)
+_INPUT_VALUE_RE = _re.compile(r"input_value=.*?(?=, input_type=|\]|$)", _re.MULTILINE)
+
+
+# "password 'hunter2'", "secret is: x", "token = x" (quoted or not).
+_LOOSE_SECRET_RE = _re.compile(
+    r"(?i)\b((?:api[ _-]?key|access[ _-]?key|secret(?:[ _-]?key)?|token|passw(?:or)?d|pwd|"
+    r"credentials?)\b\s*(?:is|was|=|:)?\s*[:=]?\s*)(['\"]?)[^\s'\",;&]{3,}\2")
+_SPACED_PHONE_RE = _re.compile(r"\+\d{1,3}(?:[ .-]?\(?\d{1,4}\)?){2,5}\d")
+
+
+def _scrub_error_text(text: str) -> str:
+    text = _INPUT_VALUE_RE.sub("input_value=" + REDACTED, text)
+    text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    text = _AUTH_SCHEME_RE.sub(lambda m: m.group(1) + " " + REDACTED, text)
+    text = _URL_IN_TEXT_RE.sub(lambda m: sanitize_url(m.group()), text)
+    text = _USERINFO_RE.sub(REDACTED + "@", text)
+    text = _CREDENTIAL_PAIR_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    text = _LOOSE_SECRET_RE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _SPACED_PHONE_RE.sub("{phone}", text)
+    for name, pattern in _PII_PATTERNS.items():
+        validator = _PII_VALIDATORS.get(name)
+        text = pattern.sub(
+            lambda m, n=name, v=validator: m.group() if v and not v(m.group()) else "{" + n + "}",
+            text,
+        )
+    # Any remaining word that looks like a credential or identifier token
+    # (API-key shapes, long high-entropy strings) is redacted too.
+    return _re.sub(r"[^\s'\"`,;()\[\]{}<>]{12,}",
+                   lambda m: REDACTED if _secret_segment(m.group()) else m.group(), text)
+
+
+def _redact_error(message: Any, limit: int = 200, *, mode: str | None = None) -> str:
+    """The error_message recorded in a failure receipt.
+
+    `message` is an exception, or a string of the form "TypeName: text"
+    (what f"{type(exc).__name__}: {exc}" produces). By default only the
+    type and a short hash of the text are recorded; see set_error_text()
+    and error_text() to keep scrubbed text instead.
+    """
+    if isinstance(message, BaseException):
+        kind, text = type(message).__name__, str(message)
+    else:
+        message = str(message)
+        m = _ERROR_PREFIX_RE.match(message)
+        kind, text = (m.group(1), m.group(2) or "") if m else ("Error", message)
+    mode = mode or _ERROR_TEXT.get() or _ERROR_TEXT_DEFAULT[0]
+    if mode not in ERROR_TEXT_MODES:
+        raise ValueError(f"error text mode must be one of {sorted(ERROR_TEXT_MODES)}")
+    if mode == "hash":
+        if not text:
+            return kind[:limit]
+        digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+        return f"{kind} (sha256:{digest})"[:limit]
+    scrubbed = _scrub_error_text(text)
+    return (f"{kind}: {scrubbed}" if scrubbed else kind)[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +387,130 @@ def public_key_fingerprint(pk: Ed25519PublicKey) -> str:
     return f"ed25519:{digest[:32]}"
 
 
+# Edwards25519 (RFC 8032 §5.1): just enough arithmetic to decode a public
+# key strictly and test its order. OpenSSL loads any 32 bytes as a public
+# key, including the identity 01 00..00, under which (R = B, S = 1) is a
+# valid signature on EVERY message. Small-order keys bind nothing.
+_ED_P = 2**255 - 19
+_ED_D = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed25519_decode_point(encoded: bytes) -> tuple[int, int] | None:
+    """Strict RFC 8032 §5.1.3 decoding; None if invalid or non-canonical."""
+    if len(encoded) != 32:
+        return None
+    value = int.from_bytes(encoded, "little")
+    sign = value >> 255
+    y = value & ((1 << 255) - 1)
+    if y >= _ED_P:  # non-canonical: y must be reduced mod p
+        return None
+    u = (y * y - 1) % _ED_P
+    v = (_ED_D * y * y + 1) % _ED_P
+    x = u * pow(v, 3, _ED_P) * pow(u * pow(v, 7, _ED_P), (_ED_P - 5) // 8, _ED_P) % _ED_P
+    vxx = v * x * x % _ED_P
+    if vxx == (-u) % _ED_P:
+        x = x * _ED_SQRT_M1 % _ED_P
+    elif vxx != u:
+        return None  # not on the curve
+    if x == 0 and sign:  # non-canonical: "-0"
+        return None
+    if x & 1 != sign:
+        x = _ED_P - x
+    return x, y
+
+
+def _ed25519_add(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
+    # Complete twisted Edwards addition (a = -1, d non-square).
+    (x1, y1), (x2, y2) = a, b
+    t = _ED_D * x1 * x2 * y1 * y2 % _ED_P
+    x3 = (x1 * y2 + y1 * x2) * pow(1 + t, _ED_P - 2, _ED_P) % _ED_P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, _ED_P - 2, _ED_P) % _ED_P
+    return x3, y3
+
+
+def is_weak_ed25519_public_key(key: Any) -> bool:
+    """True if `key` must not be trusted as an Ed25519 public key.
+
+    Accepts raw bytes, 64-char hex, or an Ed25519PublicKey. Returns True if
+    the encoding is malformed or non-canonical (y >= p, or x = 0 with the
+    sign bit set), if it is not a curve point, or if the point has small
+    order (8·A is the identity). Under a small-order key, signatures can be
+    produced without any private key, so they prove nothing.
+    """
+    try:
+        if isinstance(key, Ed25519PublicKey):
+            raw = _public_key_bytes(key)
+        elif isinstance(key, str):
+            if len(key) != 64:
+                return True
+            raw = bytes.fromhex(key)
+        elif isinstance(key, (bytes, bytearray)):
+            raw = bytes(key)
+        else:
+            return True
+    except (ValueError, TypeError):
+        return True
+    point = _ed25519_decode_point(raw)
+    if point is None:
+        return True
+    for _ in range(3):
+        point = _ed25519_add(point, point)
+    return point == (0, 1)
+
+
+def load_ed25519_public_key(key: Any, label: str = "public key") -> Ed25519PublicKey:
+    """Load raw bytes / 64-hex / Ed25519PublicKey, rejecting weak keys.
+
+    Raises ValueError for malformed, non-canonical and small-order keys.
+    """
+    if isinstance(key, str):
+        if len(key) != 64:
+            raise ValueError(f"{label} hex must be 64 characters")
+        try:
+            key = bytes.fromhex(key)
+        except ValueError:
+            raise ValueError(f"{label} is not hex") from None
+    if isinstance(key, (bytes, bytearray)):
+        if len(key) != 32:
+            raise ValueError(f"raw Ed25519 {label} must be 32 bytes")
+        if is_weak_ed25519_public_key(bytes(key)):
+            raise ValueError(f"{label} is a small-order or non-canonical Ed25519 key")
+        return Ed25519PublicKey.from_public_bytes(bytes(key))
+    if not isinstance(key, Ed25519PublicKey):
+        raise ValueError(f"{label} must be an Ed25519 public key")
+    if is_weak_ed25519_public_key(key):
+        raise ValueError(f"{label} is a small-order or non-canonical Ed25519 key")
+    return key
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        out[key] = value
+    return out
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def loads_receipt_json(data: str | bytes) -> Any:
+    """Parse receipt JSON strictly: duplicate keys and NaN/Infinity are
+    errors (ValueError), so every parser reads the same document."""
+    if isinstance(data, (bytes, bytearray)):
+        data = bytes(data).decode("utf-8")
+    try:
+        return json.loads(
+            data, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant
+        )
+    except RecursionError:
+        # Hostile nesting must fail like any other malformed JSON.
+        raise ValueError("JSON is nested too deeply") from None
+
+
 @dataclass
 class OperatorKey:
     """An operator's ed25519 keypair for signing receipts."""
@@ -148,6 +518,14 @@ class OperatorKey:
     name: str
     private_key: Ed25519PrivateKey
     public_key: Ed25519PublicKey
+
+    def __post_init__(self) -> None:
+        # Fail closed on keys that bind nothing (small-order / non-canonical):
+        # anyone could "sign" for them without a private key.
+        if isinstance(self.public_key, Ed25519PublicKey) and is_weak_ed25519_public_key(
+            self.public_key
+        ):
+            raise ValueError("operator public key is a small-order or non-canonical Ed25519 key")
 
     @property
     def fingerprint(self) -> str:
@@ -208,16 +586,7 @@ class RemoteOperatorKey(OperatorKey):
         public_key: Ed25519PublicKey | bytes | str,
         sign_fn: Callable[[bytes], bytes],
     ):
-        if isinstance(public_key, str):
-            if len(public_key) != 64:
-                raise ValueError("public key hex must be 64 characters")
-            public_key = bytes.fromhex(public_key)
-        if isinstance(public_key, (bytes, bytearray)):
-            if len(public_key) != 32:
-                raise ValueError("raw Ed25519 public key must be 32 bytes")
-            public_key = Ed25519PublicKey.from_public_bytes(bytes(public_key))
-        if not isinstance(public_key, Ed25519PublicKey):
-            raise ValueError("public_key must be an Ed25519 public key")
+        public_key = load_ed25519_public_key(public_key, "public key")
         if not callable(sign_fn):
             raise ValueError("sign_fn must be callable")
         super().__init__(name=name, private_key=None, public_key=public_key)
@@ -374,16 +743,59 @@ def _signed_payload(execution: dict, provenance: dict) -> bytes:
     return canonical_dumps({"execution": execution, "provenance": provenance})
 
 
+def _forbidden_json_value(value: Any, path: str = "") -> str | None:
+    """Path of the first JSON boolean or null (RECEIPT-SPEC §3), else None.
+
+    Also rejects circular references and nesting deeper than any receipt
+    needs, so a hostile in-memory dict fails instead of hanging.
+    """
+    on_path: set[int] = set()
+
+    def walk(item: Any, where: str, depth: int) -> str | None:
+        if item is None or isinstance(item, bool):
+            return where or "/"
+        if isinstance(item, float) and not math.isfinite(item):
+            return f"{where or '/'} (non-finite number)"
+        if isinstance(item, (dict, list, tuple)):
+            if depth > 64:
+                return f"{where or '/'} (nested too deeply)"
+            if id(item) in on_path:
+                return f"{where or '/'} (circular reference)"
+            on_path.add(id(item))
+            try:
+                pairs = item.items() if isinstance(item, dict) else enumerate(item)
+                for k, v in pairs:
+                    sub = f"{where}.{k}" if isinstance(item, dict) else f"{where}[{k}]"
+                    found = walk(v, sub, depth + 1)
+                    if found:
+                        return found
+            finally:
+                on_path.discard(id(item))
+        return None
+
+    return walk(value, path, 0)
+
+
 def _check_receipt_signature(receipt: Receipt, label: str) -> None:
     """Raise ValueError unless the receipt's Ed25519 signature is valid.
 
     Used to fail closed when loading receipts from an untrusted bundle.
+    Rejects malformed, non-canonical and small-order operator keys, and
+    signed payloads containing JSON booleans or nulls (RECEIPT-SPEC §3).
     """
     from cryptography.exceptions import InvalidSignature
 
-    att = receipt.attestation
+    att = getattr(receipt, "attestation", None)
+    execution = getattr(receipt, "execution", None)
+    provenance = getattr(receipt, "provenance", None)
+    if not isinstance(att, dict):
+        raise ValueError(f"{label}: attestation is not a JSON object")
+    if not isinstance(execution, dict) or not isinstance(provenance, dict):
+        raise ValueError(f"{label}: execution and provenance must be JSON objects")
     pubkey_hex = att.get("operator_public_key", "")
     signature_hex = att.get("signature", "")
+    if not isinstance(pubkey_hex, str) or not isinstance(signature_hex, str):
+        raise ValueError(f"{label}: operator_public_key and signature must be hex strings")
     # Ed25519: 32-byte key (64 hex chars), 64-byte signature (128 hex chars).
     # Bound lengths before decoding so a hostile bundle can't force a huge
     # bytes.fromhex() allocation.
@@ -391,16 +803,24 @@ def _check_receipt_signature(receipt: Receipt, label: str) -> None:
         raise ValueError(f"{label}: operator_public_key is {len(pubkey_hex)} hex chars, expected 64")
     if len(signature_hex) != 128:
         raise ValueError(f"{label}: signature is {len(signature_hex)} hex chars, expected 128")
+    forbidden = _forbidden_json_value({"execution": execution, "provenance": provenance})
+    if forbidden is not None:
+        raise ValueError(
+            f"{label}: signed payload contains a JSON boolean, null or circular value at {forbidden} "
+            "(RECEIPT-SPEC §3)"
+        )
     try:
-        pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex))
+        pk = load_ed25519_public_key(pubkey_hex, "operator_public_key")
         expected_fingerprint = public_key_fingerprint(pk)
         if att.get("operator_fingerprint") != expected_fingerprint:
             raise ValueError(f"{label}: operator fingerprint does not match public key")
-        pk.verify(bytes.fromhex(signature_hex), _signed_payload(receipt.execution, receipt.provenance))
+        pk.verify(bytes.fromhex(signature_hex), _signed_payload(execution, provenance))
     except InvalidSignature:
         raise ValueError(f"{label}: signature verification failed — receipt may be tampered")
-    except ValueError:
-        raise
+    except ValueError as exc:
+        if str(exc).startswith(label):
+            raise
+        raise ValueError(f"{label}: {exc}") from None
     except Exception as e:  # malformed key material, etc.
         raise ValueError(f"{label}: signature check error: {type(e).__name__}")
 
@@ -441,11 +861,23 @@ def sign_execution_receipt(
     receipt_type = execution.get("receipt_type")
     if not isinstance(receipt_type, str) or not receipt_type:
         raise ValueError("execution.receipt_type is required")
-    try:
-        execution_copy = json.loads(canonical_dumps(execution))
-        provenance_copy = json.loads(canonical_dumps(provenance))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("receipt body is not canonical JSON") from exc
+    # Refuse what every verifier would reject (RECEIPT-SPEC §3): booleans,
+    # nulls, circular values. Use strings such as "true" / "false".
+    # Check before encoding (catches cycles/absurd depth cheaply), then
+    # check the normalised JSON that is actually signed, exactly as the
+    # verifier sees it (tuples become lists, etc.).
+    forbidden = _forbidden_json_value({"execution": execution, "provenance": provenance})
+    if not forbidden:
+        try:
+            execution_copy = json.loads(canonical_dumps(execution))
+            provenance_copy = json.loads(canonical_dumps(provenance))
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("receipt body is not canonical JSON") from exc
+        forbidden = _forbidden_json_value({"execution": execution_copy,
+                                           "provenance": provenance_copy})
+    if forbidden:
+        raise ValueError(f"cannot sign: JSON boolean, null or circular value at {forbidden} "
+                         "(RECEIPT-SPEC §3; use strings such as \"true\")")
 
     # Domain profile validation happens before signing.  Historical receipts
     # without a profile marker remain valid; profile 1.1 opts into strict,
@@ -756,7 +1188,7 @@ def _start_model_call(provider, model, api_endpoint, serialize_request, tools) -
     return _ModelCallState(
         provider=provider,
         model=model,
-        api_endpoint=api_endpoint,
+        api_endpoint=_record_endpoint(api_endpoint),
         input_hash=input_hash,
         started_at=started_at,
         t_start=t_start,
@@ -883,22 +1315,15 @@ def _fail_model_call(state: _ModelCallState, exc: Exception, operator_key: Opera
 
 def _client_endpoint(client: Any, default_base: str, path: str) -> str:
     """The real endpoint for an SDK client, honouring a custom base_url
-    (gateways, Bedrock/Vertex/Azure-compatible proxies). Credentials and
-    query strings in the base URL are never recorded."""
-    from urllib.parse import urlsplit, urlunsplit
-
+    (gateways, Bedrock/Vertex/Azure-compatible proxies). The base URL goes
+    through sanitize_url: credentials, query strings, fragments, ;params and
+    secret-looking path segments are never recorded."""
     base = getattr(client, "base_url", None)
     raw = str(base) if base else default_base
-    try:
-        parts = urlsplit(raw)
-        host = parts.hostname or ""
-        if ":" in host:
-            host = f"[{host}]"
-        netloc = host + (f":{parts.port}" if parts.port else "")
-        clean = urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
-    except ValueError:
-        clean = default_base.rstrip("/")
-    return clean + "/" + path.lstrip("/")
+    clean = sanitize_url(raw)
+    if clean == REDACTED or not _SCHEME_RE.match(clean):
+        clean = default_base
+    return clean.rstrip("/") + "/" + path.lstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -1058,7 +1483,7 @@ class ObservedModelStream:
     ):
         self._provider = provider
         self._model = model
-        self._api_endpoint = api_endpoint
+        self._api_endpoint = _record_endpoint(api_endpoint)
         self._operator_key = operator_key
         self._input_hash = input_hash
         self._started_at = started_at
@@ -1573,7 +1998,7 @@ def _start_tool_call(tool_name, transport, args, tool_version, endpoint,
     else:
         input_hash = "sha256:empty"
     return _ToolCallState(tool_name, transport, input_hash, started_at, t_start,
-                          tool_version, endpoint, tool_definition_hash)
+                          tool_version, _record_endpoint(endpoint), tool_definition_hash)
 
 
 def _finish_tool_call(state: _ToolCallState, result: Any, operator_key: OperatorKey,
@@ -1840,6 +2265,7 @@ def observe_http_tool(
     headers: dict | None = None,
     tool_version: str = "",
     serialize_output: Callable[[Any], Any] | None = None,
+    host_only: bool = False,
 ) -> tuple[Any, Receipt]:
     """Wrap an HTTP API call that is NOT a model call.
 
@@ -1858,6 +2284,11 @@ def observe_http_tool(
             headers in the input hash, pass them in request_body.
         tool_version: Optional.
         serialize_output: Optional output canonicalizer.
+        host_only: Record only scheme://host[:port] as the endpoint.
+
+    The recorded `endpoint` is sanitize_url(url): no userinfo, query,
+    fragment or secret-looking path segments. The full URL only enters the
+    input hash.
 
     Example:
         import requests
@@ -1886,7 +2317,7 @@ def observe_http_tool(
         transport="http",
         args=input_repr,
         tool_version=tool_version,
-        endpoint=url,
+        endpoint=sanitize_url(url, host_only=host_only),
         serialize_output=serialize_output,
     )
 
@@ -2447,15 +2878,15 @@ def unbundle_workflow(
             if member.name == "orchestration.json":
                 f = tar.extractfile(member)
                 if f:
-                    orch_data = json.loads(f.read().decode("utf-8"))
+                    orch_data = loads_receipt_json(f.read())
             elif member.name == "MANIFEST.json":
                 f = tar.extractfile(member)
                 if f:
-                    manifest_data = json.loads(f.read().decode("utf-8"))
+                    manifest_data = loads_receipt_json(f.read())
             elif member.name.startswith("children/"):
                 f = tar.extractfile(member)
                 if f:
-                    children_data[member.name] = json.loads(f.read().decode("utf-8"))
+                    children_data[member.name] = loads_receipt_json(f.read())
 
     if orch_data is None:
         raise ValueError("bundle missing orchestration.json")
@@ -2544,7 +2975,7 @@ def verify_workflow_bundle(bundle_path: Path | str) -> dict:
     # Verify parent
     try:
         pk_bytes = bytes.fromhex(parent.attestation["operator_public_key"])
-        pk = Ed25519PublicKey.from_public_bytes(pk_bytes)
+        pk = load_ed25519_public_key(pk_bytes, "operator public key")
         payload = _signed_payload(parent.execution, parent.provenance)
         sig = bytes.fromhex(parent.attestation["signature"])
         pk.verify(sig, payload)
@@ -2560,7 +2991,7 @@ def verify_workflow_bundle(bundle_path: Path | str) -> dict:
         child_result = {"step": step_name, "ok": False, "message": ""}
         try:
             c_pk_bytes = bytes.fromhex(child.attestation["operator_public_key"])
-            c_pk = Ed25519PublicKey.from_public_bytes(c_pk_bytes)
+            c_pk = load_ed25519_public_key(c_pk_bytes, "operator public key")
             c_payload = _signed_payload(child.execution, child.provenance)
             c_sig = bytes.fromhex(child.attestation["signature"])
             c_pk.verify(c_sig, c_payload)
@@ -2680,6 +3111,46 @@ def _valid_ipv4(candidate: str) -> bool:
 _PII_VALIDATORS = {"iban": _valid_iban, "ipv4": _valid_ipv4}
 
 
+_JSON_ESCAPE_RE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|.)")
+_MAX_PII_STRINGS = 100_000
+
+
+def _pii_strings(value: Any, out: list[str], depth: int = 0) -> None:
+    """Collect the decoded strings (keys, values, numbers) of a JSON-like value."""
+    if len(out) >= _MAX_PII_STRINGS or depth > 64:
+        return
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, bool) or value is None:
+        return
+    elif isinstance(value, (int, float)):
+        out.append(str(value))
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            _pii_strings(k, out, depth + 1)
+            _pii_strings(v, out, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _pii_strings(item, out, depth + 1)
+    elif isinstance(value, bytes):
+        _pii_text_or_json(value.decode("utf-8", errors="replace"), out, depth)
+    else:
+        out.append(str(value))
+
+
+def _pii_text_or_json(text: str, out: list[str], depth: int = 0) -> None:
+    stripped = text.lstrip()
+    if stripped[:1] in ("{", "[", '"'):
+        try:
+            _pii_strings(json.loads(text), out, depth + 1)
+            return
+        except (ValueError, RecursionError):
+            pass
+    # Not (complete) JSON: treat backslash escapes (\n, \t, \u0040...) as
+    # separators so they can't glue a value to a word character.
+    out.append(_JSON_ESCAPE_RE.sub(" ", text))
+
+
 def fingerprint_pii(payload: Any) -> dict[str, int]:
     """Scan a payload for PII-like patterns. Returns {pattern_name: count}.
 
@@ -2687,25 +3158,23 @@ def fingerprint_pii(payload: Any) -> dict[str, int]:
     An empty dict means no known PII patterns matched (which does NOT
     mean the payload is PII-free — only that nothing familiar was found).
 
-    The payload is converted to a string representation before scanning.
-    For dicts and lists, canonical JSON is used.
+    Dicts and lists are walked and every decoded string (keys and values,
+    and numbers) is scanned on its own. Bytes and strings that hold JSON are
+    decoded first; other bytes are decoded as UTF-8 text and backslash
+    escapes are treated as separators.
     """
     if payload is None:
         return {}
 
-    if isinstance(payload, bytes):
-        try:
-            text = payload.decode("utf-8", errors="replace")
-        except Exception:
-            return {}
+    strings: list[str] = []
+    if isinstance(payload, (bytes, bytearray)):
+        _pii_text_or_json(bytes(payload).decode("utf-8", errors="replace"), strings)
     elif isinstance(payload, str):
-        text = payload
-    elif isinstance(payload, (dict, list)):
-        text = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        )
+        _pii_text_or_json(payload, strings)
     else:
-        text = str(payload)
+        _pii_strings(payload, strings)
+    # NUL never matches \s or a word character, so patterns can't span two values.
+    text = "\x00".join(strings)
 
     findings: dict[str, int] = {}
     # A valid IBAN is counted once, as an IBAN: mask it so its digits are
@@ -2736,7 +3205,8 @@ class DataFlowRecord:
     """The host portion of the destination URL. E.g. "api.openai.com"."""
 
     destination_url: str
-    """Full URL, minus query string for privacy. E.g. "https://api.openai.com/v1/chat/completions"."""
+    """sanitize_url() of the URL: no userinfo, query, fragment or secret-looking
+    path segments. E.g. "https://api.openai.com/v1/chat/completions"."""
 
     method: str
     """HTTP method."""
@@ -2779,6 +3249,12 @@ class DataFlowRecord:
     error_message: str = ""
     """If ok=False, short error description."""
 
+    pii_scan_truncated: bool = False
+    """True if only the first pii_scan_bytes of the payload were scanned."""
+
+    pii_scan_bytes: int = 0
+    """Bytes scanned for PII when the scan was truncated."""
+
 
 def sign_data_flow(
     record: DataFlowRecord,
@@ -2809,6 +3285,10 @@ def sign_data_flow(
         execution["pii_fingerprint"] = dict(
             sorted(record.pii_fingerprint.items())
         )
+    if record.pii_scan_truncated:
+        # Receipt bodies carry no booleans: "true" / "false" strings.
+        execution["pii_scan_truncated"] = "true"
+        execution["pii_scan_bytes"] = record.pii_scan_bytes
     if record.declared_allow_list:
         execution["declared_allow_list"] = sorted(record.declared_allow_list)
     if record.error_message:
@@ -2829,16 +3309,6 @@ def _parse_host(url: str) -> str:
         return urlparse(url).hostname or ""
     except Exception:
         return ""
-
-
-def _strip_query(url: str) -> str:
-    """Return the URL without its query string (for privacy)."""
-    try:
-        from urllib.parse import urlparse, urlunparse
-        parts = urlparse(url)
-        return urlunparse((parts.scheme, parts.netloc, parts.path, "", "", ""))
-    except Exception:
-        return url
 
 
 def _coerce_to_bytes(data: Any) -> bytes:
@@ -2867,6 +3337,7 @@ def observe_data_flow(
     scan_pii: bool = True,
     extract_status: Callable[[Any], int] | None = None,
     extract_response_body: Callable[[Any], Any] | None = None,
+    host_only: bool = False,
 ) -> tuple[Any, Receipt]:
     """Wrap an outbound HTTP request, producing a signed data flow receipt.
 
@@ -2892,6 +3363,8 @@ def observe_data_flow(
         extract_response_body: Optional function to extract response body
             for hashing. If None, we try common attributes (.content,
             .text, .json()).
+        host_only: Record only scheme://host[:port] as destination_url.
+            Otherwise the URL is recorded through sanitize_url().
 
     Returns:
         (response, receipt) on success; (None, receipt_with_ok_false)
@@ -2927,7 +3400,7 @@ def observe_data_flow(
 
     # Allow-list check
     destination_host = _parse_host(url)
-    destination_url = _strip_query(url)
+    destination_url = sanitize_url(url, host_only=host_only)
     if declared_allow_list is not None:
         destination_declared = destination_host in declared_allow_list
     else:

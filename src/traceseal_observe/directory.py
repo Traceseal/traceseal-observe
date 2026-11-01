@@ -28,7 +28,9 @@ directory answers that:
   whoever published it, so a key can't be listed without its holder's
   consent.
 - `key_status_at(report, public_key, when)` tells a verifier whether a key
-  was valid for the organisation at a given time.
+  was valid for the organisation at a given time; `check_receipts` verifies
+  each receipt's signature first and uses only signed (or independently
+  trusted) times, never the unsigned attestation.attested_at.
 
 This is a TraceSeal convention, not an external standard. For a legal
 identity binding, sign the directory additionally with an eIDAS
@@ -53,6 +55,16 @@ DIRECTORY_VERSION = "1.0"
 WELL_KNOWN_PATH = "/.well-known/traceseal/operator-keys.json"
 KEY_STATUSES = frozenset({"active", "retired", "revoked"})
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _weak(pk: str) -> bool:
+    from traceseal_observe import is_weak_ed25519_public_key
+    return is_weak_ed25519_public_key(pk)
+
+
+def _load_key(pk: str) -> Any:
+    from traceseal_observe import load_ed25519_public_key
+    return load_ed25519_public_key(pk)
 _UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 _MAX_KEYS = 256
@@ -120,8 +132,8 @@ def _validate(document: Any, *, require_signatures: bool = True) -> None:
         if not isinstance(entry, dict):
             raise DirectoryError("key entries must be objects")
         pk = entry.get("public_key")
-        if not isinstance(pk, str) or not _HEX64.fullmatch(pk) or pk in seen:
-            raise DirectoryError("key public_key must be unique 64-hex")
+        if not isinstance(pk, str) or not _HEX64.fullmatch(pk) or pk in seen or _weak(pk):
+            raise DirectoryError("key public_key must be unique 64-hex and not a small-order Ed25519 key")
         seen.add(pk)
         if entry.get("status") not in KEY_STATUSES:
             raise DirectoryError("key status must be active, retired or revoked")
@@ -158,11 +170,14 @@ def verify_directory(document: Any, *, domain: str | None = None) -> dict[str, A
     valid_signers = set()
     for sig in document["signatures"]:
         pk = sig.get("public_key") if isinstance(sig, dict) else None
-        if pk not in listed:
+        if not isinstance(pk, str) or pk not in listed:
             raise DirectoryError("directory is signed by a key it does not list")
+        signature = sig.get("signature")
+        if not isinstance(signature, str) or len(signature) != 128:
+            raise DirectoryError(f"signature by {pk[:16]}… is malformed")
         try:
-            Ed25519PublicKey.from_public_bytes(bytes.fromhex(pk)).verify(
-                bytes.fromhex(sig.get("signature", "")), body)
+            _load_key(pk).verify(
+                bytes.fromhex(signature), body)
         except (ValueError, InvalidSignature):
             raise DirectoryError(f"signature by {pk[:16]}… is invalid") from None
         valid_signers.add(pk)
@@ -174,10 +189,20 @@ def verify_directory(document: Any, *, domain: str | None = None) -> dict[str, A
             "keys": {k["public_key"]: k for k in document["keys"]}}
 
 
-def key_status_at(report: dict[str, Any], public_key: str, when: str) -> str:
-    """'valid', 'not_listed', 'not_yet_valid', 'expired', 'revoked' or
-    'compromised' for a key at a time, per a verified directory."""
-    entry = report["keys"].get(public_key)
+def key_status_at(report: dict[str, Any], public_key: str, when: str, *,
+                  trusted_time: bool = False) -> str:
+    """'valid', 'not_listed', 'not_yet_valid', 'expired', 'revoked',
+    'compromised' or 'revoked_time_unproven' for a key at a time, per a
+    verified directory.
+
+    trusted_time says whether `when` was established independently of the
+    signer (an RFC 3161 timestamp or witness cosignature), rather than being
+    the time the receipt claims for itself. A revoked key without
+    `compromised_after` gives no safe cut-off: whoever holds it can sign a
+    new receipt claiming any earlier time. So for such a key a self-claimed
+    time before revocation yields 'revoked_time_unproven', not 'valid'.
+    """
+    entry = report["keys"].get(public_key) if isinstance(public_key, str) else None
     if entry is None:
         return "not_listed"
     moment = _utc(when, "when")
@@ -189,6 +214,8 @@ def key_status_at(report: dict[str, Any], public_key: str, when: str) -> str:
         return "revoked"
     if "valid_until" in entry and moment > _utc(entry["valid_until"], "valid_until"):
         return "expired"
+    if entry["status"] == "revoked" and "compromised_after" not in entry and not trusted_time:
+        return "revoked_time_unproven"
     return "valid"
 
 
@@ -205,7 +232,10 @@ def fetch_directory(domain: str, *, timeout: float = 10.0) -> dict[str, Any]:
         raise DirectoryError(f"cannot fetch {url}: {type(exc).__name__}") from None
     if len(data) > _MAX_BYTES:
         raise DirectoryError("directory is too large")
-    document = json.loads(data)
+    try:
+        document = json.loads(data)
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise DirectoryError(f"directory at {url} is not valid JSON ({type(exc).__name__})") from None
     return verify_directory(document, domain=domain)
 
 
@@ -219,25 +249,83 @@ def _signed_time(receipt: Any) -> str | None:
     attestation.attested_at is outside the v1 signature, so anyone holding a
     receipt can edit it; it is never used for key-validity decisions.
     """
+    execution = getattr(receipt, "execution", None)
+    if not isinstance(execution, dict):
+        return None
     for field in _SIGNED_TIME_FIELDS:
-        value = receipt.execution.get(field)
+        value = execution.get(field)
         if isinstance(value, str) and _UTC_RE.fullmatch(value):
+            try:
+                _utc(value, field)
+            except DirectoryError:
+                continue
             return value
     return None
 
 
-def check_receipts(receipts: list[Any], report: dict[str, Any]) -> list[dict[str, Any]]:
+def _signature_problem(receipt: Any) -> str | None:
+    """None if the receipt's signature verifies; otherwise why not. Fails closed."""
+    from traceseal_observe import Receipt, verify_receipt_signature
+
+    if not isinstance(receipt, Receipt):
+        return "not a receipt"
+    for field in ("execution", "provenance", "attestation"):
+        if not isinstance(getattr(receipt, field), dict):
+            return f"{field} is not an object"
+    for field in ("operator_public_key", "signature", "operator_fingerprint"):
+        if not isinstance(receipt.attestation.get(field, ""), str):
+            return f"attestation.{field} is not a string"
+    try:
+        verify_receipt_signature(receipt)
+    except ValueError as exc:
+        return str(exc)
+    except Exception as exc:
+        return f"signature check error: {type(exc).__name__}"
+    return None
+
+
+def _hash(receipt: Any) -> str:
+    try:
+        return receipt.receipt_hash
+    except Exception:
+        return "?"
+
+
+def check_receipts(receipts: list[Any], report: dict[str, Any], *,
+                   trusted_times: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """Status of each receipt's signing key at its signed time.
 
+    Each receipt's signature is verified first; a receipt that does not
+    verify reports "invalid_signature" (its claimed key proves nothing).
     Receipts with no signed time report "unknown_time": their key validity
-    cannot be decided from tamper-evident data.
+    cannot be decided from tamper-evident data. `trusted_times` maps a
+    receipt hash to a time established independently of the signer (e.g. a
+    verified RFC 3161 token over the receipt or its checkpoint); it is used
+    instead of the receipt's own claim and is what lets a revoked key without
+    `compromised_after` be judged. Never raises on hostile receipts.
     """
     out = []
+    trusted_times = trusted_times or {}
     for r in receipts:
-        when = _signed_time(r)
-        pk = r.attestation.get("operator_public_key", "")
-        status = key_status_at(report, pk, when) if isinstance(when, str) else "unknown_time"
-        out.append({"receipt": r.receipt_hash, "public_key": pk, "status": status})
+        digest = _hash(r)
+        attestation = getattr(r, "attestation", None)
+        pk = attestation.get("operator_public_key", "") if isinstance(attestation, dict) else ""
+        pk = pk if isinstance(pk, str) else ""
+        item = {"receipt": digest, "public_key": pk}
+        problem = _signature_problem(r)
+        if problem is not None:
+            out.append({**item, "status": "invalid_signature", "detail": problem})
+            continue
+        trusted = trusted_times.get(digest)
+        when = trusted if isinstance(trusted, str) else _signed_time(r)
+        if when is None:
+            status = "unknown_time"
+        else:
+            try:
+                status = key_status_at(report, pk, when, trusted_time=isinstance(trusted, str))
+            except DirectoryError:
+                status = "unknown_time"
+        out.append({**item, "status": status})
     return out
 
 
@@ -270,13 +358,22 @@ def main(argv: list[str] | None = None) -> int:
             report = verify_directory(json.loads(Path(args.file).read_text("utf-8")), domain=args.domain)
         else:
             report = fetch_directory(args.domain)
-    except (OSError, ValueError) as exc:
-        print(f"[FAIL] {exc}", file=sys.stderr)
+    except (OSError, ValueError, RecursionError) as exc:
+        print(f"[FAIL] {exc if not isinstance(exc, RecursionError) else 'JSON is nested too deeply'}",
+              file=sys.stderr)
         return 1
     print(f"[OK] {report['domain']} lists {len(report['keys'])} key(s), issued {report['issued_at']}")
     bad = 0
-    for item in check_receipts([load_receipt(r) for r in args.receipts], report):
-        print(f"  {item['receipt'][:23]}  key {item['public_key'][:16]}…  {item['status']}")
+    loaded = []
+    for path in args.receipts:
+        try:
+            loaded.append(load_receipt(path))
+        except Exception as exc:
+            print(f"  {path}: unreadable receipt ({type(exc).__name__})")
+            bad += 1
+    for item in check_receipts(loaded, report):
+        detail = f" ({item['detail']})" if item.get("detail") else ""
+        print(f"  {item['receipt'][:23]}  key {item['public_key'][:16]}…  {item['status']}{detail}")
         bad += item["status"] != "valid"
     return 1 if bad else 0
 

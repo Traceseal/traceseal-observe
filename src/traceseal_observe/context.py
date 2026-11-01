@@ -27,12 +27,16 @@ Contexts nest; inner values override outer ones. They follow
 contextvars semantics, so they are safe across threads and asyncio tasks
 (a new thread starts empty unless you copy the context into it).
 
-Principals are recorded as keyed commitments, never raw identifiers:
+User principals are always recorded as keyed commitments, never raw
+identifiers (the constructor refuses anything else for kind="user"):
     ref = "hmac-sha256:" + HMAC-SHA256(pepper, "<kind>:<id>")
-so receipts can be shared without disclosing who the user was. Whoever
-holds the pepper can still find every receipt about a person (GDPR Art. 15
-requests). Destroying the pepper makes those references permanently
-unlinkable while every signature stays valid.
+so receipts can be shared without disclosing the user's identifier. They
+are pseudonymous, not anonymous: the same user gets the same ref in every
+receipt, so receipts about one person can be linked to each other, and
+anything else in or around them (tenant, timing, content) may identify
+them. Whoever holds the pepper can find every receipt about a person (GDPR
+Art. 15 requests). Destroying the pepper stops anyone linking a ref back to
+an identifier, while every signature stays valid.
 """
 
 from __future__ import annotations
@@ -98,6 +102,9 @@ class Principal:
             raise ValueError(f"principal kind must be one of {sorted(PRINCIPAL_KINDS)}")
         if not isinstance(self.ref, str) or _REF_RE.fullmatch(self.ref) is None:
             raise ValueError("principal ref must be hmac-sha256:<hex> or id:<public id>")
+        if self.kind == "user" and not self.ref.startswith("hmac-sha256:"):
+            raise ValueError("user principals must be keyed commitments (hmac-sha256:<hex>); "
+                             "use Principal.user(user_id, pepper=...)")
 
     @classmethod
     def user(cls, user_id: str, *, pepper: bytes) -> Principal:
@@ -308,7 +315,7 @@ def _arguments_hash(arguments: Any) -> str:
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments) if arguments.strip() else {}
-        except ValueError:
+        except (ValueError, RecursionError):
             return sha256_of(arguments)
     return sha256_of(arguments)
 

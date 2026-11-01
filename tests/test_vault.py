@@ -141,7 +141,7 @@ class TestRetentionAndShredding:
         vault.put("x", domain="d")
         vault.set_legal_hold("d")
         with pytest.raises(VaultError, match="legal hold"):
-            vault.shred("d", override_retention=True)
+            vault.shred("d", operator_key=OperatorKey.generate(), override_retention=True)
         vault.set_legal_hold("d", False)
         vault.shred("d")
 

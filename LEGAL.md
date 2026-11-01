@@ -59,7 +59,9 @@ Whether a court or authority accepts receipts as evidence, and how much
 weight it gives them, depends on the forum and national procedural law.
 Only *qualified* electronic time stamps from a provider on the EU trusted
 list carry the presumption of accuracy in eIDAS Art. 41(2). Other
-timestamps are admissible (Art. 41(1)) without that presumption.
+timestamps may not be denied legal effect or admissibility *solely*
+because they are electronic or not qualified (Art. 41(1)); their weight
+is for the court, without that presumption.
 
 ## 4. Regulatory references in this project
 
@@ -68,10 +70,10 @@ The ones that matter most:
 
 | Regime | What TraceSeal references | Status (as reviewed) |
 |---|---|---|
-| EU AI Act (Regulation (EU) 2024/1689) | Arts. 12, 14, 19, 26, 72, 73 | High-risk obligations only. As amended by Regulation (EU) 2026/1744: they apply from **2 December 2027** (Annex III) and **2 August 2028** (Annex I). Art. 50 transparency duties (telling people they deal with AI, marking AI-generated content) are separate; TraceSeal does not perform them. |
-| GDPR (Regulation (EU) 2016/679) | Arts. 4(5), 5, 15, 17, 25, 30, 33, 34 | In force. |
-| NIS2 (Directive (EU) 2022/2555) | Art. 23 | Applies through national transposition, which may differ. |
-| DORA (Regulation (EU) 2022/2554) | Art. 19; Delegated Regulation (EU) 2025/301 | In force for financial entities in scope. |
+| EU AI Act (Regulation (EU) 2024/1689) | Arts. 12, 14, 19, 26, 72, 73 | High-risk obligations only. As amended by Regulation (EU) 2026/1744: they apply from **2 December 2027** (Annex III) and **2 August 2028** (Annex I). Confirm in the consolidated text whether these are fixed dates or the latest dates, and which chapters (including Arts. 72–73) they cover. Art. 50 transparency duties (telling people they deal with AI, marking AI-generated content) are separate; TraceSeal does not perform them. |
+| GDPR (Regulation (EU) 2016/679) | Arts. 4(5), 5, 15, 17, 25, 30, 33, 34, 44 | In force. |
+| NIS2 (Directive (EU) 2022/2555) | Art. 23 | Applies through national transposition, which may differ and may not yet be complete in every Member State. |
+| DORA (Regulation (EU) 2022/2554) | Art. 19; Delegated Regulation (EU) 2025/301 | In force for financial entities in scope. The computed deadlines do not apply any weekend or holiday relief the technical standards may give. |
 | eIDAS (Regulation (EU) 910/2014, as amended by (EU) 2024/1183) | Art. 41 | In force. |
 | ISO/IEC 42001, NIST AI RMF | event logging, monitoring | Voluntary. |
 
@@ -92,7 +94,11 @@ evidence that no incident occurred.
   receipts, the evidence vault and evidence packs.
 - Principal commitments and hashes are **pseudonymised, not anonymised**.
   They stay personal data for anyone who holds the pepper or can guess
-  the input (GDPR Art. 4(5), Recital 26). Treat receipts accordingly.
+  the input (GDPR Art. 4(5), Recital 26). Whether they are personal data
+  for a recipient who cannot re-identify depends on the circumstances
+  (see CJEU, C-413/23 P, *EDPS v SRB*). The same commitment links one
+  user's receipts, and receipts carry some clear-text metadata. Treat
+  receipts as personal data unless counsel advises otherwise.
 - Crypto-shredding makes vault payloads unreadable. It is a technical
   erasure measure, not a legal determination that Art. 17 is satisfied,
   and it does not reach backups or copies held elsewhere. Retaining data

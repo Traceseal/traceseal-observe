@@ -54,7 +54,8 @@ def test_complete_agent_turn(tmp_path, capsys):
             approval = sign_oversight(decision="approved", operator_key=signer,
                                       reviewer=Principal.user(reviewer_id, pepper=PEPPER),
                                       subjects=[model_receipt], tool_call_ids=[call.id],
-                                      presented={"call": call.name}, review_started_at="2026-01-01T00:00:00Z")
+                                      presented={"call": call.name},
+                                      review_started_at=model_receipt.execution["started_at"])
             with caused_by(model_receipt, policy, approval, tool_call_id=call.id):
                 result, tool_receipt = observe_tool(call.name, signer, lambda: run(call), args=call.input)
             receipts += [policy, approval, tool_receipt]

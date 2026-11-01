@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import json
 
 import pytest
@@ -102,7 +104,9 @@ class TestObserveTool:
         )
         assert result is None
         assert receipt.execution["ok"] == "false"
-        assert "bad input" in receipt.execution["error_message"]
+        # 1.6: only the type and a short hash of the message are recorded.
+        digest = hashlib.sha256(b"bad input").hexdigest()[:12]
+        assert receipt.execution["error_message"] == f"ValueError (sha256:{digest})"
 
     def test_timing_recorded(self, key):
         import time as _time
@@ -187,7 +191,8 @@ class TestObserveToolFnDecorator:
         result, receipt = broken()
         assert result is None
         assert receipt.execution["ok"] == "false"
-        assert "oops" in receipt.execution["error_message"]
+        assert receipt.execution["error_message"].startswith("RuntimeError (sha256:")
+        assert "oops" not in receipt.execution["error_message"]
 
 
 class TestObserveMcpTool:

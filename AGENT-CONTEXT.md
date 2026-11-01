@@ -80,13 +80,22 @@ hand-offs across organisations).
 ref = "hmac-sha256:" + hex(HMAC-SHA256(pepper, "<kind>:<id>"))
 ```
 
-- Receipts can be shared with auditors or published without revealing who
-  the user was.
+- Receipts can be shared with auditors without revealing the user's
+  identifier. That is pseudonymity, not anonymity: the same user has the
+  same `ref` in every receipt under one pepper, so all of one person's
+  receipts can be linked to each other, and the linked set (tenant,
+  timing, agent, tools, outcomes) may be enough to single them out. Treat
+  that before publishing receipts widely. Separate peppers per tenant or
+  period limit linkage to that scope.
+- `Principal("user", ref)` refuses any `ref` that is not an
+  `hmac-sha256:` commitment, so a raw user id can't be recorded by
+  constructing a principal directly. Use `Principal.user(id, pepper=...)`.
 - Whoever holds the pepper can find every receipt about a person
   (`find_receipts_for_principal`, `traceseal-trace find-principal`), which
   serves GDPR Art. 15 access requests.
-- **Destroying the pepper** makes those references permanently unlinkable
-  while every signature stays valid. Use one pepper per tenant or per
+- **Destroying the pepper** means nobody can link those references back to
+  an identifier any more (they stay linkable to each other) while every
+  signature stays valid. Use one pepper per tenant or per
   retention period so you can erase at that granularity.
 
 `Principal.public(kind, id)` records a public identifier (`id:<value>`)
@@ -152,8 +161,11 @@ The verifier also reports:
 - causes that weren't supplied (`unresolved_causes`).
 
 Authorisation **errors**:
-- an action whose time (`started_at`, otherwise `observed_at` or
-  `chained_at`) is after `authorization.expires_at`;
+- an action whose signed time (`started_at`, otherwise `observed_at`,
+  `decided_at` or `chained_at`, strict `YYYY-MM-DDTHH:MM:SSZ`) is after
+  `authorization.expires_at`. The unsigned `attestation.attested_at` is
+  never used: a receipt with `expires_at` but no valid signed time is an
+  error (expiry not checked), never a pass;
 - with `required_scopes`, a tool receipt whose context lacks a required
   scope.
 

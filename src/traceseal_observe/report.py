@@ -1,20 +1,24 @@
-"""Compliance evidence packs: verify everything, map it to obligations, sign it.
+"""Evidence packs: verify receipts, map the findings to obligations, sign it.
 
     traceseal-report build receipts/ --checkpoint cp.txt --output pack/ \
-        --require-approval issue_refund --operator-key ops.key
+        --require-approval issue_refund --operator-key ops.key \
+        --operator-pubkey <hex of the operator key(s) the receipts must come from>
 
 produces a directory an auditor can take away:
 
     pack/
       report.md        human-readable findings and control mapping
       report.json      the same, machine-readable, with every verifier report
+                       and the analysis options the pack was built with
       receipts/        copies of every receipt examined
       checkpoints/     checkpoints and timestamp tokens supplied
       manifest.json    SHA-256 of every file above
       pack.receipt.json  operator-signed evidence_pack receipt over the manifest
 
-and `traceseal-report verify-pack pack/` re-checks the manifest, the pack
-signature and every receipt signature, offline.
+and `traceseal-report verify-pack pack/ --operator-pubkey <hex>` checks,
+offline, the manifest, the pack signature against a key you pinned, every
+receipt signature, and re-runs the analysis over the pack's receipts and
+checkpoints to confirm that report.json's findings follow from them.
 
 The control mapping says what evidence exists for each obligation and
 whether the verifiers found problems. It is not a conformity assessment,
@@ -27,15 +31,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
 import shutil
+import stat
 import sys
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from traceseal_observe import Receipt, summarize_data_flows, verify_receipt_signature
 
-PACK_VERSION = "1.0"
+PACK_VERSION = "1.1"
 HIGH_RISK_DATES = ("Applies from 2 December 2027 (Annex III) and 2 August 2028 (Annex I), "
                    "as amended by Regulation (EU) 2026/1744.")
 LEGAL_NOTICE = (
@@ -46,15 +54,36 @@ LEGAL_NOTICE = (
     "depends on your role, whether the system is high-risk, and national law. Laws and dates "
     "change: check the current texts and obtain advice from qualified counsel."
 )
-_TIME_KEYS = ("started_at", "observed_at", "decided_at", "aware_at", "chained_at")
+# Time fields inside the signed execution body. attestation.attested_at is
+# outside the v1 signature (anyone holding a receipt can edit it), so it is
+# never used for period or time calculations.
+_TIME_KEYS = ("chained_at", "started_at", "observed_at", "decided_at", "aware_at",
+              "recorded_at", "verified_at", "reobserved_at")
+_UTC_FMT = "%Y-%m-%dT%H:%M:%SZ"
+_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+_HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
+_OPERATIONAL_TYPES = ("model", "tool", "data_flow", "orchestration", "outcome",
+                      "oversight", "policy_decision", "erasure", "incident")
+RETENTION_DAYS = 183
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or _UTC_RE.fullmatch(value) is None:
+        return None
+    try:
+        return datetime.strptime(value, _UTC_FMT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def _when(r: Receipt) -> str | None:
+    """The receipt's signed time, or None when it has none (unknown)."""
+    ex = r.execution if isinstance(r.execution, dict) else {}
     for key in _TIME_KEYS:
-        value = r.execution.get(key)
-        if isinstance(value, str) and len(value) == 20:
+        value = ex.get(key)
+        if _parse_utc(value) is not None:
             return value
-    return r.attestation.get("attested_at")
+    return None
 
 
 def _sha256_file(path: Path) -> str:
@@ -62,8 +91,83 @@ def _sha256_file(path: Path) -> str:
 
 
 def _days(a: str, b: str) -> float:
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
-    return (datetime.strptime(b, fmt) - datetime.strptime(a, fmt)).total_seconds() / 86400
+    start, end = _parse_utc(a), _parse_utc(b)
+    if start is None or end is None:
+        return 0.0
+    return (end - start).total_seconds() / 86400
+
+
+def _normalise_keys(keys: Any, label: str) -> list[str]:
+    if isinstance(keys, str):
+        keys = [keys]
+    out = []
+    for k in keys or ():
+        if not isinstance(k, str) or not _HEX64.fullmatch(k.strip()):
+            raise ValueError(f"{label}: {k!r} is not a 64-hex Ed25519 public key")
+        out.append(k.strip().lower())
+    return sorted(set(out))
+
+
+def _check_receipt(r: Any, label: str) -> None:
+    """Shape checks plus verify_receipt_signature; raises ValueError only."""
+    if not isinstance(r, Receipt):
+        raise ValueError(f"{label}: not a receipt")
+    for field in ("execution", "provenance", "attestation"):
+        if not isinstance(getattr(r, field), dict):
+            raise ValueError(f"{label}: malformed receipt ({field} is not an object)")
+    if not isinstance(r.receipt_version, str):
+        raise ValueError(f"{label}: malformed receipt (receipt_version is not a string)")
+    for field in ("operator_public_key", "signature", "operator_fingerprint"):
+        if not isinstance(r.attestation.get(field, ""), str):
+            raise ValueError(f"{label}: malformed receipt (attestation.{field} is not a string)")
+    try:
+        verify_receipt_signature(r, label)
+    except ValueError:
+        raise
+    except Exception as exc:  # hostile content must not escape as anything else
+        raise ValueError(f"{label}: signature check error: {type(exc).__name__}") from None
+    ex = r.execution
+    for field in ("receipt_type", "chain_id"):
+        if field in ex and not isinstance(ex[field], str):
+            raise ValueError(f"{label}: malformed receipt (execution.{field} is not a string)")
+
+
+def _signer(r: Receipt) -> str:
+    return r.attestation.get("operator_public_key", "").lower()
+
+
+def _short(r: Receipt) -> str:
+    try:
+        return r.receipt_hash[:23]
+    except Exception:
+        return "?"
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
+
+
+def _robust(fn: Callable[[list[Receipt]], Any], items: list[Receipt], what: str,
+            failures: list[str]) -> Any:
+    """Run a verifier; if hostile input makes it raise, isolate and skip the
+    receipts that make it raise on their own, and report them as failures."""
+    try:
+        return fn(items)
+    except Exception:
+        pass
+    kept = []
+    for r in items:
+        try:
+            fn([r])
+            kept.append(r)
+        except Exception as exc:
+            failures.append(f"{what}: receipt {_short(r)} could not be analysed "
+                            f"({type(exc).__name__}: {exc})")
+    try:
+        return fn(kept)
+    except Exception as exc:
+        failures.append(f"{what} could not run ({type(exc).__name__}: {exc})")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -83,26 +187,44 @@ def analyse(
     require_policy: dict[str, str] | None = None,
     min_review_seconds: int | None = None,
     now: str | None = None,
+    operator_keys: Iterable[str] | None = None,
+    reviewer_keys: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run every verifier and build the evidence summary and control map."""
+    """Run every verifier and build the evidence summary and control map.
+
+    operator_keys pins the Ed25519 public keys (hex) the receipts must be
+    signed by. Receipts signed by any other key are listed in
+    `foreign_key_receipts`, excluded from the analysis, and make `ok` false.
+    Never raises on hostile receipt content: it is reported instead.
+    """
     from traceseal_observe.chain import ChainError, _resolve_checkpoint, verify_chain
     from traceseal_observe.incident import incident_status
     from traceseal_observe.trace import verify_trace
 
-    signature_failures = []
+    pin = _normalise_keys(operator_keys, "operator_keys") if operator_keys is not None else None
+    signature_failures: list[str] = []
+    analysis_failures: list[str] = []
+    warnings: list[str] = []
     valid: list[Receipt] = []
     for i, r in enumerate(receipts):
         try:
-            verify_receipt_signature(r, f"receipt[{i}]")
+            _check_receipt(r, f"receipt[{i}]")
             valid.append(r)
         except ValueError as exc:
             signature_failures.append(str(exc))
+
+    foreign = []
+    if pin is not None:
+        foreign = [{"receipt": r.receipt_hash, "public_key": _signer(r)}
+                   for r in valid if _signer(r) not in pin]
+        valid = [r for r in valid if _signer(r) in pin]
 
     by_type: dict[str, int] = {}
     for r in valid:
         t = r.execution.get("receipt_type", "skill")
         by_type[t] = by_type.get(t, 0) + 1
     times = sorted(t for t in (_when(r) for r in valid) if t)
+    untimed = sum(1 for r in valid if _when(r) is None)
 
     # -- chains --------------------------------------------------------------
     chains: dict[str, list[Receipt]] = {}
@@ -111,59 +233,123 @@ def analyse(
         cid = r.execution.get("chain_id")
         if cid is not None and "chain_seq" in r.execution:
             chains.setdefault(cid, []).append(r)
-        elif r.execution.get("receipt_type") in (
-            "model", "tool", "data_flow", "orchestration", "outcome",
-            "oversight", "policy_decision", "erasure", "incident",
-        ):
+        elif r.execution.get("receipt_type") in _OPERATIONAL_TYPES:
             unchained_ops += 1
     chain_reports = {}
+    chain_extra = {}
     stamps = checkpoint_timestamps or {}
     for cid, members in chains.items():
-        keys = sorted({m.attestation["operator_public_key"] for m in members}
+        keys = sorted({_signer(m) for m in members}
                       | {m.execution["next_public_key"] for m in members
-                         if m.execution.get("receipt_type") == "chain_key_rotation"})
+                         if m.execution.get("receipt_type") == "chain_key_rotation"
+                         and isinstance(m.execution.get("next_public_key"), str)})
         chosen = None
         for note in checkpoints:
             try:
                 _resolve_checkpoint(note, keys, cid, witness_vkeys)
             except (ChainError, ValueError):
                 continue
+            except Exception:  # hostile checkpoint text
+                continue
             chosen = note
-        chain_reports[cid] = verify_chain(
-            members, checkpoint=chosen,
-            checkpoint_timestamps=stamps.get(chosen, []) if chosen else (),
-            tsa_trust_anchors=tsa_trust_anchors, witness_vkeys=witness_vkeys,
-        )
+        try:
+            chain_reports[cid] = verify_chain(
+                members, checkpoint=chosen,
+                checkpoint_timestamps=stamps.get(chosen, []) if chosen else (),
+                tsa_trust_anchors=tsa_trust_anchors, witness_vkeys=witness_vkeys,
+            )
+        except Exception as exc:
+            chain_reports[cid] = {"ok": False, "count": len(members), "first_seq": None,
+                                  "last_seq": None, "gaps": [], "forks": [],
+                                  "errors": [f"chain could not be verified ({type(exc).__name__})"],
+                                  "warnings": [], "rotations": [], "compromised_seqs": [],
+                                  "checkpoint": None}
+        rep = chain_reports[cid]
+        cp = rep.get("checkpoint") or {}
+        chain_times = sorted(t for t in (_parse_utc(m.execution.get("chained_at")) for m in members) if t)
+        span = (chain_times[-1] - chain_times[0]).total_seconds() / 86400 if len(chain_times) > 1 else 0
+        chain_extra[cid] = {
+            "span_days": round(span, 1),
+            # Trusted time: a verified checkpoint that anchors these receipts and
+            # carries a verified TSA token or witness cosignature.
+            "trusted_time": bool(rep["ok"] and cp.get("anchored")
+                                 and (cp.get("timestamps") or cp.get("witnesses"))),
+        }
 
-    trace = verify_trace(valid, required_scopes=required_scopes,
-                         require_approval=require_approval, require_policy=require_policy,
-                         min_review_seconds=min_review_seconds)
-    incidents = incident_status([r for r in valid if r.execution.get("receipt_type") == "incident"], now=now)
-    flows = summarize_data_flows(valid)
+    # -- signer keys: are they one operator? -------------------------------------
+    signer_keys = sorted({_signer(r) for r in valid})
+    parent = {k: k for k in signer_keys}
+
+    def find(k: str) -> str:
+        while parent.setdefault(k, k) != k:
+            k = parent[k]
+        return k
+
+    for rep in chain_reports.values():
+        for rot in rep.get("rotations") or ():
+            a, b = rot.get("previous_public_key"), rot.get("next_public_key")
+            if isinstance(a, str) and isinstance(b, str):
+                parent[find(a.lower())] = find(b.lower())
+    groups = {find(k) for k in signer_keys}
+    if pin is None and len(groups) > 1:
+        warnings.append(
+            f"receipts are signed by {len(signer_keys)} keys not all linked by a verified chain "
+            "rotation, and no operator key was pinned: anyone can add receipts signed by their "
+            "own key. Pin the operator key(s) with operator_keys / --operator-pubkey.")
+    if untimed:
+        warnings.append(f"{untimed} receipt(s) carry no signed time; they are not counted in the period.")
+
+    trace = _robust(lambda rs: verify_trace(rs, required_scopes=required_scopes,
+                                            require_approval=require_approval,
+                                            require_policy=require_policy,
+                                            min_review_seconds=min_review_seconds,
+                                            reviewer_keys=reviewer_keys),
+                    valid, "trace", analysis_failures)
+    if trace is None:
+        trace = {"ok": False, "errors": ["trace verification could not run"], "warnings": [],
+                 "tool_calls": [], "unexecuted_tool_calls": [], "unprompted_tool_receipts": [],
+                 "unresolved_causes": [], "agents": {}, "oversight": [], "policy_decisions": []}
+    incident_receipts = [r for r in valid if r.execution.get("receipt_type") == "incident"]
+    incidents = _robust(lambda rs: incident_status(rs, now=now), incident_receipts,
+                        "incidents", analysis_failures) or []
+    flows = _robust(summarize_data_flows, valid, "data flows", analysis_failures)
+    if flows is None:
+        flows = {"total_calls": 0, "destinations": {}, "undeclared_calls": 0, "pii_summary": {},
+                 "total_payload_bytes": 0, "failed_calls": 0}
     models: dict[str, int] = {}
     served: dict[str, int] = {}
     tools: dict[str, int] = {}
     for r in valid:
         ex = r.execution
         if ex.get("receipt_type") == "model":
-            models[f"{ex.get('provider')}/{ex.get('model')}"] = models.get(f"{ex.get('provider')}/{ex.get('model')}", 0) + 1
+            name = f"{_text(ex.get('provider'))}/{_text(ex.get('model'))}"
+            models[name] = models.get(name, 0) + 1
             if ex.get("served_model"):
-                served[ex["served_model"]] = served.get(ex["served_model"], 0) + 1
+                sm = _text(ex["served_model"])
+                served[sm] = served.get(sm, 0) + 1
         if ex.get("receipt_type") == "tool":
-            tools[ex.get("tool_name", "?")] = tools.get(ex.get("tool_name", "?"), 0) + 1
+            tn = _text(ex.get("tool_name", "?"))
+            tools[tn] = tools.get(tn, 0) + 1
     erasures = [r for r in valid if r.execution.get("receipt_type") == "erasure"]
     with_context = sum(1 for r in valid if isinstance(r.execution.get("context"), dict))
 
     summary = {
         "receipts": len(receipts),
-        "valid_signatures": len(valid),
+        "valid_signatures": len(valid) + len(foreign),
         "signature_failures": signature_failures,
+        "analysis_failures": analysis_failures,
+        "operator_keys": pin,
+        "foreign_key_receipts": foreign,
+        "signer_keys": signer_keys,
+        "warnings": warnings,
         "by_type": dict(sorted(by_type.items())),
         "period": {"first": times[0] if times else None, "last": times[-1] if times else None,
-                   "days": round(_days(times[0], times[-1]), 1) if len(times) > 1 else 0},
-        "chains": {cid: {k: rep[k] for k in ("ok", "count", "first_seq", "last_seq", "gaps",
-                                             "forks", "errors", "warnings", "rotations",
-                                             "compromised_seqs", "checkpoint")}
+                   "days": round(_days(times[0], times[-1]), 1) if len(times) > 1 else 0,
+                   "basis": "signed receipt times (attested_at is never used)"},
+        "chains": {cid: {**{k: rep.get(k) for k in ("ok", "count", "first_seq", "last_seq", "gaps",
+                                                    "forks", "errors", "warnings", "rotations",
+                                                    "compromised_seqs", "checkpoint")},
+                         **chain_extra[cid]}
                    for cid, rep in chain_reports.items()},
         "unchained_operational_receipts": unchained_ops,
         "with_context": with_context,
@@ -171,10 +357,11 @@ def analyse(
         "models_served": dict(sorted(served.items())),
         "tools": dict(sorted(tools.items())),
         "data_flows": flows,
-        "trace": {k: trace[k] for k in ("ok", "errors", "warnings", "tool_calls",
-                                        "unexecuted_tool_calls", "unprompted_tool_receipts",
-                                        "unresolved_causes", "agents", "oversight",
-                                        "policy_decisions")},
+        "trace": {k: trace.get(k, [] if k != "ok" else False)
+                  for k in ("ok", "errors", "warnings", "tool_calls",
+                            "unexecuted_tool_calls", "unprompted_tool_receipts",
+                            "unresolved_causes", "agents", "oversight",
+                            "policy_decisions")},
         "incidents": incidents,
         "erasures": [{"hash": r.receipt_hash, "reason": r.execution.get("reason"),
                       "objects": r.execution.get("object_count"),
@@ -183,23 +370,37 @@ def analyse(
     }
     summary["controls"] = map_controls(summary)
     summary["legal_notice"] = LEGAL_NOTICE
-    summary["ok"] = (
+    summary["ok"] = bool(
         not signature_failures
+        and not analysis_failures
+        and not foreign
         and all(rep["ok"] for rep in chain_reports.values())
         and trace["ok"]
-        and not any(i["missed_deadlines"] for i in incidents)
+        and not any(i.get("missed_deadlines") or i.get("problems") for i in incidents)
     )
     return summary
 
 
-def _status(evidence: bool, issues: list[str]) -> tuple[str, list[str]]:
+def _status(evidence: bool, issues: list[str], *, partial: bool = False) -> tuple[str, list[str]]:
     if issues:
         return "issues", list(issues)
+    if evidence and partial:
+        return "partial", []
     return ("evidence" if evidence else "no evidence"), []
 
 
+def _dedupe(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
+
+
 def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
-    """Map the verified evidence to obligations. Informational only."""
+    """Map the verified evidence to obligations. Informational only.
+
+    A trace error is never dropped: errors a specific row claims (oversight,
+    authorisation, policy) appear there, and *every* trace error appears on
+    Art. 26(5) and NIST AI RMF; errors no specific row claims also appear on
+    Art. 12 and ISO/IEC 42001.
+    """
     chains = s["chains"]
     chain_issues = [
         f"chain {cid}: " + "; ".join(
@@ -212,20 +413,45 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
                if rep.get("checkpoint") and (rep["checkpoint"].get("timestamps")
                                              or rep["checkpoint"].get("witnesses"))]
     trace = s["trace"]
-    oversight_errors = [e for e in trace["errors"] if any(w in e for w in (
+    trace_errors = [str(e) for e in trace["errors"]]
+    if not trace["ok"] and not trace_errors:
+        trace_errors = ["trace verification failed"]
+    # Routing to the specific rows below is a convenience; it is not what keeps
+    # an error visible (see the docstring).
+    oversight_errors = [e for e in trace_errors if any(w in e for w in (
         "approval", "human", "reviewer", "stopped", "rejected", "countersignature"))]
-    authz_errors = [e for e in trace["errors"] if "scope" in e or "expired" in e]
-    policy_errors = [e for e in trace["errors"] if "policy" in e]
-    missed = [f"{i['category']} {i['head'][:15]}: {d['basis']} due {d['due']}"
-              for i in s["incidents"] for d in i["missed_deadlines"]]
+    authz_errors = [e for e in trace_errors if "scope" in e or "expired" in e]
+    policy_errors = [e for e in trace_errors if "policy" in e]
+    claimed = set(oversight_errors) | set(authz_errors) | set(policy_errors)
+    unclaimed = [e for e in trace_errors if e not in claimed]
+    foreign = s.get("foreign_key_receipts") or []
+    integrity = (list(s["signature_failures"]) + list(s.get("analysis_failures") or [])
+                 + ([f"{len(foreign)} receipt(s) signed by a key outside the pinned operator keys"]
+                    if foreign else []))
+    missed = [f"{i.get('category')} {str(i.get('head', ''))[:15]}: {d.get('basis')} due {d.get('due')}"
+              for i in s["incidents"] for d in i.get("missed_deadlines", [])] + [
+        f"{i.get('category')} {str(i.get('head', ''))[:15]}: {p}"
+        for i in s["incidents"] for p in i.get("problems", [])]
+    # An incident receipt that could not be analysed may belong to any regime.
+    incident_failures = [f for f in s.get("analysis_failures") or [] if f.startswith("incidents")]
     ops = sum(n for t, n in s["by_type"].items() if t not in ("skill",))
     period_days = s["period"]["days"]
     flows = s["data_flows"]
+    unchained = s["unchained_operational_receipts"]
+    retention_chains = [cid for cid, rep in chains.items()
+                        if rep.get("trusted_time") and (rep.get("span_days") or 0) >= RETENTION_DAYS]
+    if period_days >= RETENTION_DAYS and retention_chains:
+        retention_status = "evidence"
+    elif ops == 0:
+        retention_status = "no evidence"
+    else:
+        retention_status = "partial"
 
     def control(framework, ref, title, status, evidence, notes="", applies_to=""):
         problems: list[str] = []
         if isinstance(status, tuple):
             status, problems = status
+            problems = _dedupe(problems)
         return {"framework": framework, "ref": ref, "title": title, "status": status,
                 "evidence": evidence, "notes": notes, "problems": problems,
                 "applies_to": applies_to}
@@ -234,17 +460,19 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
     deployer = "Deployers of high-risk AI systems. " + HIGH_RISK_DATES
     out = [
         control("EU AI Act", "Art. 12", "Record-keeping: automatic logging of events",
-                _status(ops > 0, chain_issues + s["signature_failures"]),
+                _status(ops > 0, _dedupe(chain_issues + integrity + unclaimed), partial=unchained > 0),
                 f"{ops} signed operational receipts; {len(chains)} chain(s); "
                 f"{len(anchored)} anchored to a checkpoint; {len(trusted)} with trusted time "
                 f"(TSA/witness); {s['unchained_operational_receipts']} receipts outside any chain.",
-                ("Unchained receipts cannot show completeness. " if s["unchained_operational_receipts"] else "")
+                ("Unchained receipts cannot show completeness. " if unchained else "")
+                + "".join(w + " " for w in s.get("warnings") or [])
                 + "Art. 12 is a design duty on the system; these receipts are evidence that "
                   "logging operated, not a finding that the logging design is sufficient.",
                 high_risk),
         control("EU AI Act", "Art. 12(2)", "Logs enable risk identification, post-market and "
                 "deployer monitoring",
-                _status(s["with_context"] > 0, []),
+                _status(s["with_context"] > 0,
+                        integrity + [e for e in trace_errors if "context" in e] + unclaimed),
                 f"{s['with_context']} receipts carry signed agent/principal/trace context; "
                 f"inputs and outputs committed by hash.",
                 "The extra logging content of Art. 12(3) applies only to remote biometric "
@@ -253,20 +481,24 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
         control("EU AI Act", "Art. 14 / 26(2)", "Human oversight",
                 _status(bool(trace["oversight"]), oversight_errors),
                 f"{len(trace['oversight'])} human decisions "
-                f"({sum(1 for o in trace['oversight'] if o['reviewer_signed'])} reviewer-signed).",
+                f"({sum(1 for o in trace['oversight'] if o['reviewer_signed'] is True)} reviewer-signed).",
                 "Records that oversight took place; whether the oversight measures and the "
                 "reviewers' competence meet Art. 14 and 26(2) is not assessed.",
                 "Art. 14: providers (design). Art. 26(2): deployers (assigning competent people). "
                 + HIGH_RISK_DATES),
         control("EU AI Act", "Art. 19 / 26(6)", "Logs kept for at least six months",
-                "evidence" if period_days >= 183 else ("no evidence" if ops == 0 else "partial"),
-                f"This pack covers {period_days} days ({s['period']['first']} .. {s['period']['last']}).",
-                "Retention is shown by the operator's archive and vault policy; a pack shows the "
+                retention_status,
+                f"This pack covers {period_days} days ({s['period']['first']} .. {s['period']['last']}) "
+                f"by signed receipt times; {len(retention_chains)} chain(s) span six months under "
+                "trusted time (anchored checkpoint with a verified TSA token or witness cosignature).",
+                "'evidence' needs at least 183 days resting on trusted time; otherwise 'partial'. "
+                "A checkpoint's trusted time proves the receipts existed by then, not when each was "
+                "made. Retention is shown by the operator's archive and vault policy; a pack shows the "
                 "period it covers. Art. 26(6) is subject to Union and national data-protection law, "
                 "and logs must be kept under the deployer's control.",
                 "Art. 19: providers. Art. 26(6): deployers. " + HIGH_RISK_DATES),
         control("EU AI Act", "Art. 26(5)", "Deployer monitoring of operation",
-                _status(ops > 0, authz_errors + policy_errors),
+                _status(ops > 0, _dedupe(trace_errors + integrity)),
                 f"{len(trace['unprompted_tool_receipts'])} tool actions without a model cause; "
                 f"{sum(1 for c in trace['tool_calls'] if c['status'] == 'arguments_differ')} with changed arguments; "
                 f"{len(trace['unexecuted_tool_calls'])} requested calls not executed; "
@@ -281,7 +513,7 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
                 high_risk),
         control("EU AI Act", "Art. 73", "Serious incident reporting",
                 _status(any(i["category"] == "serious_incident" for i in s["incidents"]),
-                        [m for m in missed if m.startswith("serious_incident")]),
+                        [m for m in missed if m.startswith("serious_incident")] + incident_failures),
                 f"{sum(1 for i in s['incidents'] if i['category'] == 'serious_incident')} serious incident(s) recorded.",
                 "No incidents recorded is not evidence that none occurred.",
                 high_risk + " Deployers inform the provider immediately (Art. 26(5))."),
@@ -308,20 +540,20 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
                 "Controllers and processors."),
         control("GDPR", "Art. 33 / 34", "Personal data breach notification",
                 _status(any(i["category"] == "personal_data_breach" for i in s["incidents"]),
-                        [m for m in missed if m.startswith("personal_data_breach")]),
+                        [m for m in missed if m.startswith("personal_data_breach")] + incident_failures),
                 f"{sum(1 for i in s['incidents'] if i['category'] == 'personal_data_breach')} breach record(s).",
                 "Only the Art. 33 notification is checked against its deadline; Art. 34 "
                 "communication to data subjects is listed, not tracked.",
                 "Controllers; processors notify the controller (Art. 33(2))."),
         control("NIS2", "Art. 23", "Significant incident reporting",
                 _status(any(i["category"] == "significant_incident" for i in s["incidents"]),
-                        [m for m in missed if m.startswith("significant_incident")]),
+                        [m for m in missed if m.startswith("significant_incident")] + incident_failures),
                 f"{sum(1 for i in s['incidents'] if i['category'] == 'significant_incident')} significant incident(s).",
                 "Checked against the 24h/72h limits only; national transposition may differ.",
                 "Essential and important entities under national NIS2 law."),
         control("DORA", "Art. 19", "Major ICT-related incident reporting",
                 _status(any(i["category"] == "major_ict_incident" for i in s["incidents"]),
-                        [m for m in missed if m.startswith("major_ict_incident")]),
+                        [m for m in missed if m.startswith("major_ict_incident")] + incident_failures),
                 f"{sum(1 for i in s['incidents'] if i['category'] == 'major_ict_incident')} major ICT incident(s).",
                 "Checked against the 4-hour-from-classification rule where classified_at is "
                 "recorded; otherwise the 24-hour limit is shown as unconfirmed, not missed. "
@@ -329,12 +561,12 @@ def map_controls(s: dict[str, Any]) -> list[dict[str, Any]]:
                    "unconfirmed deadline(s)." if any(i.get('unconfirmed_deadlines') for i in s['incidents']) else ""),
                 "EU financial entities within DORA's scope."),
         control("ISO/IEC 42001", "Annex A", "AI system event logging and monitoring",
-                _status(ops > 0, chain_issues),
+                _status(ops > 0, _dedupe(chain_issues + integrity + unclaimed), partial=unchained > 0),
                 "Same evidence as EU AI Act Art. 12 and 26(5).",
                 "Voluntary standard; certification is a matter for an accredited body.",
                 "Organisations adopting the standard."),
         control("NIST AI RMF", "MEASURE / MANAGE", "Tracking, monitoring and incident response",
-                _status(ops > 0, chain_issues + missed),
+                _status(ops > 0, _dedupe(chain_issues + integrity + trace_errors + missed)),
                 "Same evidence as EU AI Act Art. 12, 72 and 73.",
                 "Voluntary framework.",
                 "Organisations adopting the framework."),
@@ -352,7 +584,10 @@ def render_markdown(s: dict[str, Any]) -> str:
     lines.append(f"**Overall:** {'all checks passed' if s['ok'] else 'ISSUES FOUND'}  ")
     p = s["period"]
     lines.append(f"**Period:** {p['first']} .. {p['last']} ({p['days']} days)  ")
-    lines.append(f"**Receipts:** {s['receipts']} ({s['valid_signatures']} with valid signatures)")
+    lines.append(f"**Receipts:** {s['receipts']} ({s['valid_signatures']} with valid signatures)  ")
+    pin = s.get("operator_keys")
+    lines.append("**Operator keys:** " + (", ".join(k[:16] + "…" for k in pin) if pin else
+                                         "not pinned (any signer accepted)"))
     lines += ["", "> **Legal notice.** " + LEGAL_NOTICE, "", "## Controls", "",
               "| Framework | Ref | Obligation | Applies to | Status | Evidence |",
               "|---|---|---|---|---|---|"]
@@ -411,14 +646,66 @@ def render_markdown(s: dict[str, Any]) -> str:
             lines.append(f"  - Follow-up (not tracked): {o['basis']}: {o['step']} ({o['timing']})")
     if s["signature_failures"]:
         lines += ["", "## Signature failures", ""] + [f"- {e}" for e in s["signature_failures"]]
+    if s.get("analysis_failures"):
+        lines += ["", "## Analysis failures", ""] + [f"- {e}" for e in s["analysis_failures"]]
+    if s.get("foreign_key_receipts"):
+        lines += ["", "## Receipts signed by keys outside the pinned operator keys", ""]
+        lines += [f"- {f['receipt'][:23]} signed by {f['public_key'][:16]}…"
+                  for f in s["foreign_key_receipts"]]
+    if s.get("warnings"):
+        lines += ["", "## Warnings", ""] + [f"- {w}" for w in s["warnings"]]
     lines += ["", "## Legal notice", "", LEGAL_NOTICE]
-    lines += ["", "## Verify this pack", "", "```bash", "traceseal-report verify-pack <this directory>", "```", ""]
+    signer = s.get("pack_signer") or "<operator public key hex, obtained out of band>"
+    lines += ["", "## Verify this pack", "",
+              "Obtain the operator's public key from a source you trust (not from this pack), then:",
+              "", "```bash", f"traceseal-report verify-pack <this directory> --operator-pubkey {signer}",
+              "```", ""]
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Building and verifying packs
 # ---------------------------------------------------------------------------
+
+_UNREADABLE = None  # placeholder fields for a receipt file that could not be parsed
+
+
+def _load_receipt_lenient(path: Path) -> Receipt:
+    """Load a receipt file; a file that is not a receipt becomes a placeholder
+    that fails the signature check, so it is reported rather than raised."""
+    from traceseal_observe.chain import load_receipt
+
+    try:
+        return load_receipt(path)
+    except Exception:
+        return Receipt(_UNREADABLE, _UNREADABLE, _UNREADABLE, _UNREADABLE)
+
+
+def _pem(cert: Any) -> str:
+    from cryptography.hazmat.primitives.serialization import Encoding
+
+    return cert.public_bytes(Encoding.PEM).decode("ascii")
+
+
+def _registry_json(registry: Any) -> Any:
+    """A reviewer key registry as plain JSON (sets and frozensets become
+    sorted lists), so it round-trips through report.json for verify-pack."""
+    if not isinstance(registry, dict):
+        return registry
+    return {ref: (sorted(v) if isinstance(v, (set, frozenset, list, tuple)) else v)
+            for ref, v in registry.items()}
+
+
+def _read_reviewer_keys(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    from traceseal_observe.oversight import normalize_reviewer_keys
+    try:
+        data = _load_json(Path(path).read_bytes())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"--reviewer-keys: {exc}") from exc
+    normalize_reviewer_keys(data)  # validate early
+    return data
 
 
 def build_pack(
@@ -430,9 +717,19 @@ def build_pack(
     timestamp_paths: dict[Path, list[Path]] | None = None,
     **analysis_kwargs: Any,
 ) -> dict[str, Any]:
-    from traceseal_observe import sign_execution_receipt
-    from traceseal_observe.chain import load_receipt
+    """Copy receipts and checkpoints into `output`, analyse them, and sign the
+    manifest with `operator_key` (unsigned packs fail verify-pack).
 
+    The analysis options are recorded in report.json["analysis_options"] so
+    verify-pack can re-derive the findings.
+    """
+    from traceseal_observe import sign_execution_receipt
+
+    unknown = set(analysis_kwargs) - {"tsa_trust_anchors", "witness_vkeys", "required_scopes",
+                                      "require_approval", "require_policy", "min_review_seconds",
+                                      "now", "operator_keys", "reviewer_keys"}
+    if unknown:
+        raise TypeError(f"unknown analysis options {sorted(unknown)}")
     out = Path(output)
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"{out} is not empty")
@@ -440,29 +737,71 @@ def build_pack(
     (out / "checkpoints").mkdir(exist_ok=True)
     receipts = []
     for i, path in enumerate(receipt_paths):
-        receipts.append(load_receipt(path))
+        receipts.append(_load_receipt_lenient(Path(path)))
         shutil.copyfile(path, out / "receipts" / f"{i:06d}-{Path(path).name}")
-    notes, stamps = [], {}
-    for path in checkpoint_paths:
+    notes, stamps, cp_records = [], {}, []
+    for i, path in enumerate(checkpoint_paths):
         note = Path(path).read_text("utf-8")
         notes.append(note)
-        shutil.copyfile(path, out / "checkpoints" / Path(path).name)
-        tokens = []
-        for tpath in (timestamp_paths or {}).get(Path(path), []):
+        rel = f"checkpoints/{i:03d}-{Path(path).name}"
+        shutil.copyfile(path, out / rel)
+        tokens, token_rels = [], []
+        for j, tpath in enumerate((timestamp_paths or {}).get(Path(path), [])):
             tokens.append(Path(tpath).read_bytes())
-            shutil.copyfile(tpath, out / "checkpoints" / Path(tpath).name)
-        stamps[note] = tokens
-    summary = analyse(receipts, checkpoints=notes, checkpoint_timestamps=stamps, **analysis_kwargs)
+            trel = f"checkpoints/{i:03d}-{j:03d}-{Path(tpath).name}"
+            shutil.copyfile(tpath, out / trel)
+            token_rels.append(trel)
+        stamps.setdefault(note, []).extend(tokens)
+        cp_records.append({"file": rel, "timestamps": token_rels})
+    generated_at = datetime.now(timezone.utc).strftime(_UTC_FMT)
+    kwargs = dict(analysis_kwargs)
+    if kwargs.get("now") is None:  # absent or explicitly None: the build time
+        kwargs["now"] = generated_at
+    if kwargs.get("operator_keys") is not None:
+        kwargs["operator_keys"] = _normalise_keys(kwargs["operator_keys"], "operator_keys")
+    approval = kwargs.get("require_approval") or ()
+    options = {
+        "checkpoints": cp_records,
+        "tsa_trust_anchors_pem": [_pem(c) for c in kwargs.get("tsa_trust_anchors") or ()],
+        "witness_vkeys": list(kwargs.get("witness_vkeys") or ()),
+        "required_scopes": kwargs.get("required_scopes"),
+        "require_approval": [approval] if isinstance(approval, str) else sorted(approval),
+        "require_policy": kwargs.get("require_policy"),
+        "min_review_seconds": kwargs.get("min_review_seconds"),
+        "now": kwargs["now"],
+        "operator_keys": kwargs.get("operator_keys"),
+        "reviewer_keys": _registry_json(kwargs.get("reviewer_keys")),
+    }
+    # Round-trip the options through JSON (as report.json stores them) and
+    # derive the findings from the files as stored in the pack: the same
+    # code verify_pack runs.
+    options = json.loads(json.dumps(options, default=str))
+    contents = {p.relative_to(out).as_posix(): p.read_bytes()
+                for p in sorted(out.rglob("*")) if p.is_file()}
+    receipt_files = sorted(rel for rel in contents if rel.startswith("receipts/"))
+    receipts = _pack_receipts(contents, receipt_files)
+    summary = _derive(contents, receipts, options)
+    latest = _parse_time(summary["period"].get("last"))
+    as_of = _parse_time(options.get("now"))
+    if latest is not None and as_of is not None and as_of < latest:
+        shutil.rmtree(out)
+        raise ValueError(f"now={options['now']} is before the latest receipt in the pack "
+                         f"({summary['period']['last']}): an analysis cannot be back-dated")
     summary["pack_version"] = PACK_VERSION
-    summary["generated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    (out / "report.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str))
-    (out / "report.md").write_text(render_markdown(summary))
+    summary["generated_at"] = generated_at
+    summary["analysis_options"] = options
+    summary["pack_signer"] = operator_key.public_key_hex if operator_key is not None else None
+    # Exact UTF-8 bytes with LF newlines on every platform: verify-pack
+    # compares these files byte for byte.
+    (out / "report.json").write_bytes(
+        json.dumps(summary, indent=2, sort_keys=True, default=str).encode("utf-8"))
+    (out / "report.md").write_bytes(render_markdown(summary).encode("utf-8"))
     files = sorted(p for p in out.rglob("*") if p.is_file())
     manifest = {
         "pack_version": PACK_VERSION,
-        "files": {str(p.relative_to(out)): _sha256_file(p) for p in files},
+        "files": {p.relative_to(out).as_posix(): _sha256_file(p) for p in files},
     }
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    (out / "manifest.json").write_bytes(json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
     if operator_key is not None:
         receipt = sign_execution_receipt(
             {
@@ -470,6 +809,7 @@ def build_pack(
                 "pack_version": PACK_VERSION,
                 "manifest_hash": _sha256_file(out / "manifest.json"),
                 "file_count": len(manifest["files"]),
+                "receipt_count": len(receipts),
                 "period_start": summary["period"]["first"] or "",
                 "period_end": summary["period"]["last"] or "",
                 "verification_ok": "true" if summary["ok"] else "false",
@@ -477,52 +817,523 @@ def build_pack(
             {"provenance_version": "1.0", "provider_attestation": "none"},
             operator_key,
         )
-        (out / "pack.receipt.json").write_text(receipt.to_json())
+        (out / "pack.receipt.json").write_bytes(receipt.to_json().encode("utf-8"))
+        # Self-check: the pack must re-derive exactly as verify-pack will
+        # re-derive it. Problems that come from the input receipts themselves
+        # (bad signatures, unreadable files) are pack content, not build bugs.
+        check = _verify_pack(out, [operator_key.public_key_hex], now=kwargs["now"])
+        inconsistent = [p for p in check["problems"] if any(marker in p for marker in (
+            "re-derived", "does not match", "analysis_options", "back-dated",
+            "verification_ok", "could not be re-derived", "pack receipt records"))]
+        if inconsistent:
+            raise RuntimeError("internal error: the built pack does not verify consistently: "
+                               + "; ".join(inconsistent[:3]))
     return summary
 
 
-def verify_pack(directory: Path | str) -> dict[str, Any]:
-    """Offline check of a pack: manifest hashes, pack signature, receipts."""
-    from traceseal_observe.chain import load_receipt
+class _PathError(ValueError):
+    pass
 
-    d = Path(directory)
-    problems: list[str] = []
+
+def _safe_rel(rel: Any) -> PurePosixPath:
+    """A manifest path: relative, POSIX, normalised, no '..'."""
+    if not isinstance(rel, str) or not rel or "\x00" in rel or "\\" in rel:
+        raise _PathError(f"unsafe path {rel!r}")
+    p = PurePosixPath(rel)
+    if p.is_absolute() or PureWindowsPath(rel).is_absolute() or PureWindowsPath(rel).drive:
+        raise _PathError(f"absolute path refused: {rel!r}")
+    if any(part in ("..", ".", "") for part in rel.split("/")) or str(p) != rel:
+        raise _PathError(f"path with '..' or non-normal components refused: {rel!r}")
+    return p
+
+
+def _safe_read(root: Path, rel: str, *, limit: int = 64 << 20) -> bytes:
+    """Read root/rel without following symlinks and without leaving root."""
+    p = _safe_rel(rel)
+    cur = root
+    for part in p.parts:
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            raise _PathError(f"missing file {rel}") from None
+        except OSError as exc:
+            raise _PathError(f"cannot read {rel}: {type(exc).__name__}") from None
+        if stat.S_ISLNK(st.st_mode):
+            raise _PathError(f"symlink refused: {rel}")
+    if not stat.S_ISREG(st.st_mode):
+        raise _PathError(f"not a regular file: {rel}")
+    real = os.path.realpath(cur)
+    if os.path.commonpath([real, str(root)]) != str(root):
+        raise _PathError(f"path resolves outside the pack: {rel}")
+    if st.st_size > limit:
+        raise _PathError(f"file too large: {rel}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        manifest = json.loads((d / "manifest.json").read_text("utf-8"))
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "problems": [f"manifest unreadable: {exc}"]}
-    listed = manifest.get("files", {})
-    for rel, digest in listed.items():
-        path = d / rel
-        if not path.is_file():
-            problems.append(f"missing file {rel}")
-        elif _sha256_file(path) != digest:
+        fd = os.open(cur, flags)
+    except OSError as exc:
+        raise _PathError(f"cannot read {rel}: {type(exc).__name__}") from None
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read(limit + 1)
+
+
+def _walk(root: Path, problems: list[str]) -> set[str]:
+    """Regular files under root; symlinks and special files are refused, never followed."""
+    found: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in list(dirnames) + filenames:
+            full = Path(dirpath) / name
+            rel = full.relative_to(root).as_posix()
+            st = os.lstat(full)
+            if stat.S_ISLNK(st.st_mode):
+                problems.append(f"symlink refused: {rel}")
+                if name in dirnames:
+                    dirnames.remove(name)
+            elif stat.S_ISREG(st.st_mode):
+                found.add(rel)
+            elif not stat.S_ISDIR(st.st_mode):
+                problems.append(f"not a regular file: {rel}")
+    return found
+
+
+def _pack_inputs(contents: dict[str, bytes], options: dict[str, Any]) -> tuple[list, dict, list]:
+    """Checkpoint notes, their timestamp tokens and TSA roots, exactly as
+    stored in the pack. Used by build_pack and verify_pack alike."""
+    from traceseal_observe.timestamp import load_certificates
+
+    notes: list[str] = []
+    stamps: dict[str, list[bytes]] = {}
+    for cp in options.get("checkpoints") or []:
+        # Normalise newlines: a CRLF checkpoint file is the same note.
+        note = contents[cp["file"]].decode("utf-8").replace("\r\n", "\n")
+        notes.append(note)
+        stamps.setdefault(note, []).extend(contents[t] for t in cp.get("timestamps") or [])
+    anchors: list[Any] = []
+    for pem in options.get("tsa_trust_anchors_pem") or []:
+        anchors.extend(load_certificates(pem.encode("ascii")))
+    return notes, stamps, anchors
+
+
+def _derive(contents: dict[str, bytes], receipts: list[Receipt],
+            options: dict[str, Any]) -> dict[str, Any]:
+    """The pack's findings from its stored files and recorded options. The
+    ONLY derivation: build_pack writes what this returns and verify_pack
+    re-runs it, so the two can never disagree."""
+    notes, stamps, anchors = _pack_inputs(contents, options)
+    return analyse(
+        receipts, checkpoints=notes, checkpoint_timestamps=stamps,
+        tsa_trust_anchors=anchors, witness_vkeys=options.get("witness_vkeys") or [],
+        required_scopes=options.get("required_scopes"),
+        require_approval=options.get("require_approval") or [],
+        require_policy=options.get("require_policy"),
+        min_review_seconds=options.get("min_review_seconds"),
+        now=options.get("now"), operator_keys=options.get("operator_keys"),
+        reviewer_keys=options.get("reviewer_keys"),
+    )
+
+
+def _pack_receipts(contents: dict[str, bytes], receipt_files: list[str],
+                   problems: list[str] | None = None) -> list[Receipt]:
+    out = []
+    for rel in receipt_files:
+        try:
+            out.append(_receipt_from_bytes(contents[rel], rel))
+        except ValueError as exc:
+            if problems is not None:
+                problems.append(str(exc))
+            out.append(Receipt(_UNREADABLE, _UNREADABLE, _UNREADABLE, _UNREADABLE))
+    return out
+
+
+def _load_json(data: bytes) -> Any:
+    """Parse JSON from a pack or option file. Hostile input (bad UTF-8,
+    invalid JSON, absurd nesting) raises ValueError and nothing else."""
+    try:
+        return json.loads(data.decode("utf-8"))
+    except RecursionError:
+        raise ValueError("JSON is nested too deeply") from None
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"not UTF-8 ({exc.reason})") from None
+
+
+def _receipt_from_bytes(data: bytes, label: str) -> Receipt:
+    """Parse a receipt; raises ValueError (never anything else) if it is not one."""
+    from traceseal_observe import loads_receipt_json
+
+    try:
+        obj = loads_receipt_json(data)
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise ValueError(f"{label}: not valid JSON ({exc})") from None
+    if not isinstance(obj, dict):
+        raise ValueError(f"{label}: not a JSON object")
+    try:
+        return Receipt(obj["receipt_version"], obj["execution"], obj["provenance"], obj["attestation"])
+    except KeyError as exc:
+        raise ValueError(f"{label}: missing {exc}") from None
+
+
+def _fp(public_key: str) -> str:
+    return public_key[:16] + "…"
+
+
+def verify_pack(directory: Path | str, expected_keys: Iterable[str] | str | None, **kwargs: Any
+                ) -> dict[str, Any]:
+    """See _verify_pack. Never raises on hostile pack content: any
+    unexpected error becomes a reported problem and a failed result."""
+    pins_given = expected_keys is not None
+    if not pins_given and not kwargs.get("trust_signer_in_pack"):
+        return _verify_pack(directory, expected_keys, **kwargs)  # raises ValueError (usage)
+    if pins_given:
+        # Normalise once (an iterator can only be read once); usage errors raise.
+        expected_keys = _normalise_keys(expected_keys, "expected_keys")
+    try:
+        return _verify_pack(directory, expected_keys, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - fail closed on anything unexpected
+        return {"ok": False, "pack_result": None, "auditor_result": None, "auditor_findings": [],
+                "analysis_options": None, "signed": False, "pinned": False, "signer": None,
+                "files": 0, "receipts": 0, "warnings": [],
+                "problems": [f"verification failed on malformed pack content "
+                             f"({type(exc).__name__}: {exc})"]}
+
+
+def _verify_pack(
+    directory: Path | str,
+    expected_keys: Iterable[str] | str | None,
+    *,
+    trust_signer_in_pack: bool = False,
+    now: str | None = None,
+    require_approval: Any = (),
+    require_policy: dict[str, str] | None = None,
+    required_scopes: dict[str, Any] | None = None,
+    reviewer_keys: dict[str, Any] | None = None,
+    min_review_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Offline check of a pack. Never raises on hostile pack content.
+
+    Two analyses run. The first re-derives the pack's own findings with the
+    options recorded at build time; report.json and report.md must match
+    it byte for byte, so nothing in them can be edited. The second is the
+    AUDITOR's: it runs on the pack's receipts with the auditor's clock
+    (`now`, default: the current time), the pinned operator keys, the
+    auditor's reviewer key registry if given, and the auditor's
+    requirements added to the recorded ones. Its verdict is
+    `auditor_result`, and the CLI's exit code follows it, so an operator
+    cannot pick a convenient date or drop a requirement to make a pack pass.
+
+    expected_keys: the operator Ed25519 public key(s) (hex) the pack must be
+    signed by, obtained out of band. Required: pass None only together with
+    trust_signer_in_pack=True, in which case any valid signer is accepted
+    and the result says `pinned: False`.
+
+    Checks: every manifest path is relative, inside the pack and not a
+    symlink; every file matches the manifest and no unlisted file exists;
+    pack.receipt.json exists, is validly signed by a pinned key and covers
+    this manifest, file count and receipt count; every receipt signature;
+    and the findings in report.json (overall ok, every control status,
+    receipt counts, period) are re-derived by re-running analyse() over
+    receipts/ and checkpoints/ with the options recorded at build time.
+
+    Returns ok (the pack is intact and its report follows from its
+    contents), pack_result ("passed" / "ISSUES FOUND": what the pack itself
+    found), signed, pinned, signer, files, receipts, problems, warnings.
+    """
+    from traceseal_observe.timestamp import load_certificates
+
+    pins = _normalise_keys(expected_keys, "expected_keys") if expected_keys is not None else []
+    if not pins and not trust_signer_in_pack:
+        raise ValueError("verify_pack needs expected_keys (the operator public key(s) obtained "
+                         "out of band), or trust_signer_in_pack=True")
+    problems: list[str] = []
+    warnings: list[str] = []
+    result: dict[str, Any] = {"ok": False, "pack_result": None, "auditor_result": None,
+                              "auditor_findings": [], "analysis_options": None,
+                              "signed": False, "pinned": False,
+                              "signer": None, "files": 0, "receipts": 0,
+                              "problems": problems, "warnings": warnings}
+    try:
+        root = Path(os.path.realpath(directory))
+        if not root.is_dir():
+            problems.append(f"{directory} is not a directory")
+            return result
+    except OSError as exc:
+        problems.append(f"cannot open pack: {type(exc).__name__}")
+        return result
+
+    # -- manifest ---------------------------------------------------------------
+    try:
+        manifest_bytes = _safe_read(root, "manifest.json")
+        manifest = _load_json(manifest_bytes)
+    except ValueError as exc:
+        problems.append(f"manifest unreadable: {exc}")
+        return result
+    listed = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(listed, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in listed.items()):
+        problems.append("manifest malformed: 'files' must map paths to sha256 digests")
+        return result
+    result["files"] = len(listed)
+    contents: dict[str, bytes] = {}
+    for rel, digest in sorted(listed.items()):
+        try:
+            data = _safe_read(root, rel)
+        except _PathError as exc:
+            problems.append(str(exc))
+            continue
+        if "sha256:" + hashlib.sha256(data).hexdigest() != digest:
             problems.append(f"file changed: {rel}")
-    actual = {str(p.relative_to(d)) for p in d.rglob("*") if p.is_file()}
+        else:
+            contents[rel] = data
+    actual = _walk(root, problems)
     extra = actual - set(listed) - {"manifest.json", "pack.receipt.json"}
     problems += [f"file not in manifest: {rel}" for rel in sorted(extra)]
-    signed = False
-    if (d / "pack.receipt.json").exists():
-        receipt = load_receipt(d / "pack.receipt.json")
+    receipt_files = sorted(rel for rel in contents if rel.startswith("receipts/"))
+    result["receipts"] = len(receipt_files)
+
+    # -- pack signature (mandatory) ----------------------------------------------
+    pack_receipt = None
+    try:
+        pack_bytes = _safe_read(root, "pack.receipt.json")
+    except _PathError as exc:
+        problems.append("pack is not signed (pack.receipt.json missing)" if "missing" in str(exc)
+                        else f"pack.receipt.json: {exc}")
+    else:
         try:
-            verify_receipt_signature(receipt, "pack receipt")
-            if receipt.execution.get("manifest_hash") != _sha256_file(d / "manifest.json"):
-                problems.append("pack receipt does not cover this manifest")
+            pack_receipt = _receipt_from_bytes(pack_bytes, "pack receipt")
+            _check_receipt(pack_receipt, "pack receipt")
+        except ValueError as exc:
+            problems.append(str(exc))
+            pack_receipt = None
+    if pack_receipt is not None:
+        ex = pack_receipt.execution
+        signer = _signer(pack_receipt)
+        result["signer"] = signer
+        if ex.get("receipt_type") != "evidence_pack":
+            problems.append("pack receipt is not an evidence_pack receipt")
+        elif ex.get("manifest_hash") != "sha256:" + hashlib.sha256(manifest_bytes).hexdigest():
+            problems.append("pack receipt does not cover this manifest")
+        else:
+            result["signed"] = True
+        if ex.get("file_count") != len(listed):
+            problems.append(f"pack receipt records {ex.get('file_count')!r} files, manifest lists {len(listed)}")
+        if ex.get("receipt_count") != len(receipt_files):
+            problems.append(f"pack receipt records {ex.get('receipt_count')!r} receipts, "
+                            f"pack holds {len(receipt_files)} (receipts removed or added?)")
+        if pins:
+            if signer in pins:
+                result["pinned"] = True
             else:
-                signed = True
-        except ValueError as exc:
-            problems.append(str(exc))
-    for path in sorted((d / "receipts").glob("*.json")):
+                problems.append(f"pack is signed by {_fp(signer)}, which is not an expected operator key")
+        else:
+            warnings.append(f"SIGNER NOT PINNED: the pack signature was checked against the key the "
+                            f"pack itself names ({signer}). Anyone can re-sign a pack with their own "
+                            "key; confirm this key belongs to the operator out of band.")
+
+    # -- receipts ---------------------------------------------------------------
+    receipts = _pack_receipts(contents, receipt_files, problems)
+    for rel, r in zip(receipt_files, receipts):
+        if r.execution is _UNREADABLE:
+            continue
         try:
-            verify_receipt_signature(load_receipt(path), path.name)
+            _check_receipt(r, rel)
         except ValueError as exc:
             problems.append(str(exc))
-    return {"ok": not problems, "signed": signed, "files": len(listed), "problems": problems}
+
+    # -- re-derive the findings ------------------------------------------------------
+    report = None
+    if "report.json" not in contents:
+        problems.append("report.json missing or not covered by the manifest")
+    else:
+        try:
+            report = _load_json(contents["report.json"])
+        except ValueError as exc:
+            problems.append(f"report.json unreadable: {exc}")
+            report = None
+        if not isinstance(report, dict):
+            problems.append("report.json is not a JSON object")
+            report = None
+    if report is not None:
+        options = report.get("analysis_options")
+        if not isinstance(options, dict):
+            problems.append("report.json records no analysis_options (pack built before 1.6?); "
+                            "its findings cannot be re-derived")
+        else:
+            try:
+                notes, stamps, anchors = _pack_inputs(contents, options)
+                derived = _derive(contents, receipts, options)
+            except Exception as exc:
+                problems.append(f"findings could not be re-derived ({type(exc).__name__}: {exc})")
+            else:
+                problems += _compare(report, derived)
+                problems += _compare_rendered(report, derived, contents)
+                result["analysis_options"] = _options_summary(options)
+                recorded_now = _parse_time(options.get("now"))
+                latest = _parse_time(derived["period"].get("last"))
+                if recorded_now is None:
+                    problems.append("analysis_options.now is missing or malformed")
+                elif latest is not None and recorded_now < latest:
+                    problems.append(f"the pack was analysed 'as of' {options.get('now')}, before its own "
+                                    f"latest receipt ({derived['period']['last']}): a back-dated analysis")
+                result["pack_result"] = "passed" if derived["ok"] else "ISSUES FOUND"
+                if pack_receipt is not None and \
+                        pack_receipt.execution.get("verification_ok") != ("true" if derived["ok"] else "false"):
+                    problems.append(f"pack receipt says verification_ok="
+                                    f"{pack_receipt.execution.get('verification_ok')!r}, but the "
+                                    f"re-derived result is {'passed' if derived['ok'] else 'ISSUES FOUND'}")
+                if options.get("operator_keys") is None:
+                    warnings.append("the pack was built without an operator key pin: receipts from "
+                                    "any signer were analysed")
+                # -- the auditor's own analysis ------------------------------------
+                # Recorded requirements and the auditor's are checked in
+                # separate runs; the auditor result passes only if every run
+                # passes, so nothing an auditor adds can remove a failure.
+                common = dict(
+                    checkpoints=notes, checkpoint_timestamps=stamps,
+                    tsa_trust_anchors=anchors, witness_vkeys=options.get("witness_vkeys") or [],
+                    now=now or _now_utc(),
+                    operator_keys=pins or options.get("operator_keys"),
+                    reviewer_keys=(reviewer_keys if reviewer_keys is not None
+                                   else options.get("reviewer_keys")),
+                )
+                runs = [dict(required_scopes=options.get("required_scopes"),
+                             require_approval=options.get("require_approval") or [],
+                             require_policy=options.get("require_policy"),
+                             min_review_seconds=options.get("min_review_seconds"))]
+                extra_approval = ([require_approval] if isinstance(require_approval, str)
+                                  else list(require_approval or ()))
+                if extra_approval or require_policy or required_scopes or min_review_seconds:
+                    runs.append(dict(required_scopes=required_scopes or None,
+                                     require_approval=extra_approval,
+                                     require_policy=require_policy or None,
+                                     min_review_seconds=min_review_seconds))
+                try:
+                    audits = [analyse(receipts, **common, **run) for run in runs]
+                except Exception as exc:
+                    problems.append(f"auditor analysis failed ({type(exc).__name__}: {exc})")
+                else:
+                    passed = all(a["ok"] for a in audits)
+                    result["auditor_result"] = "passed" if passed else "ISSUES FOUND"
+                    result["auditor_findings"] = _dedupe(
+                        [f for a in audits for f in _findings(a)])
+    problems[:] = _dedupe(problems)
+    result["ok"] = not problems
+    return result
+
+
+def _scope_args(items: list[str]) -> dict[str, list[str]]:
+    """--require-scope TOOL=SCOPE (repeatable): every scope is kept."""
+    return _union_scopes(*({t: [sc]} for t, _, sc in (i.partition("=") for i in items))) or {}
+
+
+def _union_scopes(*maps: Any) -> dict[str, list[str]] | None:
+    """Merge scope requirements per tool, keeping every scope from every
+    map, so an auditor requirement can only add to the recorded ones."""
+    out: dict[str, set[str]] = {}
+    for m in maps:
+        for tool, scopes in (m or {}).items():
+            values = [scopes] if isinstance(scopes, str) else list(scopes or [])
+            out.setdefault(tool, set()).update(v for v in values if isinstance(v, str))
+    return {tool: sorted(v) for tool, v in sorted(out.items())} or None
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _options_summary(options: dict[str, Any]) -> dict[str, Any]:
+    keys = ("now", "operator_keys", "require_approval", "require_policy", "required_scopes",
+            "min_review_seconds", "witness_vkeys")
+    out = {k: options.get(k) for k in keys}
+    out["reviewer_keys"] = sorted(options.get("reviewer_keys") or {}) or None
+    out["checkpoints"] = len(options.get("checkpoints") or [])
+    return out
+
+
+def _findings(summary: dict[str, Any]) -> list[str]:
+    out = [f"{c['framework']} {c['ref']}: {c['status']}" + (
+        f" ({'; '.join(c['problems'][:2])})" if c.get("problems") else "")
+        for c in summary["controls"] if c["status"] == "issues"]
+    out += [f"incident {i.get('category')}: MISSED {d.get('basis')} due {d.get('due')}"
+            for i in summary["incidents"] for d in i.get("missed_deadlines", [])]
+    out += [f"trace: {e}" for e in summary["trace"]["errors"][:20]]
+    return _dedupe(out)
+
+
+def _expected_report(report: dict[str, Any], derived: dict[str, Any]) -> dict[str, Any]:
+    expected = dict(derived)
+    for k in ("pack_version", "generated_at", "analysis_options", "pack_signer"):
+        if k in report:
+            expected[k] = report[k]
+    return expected
+
+
+def _compare_rendered(report: dict[str, Any], derived: dict[str, Any],
+                      contents: dict[str, bytes]) -> list[str]:
+    """report.json and report.md must be exactly what build_pack writes for
+    the re-derived findings: no field or sentence can be edited."""
+    out = []
+    expected = _expected_report(report, derived)
+    want_json = json.dumps(expected, indent=2, sort_keys=True, default=str).encode("utf-8")
+    if contents.get("report.json") != want_json:
+        try:
+            normalised = json.loads(want_json)
+        except ValueError:
+            normalised = {}
+        changed = sorted(k for k in set(normalised) | set(report)
+                         if normalised.get(k) != report.get(k))
+        out.append("report.json does not match the re-derived findings"
+                   + (f" (fields: {', '.join(changed[:8])})" if changed else ""))
+    want_md = render_markdown(expected).encode("utf-8")
+    if "report.md" not in contents:
+        out.append("report.md missing or not covered by the manifest")
+    elif contents["report.md"] != want_md:
+        out.append("report.md does not match the re-derived findings")
+    return out
+
+
+def _compare(report: dict[str, Any], derived: dict[str, Any]) -> list[str]:
+    out = []
+    if report.get("ok") is not derived["ok"]:
+        out.append(f"report.json says ok={report.get('ok')!r}, re-derived ok={derived['ok']}")
+    for field in ("receipts", "valid_signatures"):
+        if report.get(field) != derived[field]:
+            out.append(f"report.json says {field}={report.get(field)!r}, re-derived {derived[field]}")
+    period = report.get("period") if isinstance(report.get("period"), dict) else {}
+    for field in ("first", "last", "days"):
+        if period.get(field) != derived["period"][field]:
+            out.append(f"report.json period.{field}={period.get(field)!r}, "
+                       f"re-derived {derived['period'][field]!r}")
+    stated = {}
+    controls = report.get("controls")
+    if isinstance(controls, list):
+        for c in controls:
+            if isinstance(c, dict):
+                stated[(_text(c.get("framework")), _text(c.get("ref")))] = c.get("status")
+    else:
+        out.append("report.json controls are malformed")
+    for c in derived["controls"]:
+        key = (c["framework"], c["ref"])
+        if key not in stated:
+            out.append(f"report.json is missing control {key[0]} {key[1]}")
+        elif stated[key] != c["status"]:
+            out.append(f"control {key[0]} {key[1]}: report.json says {stated[key]!r}, "
+                       f"re-derived {c['status']!r}")
+    extra = set(stated) - {(c["framework"], c["ref"]) for c in derived["controls"]}
+    out += [f"report.json lists unknown control {a} {b}" for a, b in sorted(extra)]
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="traceseal-report",
-                                     description="Build or verify a compliance evidence pack.")
+                                     description="Build or verify an evidence pack.")
     sub = parser.add_subparsers(dest="command", required=True)
     b = sub.add_parser("build")
     b.add_argument("inputs", nargs="+", help="receipt files or directories")
@@ -535,18 +1346,78 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--require-policy", action="append", default=[], metavar="TOOL=POLICY")
     b.add_argument("--require-scope", action="append", default=[], metavar="TOOL=SCOPE")
     b.add_argument("--min-review-seconds", type=int)
+    b.add_argument("--reviewer-keys", metavar="FILE",
+                   help="JSON map of reviewer ref to Ed25519 public key(s); countersignatures "
+                        "count as reviewer-signed only when the key is registered")
     b.add_argument("--operator-key", help="raw Ed25519 key file to sign the pack")
+    b.add_argument("--operator-pubkey", action="append", default=[], metavar="HEX",
+                   help="pin the operator public key(s) receipts must be signed by (repeatable); "
+                        "receipts signed by other keys are excluded and fail the pack")
     v = sub.add_parser("verify-pack")
     v.add_argument("directory")
+    v.add_argument("--operator-pubkey", action="append", default=[], metavar="HEX",
+                   help="operator public key the pack must be signed by, obtained out of band "
+                        "(repeatable). Required unless --trust-signer-in-pack.")
+    v.add_argument("--trust-signer-in-pack", action="store_true",
+                   help="accept whichever key signed the pack (NOT pinned: anyone can re-sign a pack)")
+    v.add_argument("--now", help="the auditor's 'as of' time (UTC YYYY-MM-DDTHH:MM:SSZ); "
+                                 "default: the current time")
+    v.add_argument("--require-approval", action="append", default=[])
+    v.add_argument("--require-policy", action="append", default=[], metavar="TOOL=POLICY")
+    v.add_argument("--require-scope", action="append", default=[], metavar="TOOL=SCOPE")
+    v.add_argument("--min-review-seconds", type=int)
+    v.add_argument("--reviewer-keys", metavar="FILE",
+                   help="the auditor's reviewer key registry (overrides the one in the pack)")
     args = parser.parse_args(argv)
 
     if args.command == "verify-pack":
-        result = verify_pack(args.directory)
-        print(f"[{'OK' if result['ok'] else 'FAIL'}] {result.get('files', 0)} files, "
-              f"pack signature: {'valid' if result.get('signed') else 'absent'}")
+        if not args.operator_pubkey and not args.trust_signer_in_pack:
+            print("traceseal-report verify-pack: refusing to verify without a pinned signer. Pass "
+                  "--operator-pubkey <hex> with the operator's public key obtained out of band, or "
+                  "--trust-signer-in-pack to accept whichever key signed the pack (unsafe: anyone "
+                  "can re-sign a pack).", file=sys.stderr)
+            return 2
+        vpairs = lambda items: {k: v for k, _, v in (i.partition("=") for i in items)}  # noqa: E731
+
+        policy_tools = [i.partition("=")[0] for i in args.require_policy]
+        if len(policy_tools) != len(set(policy_tools)):
+            print("traceseal-report verify-pack: --require-policy names the same tool twice; "
+                  "a tool can require one policy per run", file=sys.stderr)
+            return 2
+        try:
+            if args.now is not None and _parse_time(args.now) is None:
+                raise ValueError("--now must be UTC YYYY-MM-DDTHH:MM:SSZ")
+            result = verify_pack(args.directory, args.operator_pubkey or None,
+                                 trust_signer_in_pack=args.trust_signer_in_pack,
+                                 now=args.now, require_approval=args.require_approval,
+                                 require_policy=vpairs(args.require_policy) or None,
+                                 required_scopes=_scope_args(args.require_scope) or None,
+                                 reviewer_keys=_read_reviewer_keys(args.reviewer_keys),
+                                 min_review_seconds=args.min_review_seconds)
+        except ValueError as exc:
+            print(f"traceseal-report verify-pack: {exc}", file=sys.stderr)
+            return 2
+        for w in result["warnings"]:
+            print(f"WARNING: {w}")
+        signer = result.get("signer")
+        sig = ("valid" if result["signed"] else "INVALID OR ABSENT")
+        pin = ("pinned" if result["pinned"] else "NOT PINNED") if signer else ""
+        print(f"[{'OK' if result['ok'] else 'FAIL'}] {result['files']} files, {result['receipts']} receipts, "
+              f"pack signature: {sig}" + (f" by {_fp(signer)} ({pin})" if signer else ""))
+        print(f"  pack result (as built): {result['pack_result'] or 'unknown (not re-derived)'}")
+        print(f"  auditor result (your clock and requirements): "
+              f"{result['auditor_result'] or 'unknown'}")
+        opts = result.get("analysis_options") or {}
+        if opts:
+            print("  recorded analysis options: " + ", ".join(
+                f"{k}={v}" for k, v in opts.items() if v not in (None, [], {}, 0)))
+        for finding in result["auditor_findings"][:30]:
+            print(f"  - {finding}")
         for problem in result["problems"]:
             print(f"  {problem}")
-        return 0 if result["ok"] else 1
+        if not result["ok"]:
+            return 1
+        return 0 if result["auditor_result"] == "passed" else 3
 
     from traceseal_observe import OperatorKey
     from traceseal_observe.chain import _read_certs
@@ -560,16 +1431,26 @@ def main(argv: list[str] | None = None) -> int:
         cp, _, token = item.partition("=")
         stamps.setdefault(Path(cp), []).append(Path(token))
     pairs = lambda items: {k: v for k, _, v in (i.partition("=") for i in items)}  # noqa: E731
-    summary = build_pack(
-        args.output, paths,
-        operator_key=OperatorKey.load_from_file(args.operator_key) if args.operator_key else None,
-        checkpoint_paths=[Path(c) for c in args.checkpoint], timestamp_paths=stamps,
-        tsa_trust_anchors=_read_certs(args.tsa_root), witness_vkeys=args.witness_vkey,
-        required_scopes=pairs(args.require_scope), require_approval=args.require_approval,
-        require_policy=pairs(args.require_policy), min_review_seconds=args.min_review_seconds,
-    )
+    try:
+        summary = build_pack(
+            args.output, paths,
+            operator_key=OperatorKey.load_from_file(args.operator_key) if args.operator_key else None,
+            checkpoint_paths=[Path(c) for c in args.checkpoint], timestamp_paths=stamps,
+            tsa_trust_anchors=_read_certs(args.tsa_root), witness_vkeys=args.witness_vkey,
+            required_scopes=_scope_args(args.require_scope), require_approval=args.require_approval,
+            require_policy=pairs(args.require_policy), min_review_seconds=args.min_review_seconds,
+            operator_keys=args.operator_pubkey or None,
+            reviewer_keys=_read_reviewer_keys(args.reviewer_keys),
+        )
+    except (OSError, ValueError) as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 2
     print(f"[{'OK' if summary['ok'] else 'ISSUES'}] wrote {args.output}: "
           f"{summary['valid_signatures']} receipts, {len(summary['chains'])} chain(s)")
+    if not args.operator_key:
+        print("  WARNING: pack is unsigned (no --operator-key); verify-pack will reject it")
+    for w in summary["warnings"]:
+        print(f"  WARNING: {w}")
     for c in summary["controls"]:
         print(f"  {c['framework']} {c['ref']}: {c['status']}")
     return 0 if summary["ok"] else 1

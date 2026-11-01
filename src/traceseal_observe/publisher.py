@@ -137,7 +137,8 @@ def verify_detached_publisher_signature(
                 "publisher_fingerprint_mismatch",
             )
     try:
-        key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(encoded_key))
+        from traceseal_observe import load_ed25519_public_key
+        key = load_ed25519_public_key(encoded_key, "publisher key")
         key.verify(bytes.fromhex(value["value"]), payload)
     except (InvalidSignature, ValueError) as exc:
         raise PublisherAttestationError(

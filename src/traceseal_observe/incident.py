@@ -41,6 +41,7 @@ INCIDENT_STATUSES = frozenset({"detected", "reported", "mitigated", "closed"})
 
 _UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 _TEXT_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
+_SHA_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def _utc(value: str, label: str) -> datetime:
@@ -290,7 +291,17 @@ def sign_incident(
     if classified_at is not None:
         execution["classified_at"] = classified_at
     if supersedes is not None:
+        prior = getattr(supersedes, "execution", None)
+        if isinstance(prior, dict) and prior.get("category") != category:
+            raise ValueError(
+                "supersedes a stage of another category: an incident keeps its root "
+                "category; record a new incident (citing this one in affected_receipts)")
         execution["supersedes"] = _receipt_hash(supersedes)
+    # Signed so incident_status() can recompute the deadlines from the facts.
+    if death:
+        execution["death"] = "true"
+    if widespread:
+        execution["widespread"] = "true"
     deadlines = reporting_deadlines(category, aware_at, death=death, widespread=widespread,
                                     classified_at=classified_at)
     if deadlines:
@@ -309,74 +320,207 @@ def _definitive(d: dict[str, str], category: Any) -> bool:
     return not (category == "major_ict_incident" and "classified_at" not in d)
 
 
-def _strictest_deadlines(history: list[Any]) -> list[dict[str, str]]:
-    """Resolve each (regime, step) deadline across every stage of an incident.
+def _parse(value: Any) -> datetime | None:
+    if isinstance(value, str) and _UTC_RE.fullmatch(value):
+        return _utc(value, "time")
+    return None
 
-    A later stage must not loosen a deadline an earlier stage established
-    (for example a closing record that omits death, widespread or
-    classified_at). Definitive deadlines win over unconfirmed ones; among
-    the same kind, the earliest due time wins."""
-    best: dict[tuple[str, str], dict[str, str]] = {}
+
+def _rank(d: dict[str, str], category: Any) -> tuple[int, datetime]:
+    return (0 if _definitive(d, category) else 1, _utc(d["due"], "due"))
+
+
+def _resolve_deadlines(
+    category: str, history: list[Any], aware_at: str, problems: list[str]
+) -> list[dict[str, str]]:
+    """Deadlines for an incident, recomputed from its root category and the
+    earliest awareness time, with the strictest facts any stage records
+    (death, widespread, earliest classification). The signed `deadlines` of
+    stages of the same category may only make a deadline stricter, never
+    looser; an empty or missing `deadlines` field drops nothing."""
+    death = any(h.execution.get("death") == "true" for h in history)
+    widespread = any(h.execution.get("widespread") == "true" for h in history)
+    classified = None
+    if category == "major_ict_incident":
+        aware = _utc(aware_at, "aware_at")
+        times = []
+        for h in history:
+            if "classified_at" not in h.execution or h.execution.get("category") != category:
+                continue
+            t = _parse(h.execution["classified_at"])
+            if t is None:
+                problems.append("stage has a malformed classified_at")
+            elif t < aware:
+                problems.append("stage has classified_at before the earliest aware_at")
+            else:
+                times.append(t)
+        classified = _fmt(min(times)) if times else None
+    computed = reporting_deadlines(category, aware_at, death=death, widespread=widespread,
+                                   classified_at=classified)
+    best: dict[tuple[str, str], dict[str, str]] = {
+        (d["regime"], d["step"]): d for d in computed
+    }
     for h in history:
-        category = h.execution.get("category")
-        for d in h.execution.get("deadlines", []):
-            key = (d.get("regime", ""), d.get("step", ""))
-            rank = (0 if _definitive(d, category) else 1, _utc(d["due"], "due"))
+        if h.execution.get("category") != category:
+            continue
+        signed = h.execution.get("deadlines", [])
+        if not isinstance(signed, list):
+            problems.append("stage has a malformed deadlines field")
+            continue
+        for d in signed:
+            if (not isinstance(d, dict) or not isinstance(d.get("regime"), str)
+                    or not isinstance(d.get("step"), str) or _parse(d.get("due")) is None):
+                problems.append("stage has a malformed deadline (needs regime, step and a UTC due)")
+                continue
+            key = (d["regime"], d["step"])
             cur = best.get(key)
-            if cur is None or rank < (0 if _definitive(cur, category) else 1, _utc(cur["due"], "due")):
+            if cur is None:
+                best[key] = d  # an extra signed deadline only adds an obligation
+                continue
+            new_rank, cur_rank = _rank(d, category), _rank(cur, category)
+            # Stricter only, and never less certain: an unconfirmed estimate
+            # must not replace a definitive deadline, even if it is earlier
+            # (it would turn a missed definitive deadline into "unconfirmed").
+            if new_rank[0] > cur_rank[0]:
+                continue
+            if new_rank[1] < cur_rank[1] or (new_rank[1] == cur_rank[1] and new_rank < cur_rank):
                 best[key] = d
     return list(best.values())
 
 
+def _strictest_deadlines(history: list[Any]) -> list[dict[str, str]]:
+    """Back-compatible helper: the deadlines incident_status() resolves for
+    a history (head first, root last)."""
+    problems: list[str] = []
+    root = history[-1].execution
+    awares = [t for t in (_parse(h.execution.get("aware_at")) for h in history) if t]
+    if root.get("category") not in INCIDENT_CATEGORIES or not awares:
+        return []
+    return _resolve_deadlines(root["category"], history, _fmt(min(awares)), problems)
+
+
+def _supersedes(receipt: Any, problems: list[str]) -> str | None:
+    value = receipt.execution.get("supersedes")
+    if value is None:
+        return None
+    if isinstance(value, str) and _SHA_RE.fullmatch(value):
+        return value
+    problems.append(f"stage {receipt.receipt_hash[:15]}: supersedes is malformed")
+    return None
+
+
 def incident_status(incidents: list[Any], *, now: str | None = None) -> list[dict[str, Any]]:
     """Collapse incident receipts into current state per incident, and flag
-    deadlines that passed without a 'reported' record."""
+    deadlines that passed without a 'reported' record.
+
+    An incident is identified by its root stage (the end of the supersedes
+    chain). Its category is the root's: a later stage cannot relabel it,
+    and a category change is reported in "problems". Deadlines are
+    recomputed from the root category and the earliest aware_at of any
+    stage (see _resolve_deadlines). Only stages with status "reported" of
+    the root category count as reports, and only with a reported_at at or
+    after the earliest aware_at. Malformed values never raise: they are
+    listed in "problems" and the value is ignored."""
     from traceseal_observe import _now_iso
 
     moment = _utc(now or _now_iso(), "now")
     by_hash = {r.receipt_hash: r for r in incidents}
-    superseded = {r.execution.get("supersedes") for r in incidents}
+    early_problems: dict[str, list[str]] = {}
+    links: dict[str, str | None] = {}
+    for digest, r in by_hash.items():
+        early_problems[digest] = []
+        links[digest] = _supersedes(r, early_problems[digest])
+    superseded = {v for v in links.values() if v is not None}
     out = []
     for digest, r in by_hash.items():
         if digest in superseded:
             continue
+        problems = list(early_problems[digest])
         history = [r]
-        cursor = r.execution.get("supersedes")
-        while cursor in by_hash:
+        seen = {digest}
+        cursor = links[digest]
+        while cursor in by_hash and cursor not in seen:
+            seen.add(cursor)
             history.append(by_hash[cursor])
-            cursor = by_hash[cursor].execution.get("supersedes")
-        reported = [h.execution["reported_at"] for h in history if "reported_at" in h.execution]
-        first_report = min(reported) if reported else None
-        overdue = []
-        unconfirmed = []
-        deadlines = _strictest_deadlines(history)
+            problems.extend(early_problems[cursor])
+            cursor = links[cursor]
+        if cursor is not None and cursor not in by_hash:
+            problems.append(f"superseded stage {cursor[:15]} not supplied; root may be missing")
+        root = history[-1]
+        category = root.execution.get("category")
+        if category not in INCIDENT_CATEGORIES:
+            problems.append(f"root stage has an invalid category {category!r}")
+        for h in history[:-1]:
+            if h.execution.get("category") != category:
+                problems.append(
+                    f"stage {h.receipt_hash[:15]} changes the category from {category!r} to "
+                    f"{h.execution.get('category')!r}; the incident keeps its root category")
+        awares = []
+        for h in history:
+            t = _parse(h.execution.get("aware_at"))
+            if t is None:
+                problems.append(f"stage {h.receipt_hash[:15]} has a malformed aware_at")
+            else:
+                awares.append(t)
+        aware = min(awares) if awares else None
+        reported = []
+        for h in history:
+            ex = h.execution
+            if "reported_at" not in ex:
+                continue
+            t = _parse(ex["reported_at"])
+            if t is None:
+                problems.append(f"stage {h.receipt_hash[:15]} has a malformed reported_at")
+            elif ex.get("status") != "reported" or ex.get("category") != category:
+                continue
+            elif aware is not None and t < aware:
+                problems.append(f"stage {h.receipt_hash[:15]} has reported_at before the "
+                                "earliest aware_at; not counted")
+            else:
+                root_aware = _parse(root.execution.get("aware_at"))
+                if root_aware is not None and t < root_aware:
+                    problems.append(
+                        f"stage {h.receipt_hash[:15]} says the incident was reported at "
+                        f"{_fmt(t)}, before the root stage's aware_at {_fmt(root_aware)}")
+                reported.append(t)
+        first_report = _fmt(min(reported)) if reported else None
+        overdue: list[dict[str, Any]] = []
+        unconfirmed: list[dict[str, Any]] = []
+        deadlines: list[dict[str, str]] = []
+        if category in INCIDENT_CATEGORIES and aware is not None:
+            deadlines = _resolve_deadlines(category, history, _fmt(aware), problems)
+        elif category in INCIDENT_CATEGORIES:
+            problems.append("no valid aware_at: deadlines cannot be computed")
+        first_dt = min(reported) if reported else None
         for d in deadlines:
             due = _utc(d["due"], "due")
-            if not _definitive(d, r.execution.get("category")):
+            if not _definitive(d, category):
                 # The real deadline depends on a fact the record doesn't hold
                 # (e.g. DORA classification time): never call it missed.
-                if (first_report is not None and _utc(first_report, "reported_at") > due) or (
-                        first_report is None and moment > due):
+                if (first_dt is not None and first_dt > due) or (first_dt is None and moment > due):
                     unconfirmed.append({**d, "first_reported_at": first_report})
                 continue
-            if first_report is not None:
-                if _utc(first_report, "reported_at") > due:
+            if first_dt is not None:
+                if first_dt > due:
                     overdue.append({**d, "reported_late": first_report})
             elif moment > due:
                 overdue.append({**d, "unreported": True})
         out.append({
             "head": digest,
-            "category": r.execution.get("category"),
+            "root": root.receipt_hash,
+            "category": category,
             "severity": r.execution.get("severity"),
             "status": r.execution.get("status"),
             "title": r.execution.get("title"),
-            "aware_at": r.execution.get("aware_at"),
+            "aware_at": _fmt(aware) if aware is not None else None,
             "first_reported_at": first_report,
             "stages": len(history),
             "deadlines": deadlines,
             "missed_deadlines": overdue,
             "unconfirmed_deadlines": unconfirmed,
-            "related_obligations": r.execution.get("related_obligations", []),
+            "related_obligations": (related_obligations(category)
+                                    if category in INCIDENT_CATEGORIES else []),
             "affected_receipts": r.execution.get("affected_receipt_hashes", []),
+            "problems": problems,
         })
     return out
