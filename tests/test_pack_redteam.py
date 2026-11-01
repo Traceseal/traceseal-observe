@@ -594,3 +594,14 @@ class TestDirectoryRedTeam:
         assert check_receipts([r], rep, trusted_times={r.receipt_hash: "2026-10-02T00:00:00Z"})[0]["status"] == "revoked"
         r.attestation["attested_at"] = "2026-01-02T00:00:00Z"  # unsigned: ignored
         assert check_receipts([r], rep)[0]["status"] == "revoked_time_unproven"
+
+
+def test_pack_reviewer_key_registry_is_recorded_and_rederived(tmp_path):
+    """Packs can verify reviewer countersignatures against a registry, and
+    verify-pack re-derives with the same registry."""
+    from traceseal_observe.report import build_pack, verify_pack
+
+    key = OperatorKey.generate()
+    s = build_pack(tmp_path / "pack", [], operator_key=key, reviewer_keys={})
+    assert s["analysis_options"]["reviewer_keys"] == {}
+    assert verify_pack(tmp_path / "pack", [key.public_key_hex])["ok"]

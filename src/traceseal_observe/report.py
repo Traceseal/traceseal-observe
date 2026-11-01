@@ -188,6 +188,7 @@ def analyse(
     min_review_seconds: int | None = None,
     now: str | None = None,
     operator_keys: Iterable[str] | None = None,
+    reviewer_keys: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run every verifier and build the evidence summary and control map.
 
@@ -301,7 +302,8 @@ def analyse(
     trace = _robust(lambda rs: verify_trace(rs, required_scopes=required_scopes,
                                             require_approval=require_approval,
                                             require_policy=require_policy,
-                                            min_review_seconds=min_review_seconds),
+                                            min_review_seconds=min_review_seconds,
+                                            reviewer_keys=reviewer_keys),
                     valid, "trace", analysis_failures)
     if trace is None:
         trace = {"ok": False, "errors": ["trace verification could not run"], "warnings": [],
@@ -683,6 +685,18 @@ def _pem(cert: Any) -> str:
     return cert.public_bytes(Encoding.PEM).decode("ascii")
 
 
+def _read_reviewer_keys(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    from traceseal_observe.oversight import normalize_reviewer_keys
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"--reviewer-keys: {exc}") from exc
+    normalize_reviewer_keys(data)  # validate early
+    return data
+
+
 def build_pack(
     output: Path | str,
     receipt_paths: list[Path],
@@ -702,7 +716,7 @@ def build_pack(
 
     unknown = set(analysis_kwargs) - {"tsa_trust_anchors", "witness_vkeys", "required_scopes",
                                       "require_approval", "require_policy", "min_review_seconds",
-                                      "now", "operator_keys"}
+                                      "now", "operator_keys", "reviewer_keys"}
     if unknown:
         raise TypeError(f"unknown analysis options {sorted(unknown)}")
     out = Path(output)
@@ -744,6 +758,7 @@ def build_pack(
         "min_review_seconds": kwargs.get("min_review_seconds"),
         "now": kwargs["now"],
         "operator_keys": kwargs.get("operator_keys"),
+        "reviewer_keys": kwargs.get("reviewer_keys"),
     }
     summary = analyse(receipts, checkpoints=notes, checkpoint_timestamps=stamps, **kwargs)
     summary["pack_version"] = PACK_VERSION
@@ -1023,6 +1038,7 @@ def verify_pack(
                     require_policy=options.get("require_policy"),
                     min_review_seconds=options.get("min_review_seconds"),
                     now=options.get("now"), operator_keys=options.get("operator_keys"),
+                    reviewer_keys=options.get("reviewer_keys"),
                 )
             except Exception as exc:
                 problems.append(f"findings could not be re-derived ({type(exc).__name__}: {exc})")
@@ -1089,6 +1105,9 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--require-policy", action="append", default=[], metavar="TOOL=POLICY")
     b.add_argument("--require-scope", action="append", default=[], metavar="TOOL=SCOPE")
     b.add_argument("--min-review-seconds", type=int)
+    b.add_argument("--reviewer-keys", metavar="FILE",
+                   help="JSON map of reviewer ref to Ed25519 public key(s); countersignatures "
+                        "count as reviewer-signed only when the key is registered")
     b.add_argument("--operator-key", help="raw Ed25519 key file to sign the pack")
     b.add_argument("--operator-pubkey", action="append", default=[], metavar="HEX",
                    help="pin the operator public key(s) receipts must be signed by (repeatable); "
@@ -1150,6 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
             required_scopes=pairs(args.require_scope), require_approval=args.require_approval,
             require_policy=pairs(args.require_policy), min_review_seconds=args.min_review_seconds,
             operator_keys=args.operator_pubkey or None,
+            reviewer_keys=_read_reviewer_keys(args.reviewer_keys),
         )
     except (OSError, ValueError) as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
