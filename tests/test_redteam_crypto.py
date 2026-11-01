@@ -438,3 +438,15 @@ def test_directory_and_reviewer_reject_small_order_keys():
                         "valid_from": "2025-01-01T00:00:00Z", "valid_until": "2025-06-01T00:00:00Z"})
     with pytest.raises(DirectoryError, match="small-order"):
         verify_directory(doc)
+
+
+def test_circular_execution_fails_instead_of_hanging():
+    import pytest
+    from traceseal_observe import OperatorKey, sign_execution_receipt, verify_receipt_signature
+
+    k = OperatorKey.generate()
+    r = sign_execution_receipt({"receipt_type": "tool", "tool_name": "x"},
+                               {"provenance_version": "1.0", "provider_attestation": "none"}, k)
+    r.execution["loop"] = r.execution
+    with pytest.raises(ValueError, match="circular"):
+        verify_receipt_signature(r)
