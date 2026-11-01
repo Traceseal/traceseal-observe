@@ -11,8 +11,9 @@ import hashlib
 import json
 import warnings
 
-import httpx
 import pytest
+
+httpx = pytest.importorskip("httpx2")
 
 from traceseal_observe import (
     OperatorKey,
