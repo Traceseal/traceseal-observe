@@ -1099,8 +1099,8 @@ def verify_pack(
                     auditor = analyse(
                         receipts, checkpoints=notes, checkpoint_timestamps=stamps,
                         tsa_trust_anchors=anchors, witness_vkeys=options.get("witness_vkeys") or [],
-                        required_scopes={**(options.get("required_scopes") or {}),
-                                         **(required_scopes or {})} or None,
+                        required_scopes=_union_scopes(options.get("required_scopes"),
+                                                      required_scopes),
                         require_approval=sorted(approvals),
                         require_policy={**(options.get("require_policy") or {}),
                                         **(require_policy or {})} or None,
@@ -1120,6 +1120,17 @@ def verify_pack(
     problems[:] = _dedupe(problems)
     result["ok"] = not problems
     return result
+
+
+def _union_scopes(*maps: Any) -> dict[str, list[str]] | None:
+    """Merge scope requirements per tool, keeping every scope from every
+    map, so an auditor requirement can only add to the recorded ones."""
+    out: dict[str, set[str]] = {}
+    for m in maps:
+        for tool, scopes in (m or {}).items():
+            values = [scopes] if isinstance(scopes, str) else list(scopes or [])
+            out.setdefault(tool, set()).update(v for v in values if isinstance(v, str))
+    return {tool: sorted(v) for tool, v in sorted(out.items())} or None
 
 
 def _now_utc() -> str:

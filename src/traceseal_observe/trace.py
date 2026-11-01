@@ -416,8 +416,9 @@ def verify_trace(
     # Stops, and the resumes that lift them. A resume lifts a stop only if it
     # cites the stop and is strictly later in signed order; on a tie the stop wins.
     stops: list[tuple[Receipt, dict[str, Any], list[Receipt]]] = []
-    stop_hashes = {h for h, o in oversight.items() if o["decision"] == "stopped"}
-    for digest in stop_hashes:
+    stop_order = [h for h, o in oversight.items() if o["decision"] == "stopped"]  # receipt order
+    stop_hashes = set(stop_order)
+    for digest in stop_order:
         stops.append((by_hash[digest], contexts.get(digest, {}), []))
     for digest, item in oversight.items():
         if item["decision"] != "resumed":

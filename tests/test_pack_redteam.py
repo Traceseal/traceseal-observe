@@ -677,3 +677,17 @@ class TestAuditorControlsTheAnalysis:
         assert not r["ok"]
         assert any("report.json does not match" in p for p in r["problems"])
         assert any("report.md does not match" in p for p in r["problems"])
+
+
+def test_auditor_scope_requirement_adds_to_recorded_one(tmp_path):
+    from traceseal_observe.report import _union_scopes, build_pack, verify_pack
+
+    assert _union_scopes({"refund": "refunds:write"}, {"refund": "audit:read"}) == \
+        {"refund": ["audit:read", "refunds:write"]}
+    key = OperatorKey.generate()
+    paths = _write(tmp_path, [_tool(key, "refund", {})])
+    build_pack(tmp_path / "pack", paths, operator_key=key, operator_keys=[key.public_key_hex],
+               required_scopes={"refund": "refunds:write"})
+    r = verify_pack(tmp_path / "pack", [key.public_key_hex],
+                    required_scopes={"refund": "audit:read"})
+    assert r["auditor_result"] == "ISSUES FOUND"
