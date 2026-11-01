@@ -103,13 +103,40 @@ traceseal-trace verify receipts/*.json --require-approval issue_refund \
     --require-policy issue_refund=spend-limit --require-scope issue_refund=refunds:write
 ```
 
-The verifier reports each of these as an error:
-- a tool call the model never requested;
-- arguments that differ from what the model asked for, or from what the
-  reviewer approved;
-- an action after a human rejected or stopped it;
+The verifier reports these as **errors**:
+- a tool call whose `tool_call_id` the cited model response never requested;
+- arguments that differ from what the reviewer approved;
+- an action after a human rejected the call or the whole response, or after
+  a stop that no later, citing resume lifted (including actions recorded
+  without a session id);
+- an approval that doesn't name the model response and tool call, was
+  decided after the tool ran, or whose countersignature key is the
+  operator's own;
 - an action despite a policy *deny*;
-- an action outside its scope, or after its authorisation expired.
+- with `--require-approval` / `--require-policy` / `--require-scope`: a tool
+  without the required approval, policy decision or scope;
+- an action after its authorisation's `expires_at`, or a time-based check
+  that can't be done because the receipt has no signed time.
+
+And these as **warnings** (or listed for review): arguments that differ from
+what the model asked for when no approval covers them, tool actions that
+cite no model request (`unprompted_tool_receipts`), requested calls that
+never ran, fast approvals (rubber-stamp detection), and reviewer
+countersignatures that can't be checked because no `--reviewer-keys`
+registry was given.
+
+Evidence packs:
+
+```bash
+traceseal-report build receipts/*.json --output pack/ --operator-key ops.key \
+    --operator-pubkey <ops public key hex> --require-approval issue_refund
+traceseal-report verify-pack pack/ --operator-pubkey <ops public key hex>
+```
+
+`verify-pack` requires the pack signature and the operator key you expect,
+checks every file, and re-derives the findings from the receipts. It exits
+0 when the pack is intact and its findings passed, 3 when it is intact but
+records issues, 1 when verification fails and 2 for usage errors.
 
 ## Receipt types
 

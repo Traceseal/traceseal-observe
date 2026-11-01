@@ -5,6 +5,86 @@ All notable changes to `traceseal-observe`. Format follows
 keeps the `RECEIPT-SPEC.md` v1.0 envelope: receipts from earlier versions
 verify unchanged, and new receipts verify with any v1 verifier.
 
+## [1.6.0] — 2026-11-01
+
+Fixes from an internal red-team review of 1.5.2. Several checks are
+stricter and some APIs changed (listed below). Receipts signed by 1.5.x
+still verify.
+
+### Security: evidence packs and keys
+- **`verify-pack` no longer accepts forged packs.** The pack signature is
+  mandatory and must come from a key you pin (`--operator-pubkey`, or
+  `expected_keys=`). Findings are re-derived from the pack's receipts and
+  checkpoints and must match report.json. Paths outside the pack and
+  symlinks are refused. Exit codes: 0 passed, 3 intact but with issues,
+  1 verification failed, 2 usage.
+- **`traceseal-keys verify` checks each receipt's signature** before key
+  status. A revoked key without `compromised_after` gives
+  `revoked_time_unproven`, not `valid`.
+- **Small-order and non-canonical Ed25519 keys are rejected** everywhere
+  keys are loaded (receipts, rotations, checkpoints, witnesses, directory,
+  reviewer and publisher keys). New `is_weak_ed25519_public_key()` and
+  `load_ed25519_public_key()`.
+- `analyse()` / `traceseal-report build` take `--operator-pubkey`. Receipts
+  from other keys are excluded and fail the pack.
+
+### Security: privacy
+- **URLs are sanitised everywhere they are recorded:** no userinfo, query
+  string, fragment or `;params`, and secret-looking path segments
+  (webhook tokens, API keys) are replaced with `{redacted}`. New
+  `sanitize_url()`. `observe_http_tool` no longer records the raw URL.
+- **Errors are recorded as the exception type plus a hash of the message**
+  by default, never the text. Opt in to scrubbed text with
+  `error_text("scrubbed")` or `set_error_text("scrubbed")`.
+- PII counting scans decoded values, so JSON escapes no longer hide
+  matches, and records `pii_scan_truncated` past 1 MiB.
+- Erasure receipts use a keyed `domain_hash` (per-vault salt), so they no
+  longer reveal which user was erased. `sign_erasure` needs `domain_salt=`.
+- `shred(override_retention=True)` requires an operator key, so overrides
+  are always recorded.
+- `Principal(kind="user")` accepts only keyed commitments.
+- Capture allow-lists match scheme and port (default https/443). New
+  `check_client()` / `receipted_client()` warn when httpx `mounts=` or
+  `proxy=` would bypass the transport.
+
+### Security: oversight, trace and incidents
+- **Reviewer countersignatures count only when the key is registered** for
+  that reviewer (`--reviewer-keys`, `reviewer_keys=`). A countersignature
+  by an operator key is an error. Without a registry: `"unverified"`.
+- **Approvals must name the model response and tool call**; an approval
+  can't be replayed onto other actions or responses.
+- **Rejections of a whole response apply to every call from it.** A stop
+  also covers actions recorded without a session id. A resume must cite the
+  stop and be strictly later, and the stop wins a tie.
+- **Approval timing is enforced:** model response ≤ review start ≤ decision ≤
+  tool start.
+- **Verdicts never use the unsigned `attestation.attested_at`.**
+  `sign_policy_decision` signs `decided_at`.
+- **Incident deadlines are recomputed from the root stage.** Signed
+  deadlines can only tighten them; reports count only from same-category
+  "reported" stages; a category change is a problem. `death` and
+  `widespread` are signed.
+- Control rows show trace errors (no "evidence" while the trace fails).
+  Art. 19 needs trusted time, and Art. 12 is "partial" when receipts are
+  unchained.
+
+### Security: chains
+- A key change across a gap is an error. A re-timestamped stale checkpoint
+  no longer closes a time window: only a consistency-enforcing witness
+  (`--consistency-witness-vkey`) can.
+- Forks are decided on the signed payload, so alternate encodings can't
+  fake one.
+- Declared key compromise fails `verify_chain` unless `allow_compromised=True`.
+- Duplicate JSON keys, NaN, and booleans or nulls in signed sections are
+  rejected (RECEIPT-SPEC §3). Hostile input no longer crashes the
+  verifiers.
+
+### Changed
+- Docs and README: claims scoped to what the code checks (operator
+  attestations, gaps up to a third-party checkpoint, timestamps as upper
+  bounds, pseudonymised principals). KEY-MANAGEMENT no longer calls the key
+  directory "not yet covered".
+
 ## [1.5.2] — 2026-11-01
 
 ### Fixed
