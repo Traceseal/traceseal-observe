@@ -43,7 +43,7 @@ trust primitive the operator can produce without provider cooperation.
 
 from __future__ import annotations
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 
 import hashlib
 import json
@@ -366,6 +366,126 @@ def public_key_fingerprint(pk: Ed25519PublicKey) -> str:
     return f"ed25519:{digest[:32]}"
 
 
+# Edwards25519 (RFC 8032 §5.1): just enough arithmetic to decode a public
+# key strictly and test its order. OpenSSL loads any 32 bytes as a public
+# key, including the identity 01 00..00, under which (R = B, S = 1) is a
+# valid signature on EVERY message. Small-order keys bind nothing.
+_ED_P = 2**255 - 19
+_ED_D = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed25519_decode_point(encoded: bytes) -> tuple[int, int] | None:
+    """Strict RFC 8032 §5.1.3 decoding; None if invalid or non-canonical."""
+    if len(encoded) != 32:
+        return None
+    value = int.from_bytes(encoded, "little")
+    sign = value >> 255
+    y = value & ((1 << 255) - 1)
+    if y >= _ED_P:  # non-canonical: y must be reduced mod p
+        return None
+    u = (y * y - 1) % _ED_P
+    v = (_ED_D * y * y + 1) % _ED_P
+    x = u * pow(v, 3, _ED_P) * pow(u * pow(v, 7, _ED_P), (_ED_P - 5) // 8, _ED_P) % _ED_P
+    vxx = v * x * x % _ED_P
+    if vxx == (-u) % _ED_P:
+        x = x * _ED_SQRT_M1 % _ED_P
+    elif vxx != u:
+        return None  # not on the curve
+    if x == 0 and sign:  # non-canonical: "-0"
+        return None
+    if x & 1 != sign:
+        x = _ED_P - x
+    return x, y
+
+
+def _ed25519_add(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
+    # Complete twisted Edwards addition (a = -1, d non-square).
+    (x1, y1), (x2, y2) = a, b
+    t = _ED_D * x1 * x2 * y1 * y2 % _ED_P
+    x3 = (x1 * y2 + y1 * x2) * pow(1 + t, _ED_P - 2, _ED_P) % _ED_P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, _ED_P - 2, _ED_P) % _ED_P
+    return x3, y3
+
+
+def is_weak_ed25519_public_key(key: Any) -> bool:
+    """True if `key` must not be trusted as an Ed25519 public key.
+
+    Accepts raw bytes, 64-char hex, or an Ed25519PublicKey. Returns True if
+    the encoding is malformed or non-canonical (y >= p, or x = 0 with the
+    sign bit set), if it is not a curve point, or if the point has small
+    order (8·A is the identity). Under a small-order key, signatures can be
+    produced without any private key, so they prove nothing.
+    """
+    try:
+        if isinstance(key, Ed25519PublicKey):
+            raw = _public_key_bytes(key)
+        elif isinstance(key, str):
+            if len(key) != 64:
+                return True
+            raw = bytes.fromhex(key)
+        elif isinstance(key, (bytes, bytearray)):
+            raw = bytes(key)
+        else:
+            return True
+    except (ValueError, TypeError):
+        return True
+    point = _ed25519_decode_point(raw)
+    if point is None:
+        return True
+    for _ in range(3):
+        point = _ed25519_add(point, point)
+    return point == (0, 1)
+
+
+def load_ed25519_public_key(key: Any, label: str = "public key") -> Ed25519PublicKey:
+    """Load raw bytes / 64-hex / Ed25519PublicKey, rejecting weak keys.
+
+    Raises ValueError for malformed, non-canonical and small-order keys.
+    """
+    if isinstance(key, str):
+        if len(key) != 64:
+            raise ValueError(f"{label} hex must be 64 characters")
+        try:
+            key = bytes.fromhex(key)
+        except ValueError:
+            raise ValueError(f"{label} is not hex") from None
+    if isinstance(key, (bytes, bytearray)):
+        if len(key) != 32:
+            raise ValueError(f"raw Ed25519 {label} must be 32 bytes")
+        if is_weak_ed25519_public_key(bytes(key)):
+            raise ValueError(f"{label} is a small-order or non-canonical Ed25519 key")
+        return Ed25519PublicKey.from_public_bytes(bytes(key))
+    if not isinstance(key, Ed25519PublicKey):
+        raise ValueError(f"{label} must be an Ed25519 public key")
+    if is_weak_ed25519_public_key(key):
+        raise ValueError(f"{label} is a small-order or non-canonical Ed25519 key")
+    return key
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        out[key] = value
+    return out
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def loads_receipt_json(data: str | bytes) -> Any:
+    """Parse receipt JSON strictly: duplicate keys and NaN/Infinity are
+    errors (ValueError), so every parser reads the same document."""
+    if isinstance(data, (bytes, bytearray)):
+        data = bytes(data).decode("utf-8")
+    return json.loads(
+        data, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant
+    )
+
+
 @dataclass
 class OperatorKey:
     """An operator's ed25519 keypair for signing receipts."""
@@ -373,6 +493,14 @@ class OperatorKey:
     name: str
     private_key: Ed25519PrivateKey
     public_key: Ed25519PublicKey
+
+    def __post_init__(self) -> None:
+        # Fail closed on keys that bind nothing (small-order / non-canonical):
+        # anyone could "sign" for them without a private key.
+        if isinstance(self.public_key, Ed25519PublicKey) and is_weak_ed25519_public_key(
+            self.public_key
+        ):
+            raise ValueError("operator public key is a small-order or non-canonical Ed25519 key")
 
     @property
     def fingerprint(self) -> str:
@@ -433,16 +561,7 @@ class RemoteOperatorKey(OperatorKey):
         public_key: Ed25519PublicKey | bytes | str,
         sign_fn: Callable[[bytes], bytes],
     ):
-        if isinstance(public_key, str):
-            if len(public_key) != 64:
-                raise ValueError("public key hex must be 64 characters")
-            public_key = bytes.fromhex(public_key)
-        if isinstance(public_key, (bytes, bytearray)):
-            if len(public_key) != 32:
-                raise ValueError("raw Ed25519 public key must be 32 bytes")
-            public_key = Ed25519PublicKey.from_public_bytes(bytes(public_key))
-        if not isinstance(public_key, Ed25519PublicKey):
-            raise ValueError("public_key must be an Ed25519 public key")
+        public_key = load_ed25519_public_key(public_key, "public key")
         if not callable(sign_fn):
             raise ValueError("sign_fn must be callable")
         super().__init__(name=name, private_key=None, public_key=public_key)
@@ -599,16 +718,40 @@ def _signed_payload(execution: dict, provenance: dict) -> bytes:
     return canonical_dumps({"execution": execution, "provenance": provenance})
 
 
+def _forbidden_json_value(value: Any, path: str = "") -> str | None:
+    """Path of the first JSON boolean or null (RECEIPT-SPEC §3), else None."""
+    stack = [(value, path)]
+    while stack:
+        item, where = stack.pop()
+        if item is None or isinstance(item, bool):
+            return where or "/"
+        if isinstance(item, dict):
+            stack.extend((v, f"{where}.{k}") for k, v in item.items())
+        elif isinstance(item, list):
+            stack.extend((v, f"{where}[{i}]") for i, v in enumerate(item))
+    return None
+
+
 def _check_receipt_signature(receipt: Receipt, label: str) -> None:
     """Raise ValueError unless the receipt's Ed25519 signature is valid.
 
     Used to fail closed when loading receipts from an untrusted bundle.
+    Rejects malformed, non-canonical and small-order operator keys, and
+    signed payloads containing JSON booleans or nulls (RECEIPT-SPEC §3).
     """
     from cryptography.exceptions import InvalidSignature
 
-    att = receipt.attestation
+    att = getattr(receipt, "attestation", None)
+    execution = getattr(receipt, "execution", None)
+    provenance = getattr(receipt, "provenance", None)
+    if not isinstance(att, dict):
+        raise ValueError(f"{label}: attestation is not a JSON object")
+    if not isinstance(execution, dict) or not isinstance(provenance, dict):
+        raise ValueError(f"{label}: execution and provenance must be JSON objects")
     pubkey_hex = att.get("operator_public_key", "")
     signature_hex = att.get("signature", "")
+    if not isinstance(pubkey_hex, str) or not isinstance(signature_hex, str):
+        raise ValueError(f"{label}: operator_public_key and signature must be hex strings")
     # Ed25519: 32-byte key (64 hex chars), 64-byte signature (128 hex chars).
     # Bound lengths before decoding so a hostile bundle can't force a huge
     # bytes.fromhex() allocation.
@@ -616,16 +759,24 @@ def _check_receipt_signature(receipt: Receipt, label: str) -> None:
         raise ValueError(f"{label}: operator_public_key is {len(pubkey_hex)} hex chars, expected 64")
     if len(signature_hex) != 128:
         raise ValueError(f"{label}: signature is {len(signature_hex)} hex chars, expected 128")
+    forbidden = _forbidden_json_value({"execution": execution, "provenance": provenance})
+    if forbidden is not None:
+        raise ValueError(
+            f"{label}: signed payload contains a JSON boolean or null at {forbidden} "
+            "(RECEIPT-SPEC §3)"
+        )
     try:
-        pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex))
+        pk = load_ed25519_public_key(pubkey_hex, "operator_public_key")
         expected_fingerprint = public_key_fingerprint(pk)
         if att.get("operator_fingerprint") != expected_fingerprint:
             raise ValueError(f"{label}: operator fingerprint does not match public key")
-        pk.verify(bytes.fromhex(signature_hex), _signed_payload(receipt.execution, receipt.provenance))
+        pk.verify(bytes.fromhex(signature_hex), _signed_payload(execution, provenance))
     except InvalidSignature:
         raise ValueError(f"{label}: signature verification failed — receipt may be tampered")
-    except ValueError:
-        raise
+    except ValueError as exc:
+        if str(exc).startswith(label):
+            raise
+        raise ValueError(f"{label}: {exc}") from None
     except Exception as e:  # malformed key material, etc.
         raise ValueError(f"{label}: signature check error: {type(e).__name__}")
 
@@ -2671,15 +2822,15 @@ def unbundle_workflow(
             if member.name == "orchestration.json":
                 f = tar.extractfile(member)
                 if f:
-                    orch_data = json.loads(f.read().decode("utf-8"))
+                    orch_data = loads_receipt_json(f.read())
             elif member.name == "MANIFEST.json":
                 f = tar.extractfile(member)
                 if f:
-                    manifest_data = json.loads(f.read().decode("utf-8"))
+                    manifest_data = loads_receipt_json(f.read())
             elif member.name.startswith("children/"):
                 f = tar.extractfile(member)
                 if f:
-                    children_data[member.name] = json.loads(f.read().decode("utf-8"))
+                    children_data[member.name] = loads_receipt_json(f.read())
 
     if orch_data is None:
         raise ValueError("bundle missing orchestration.json")
@@ -2768,7 +2919,7 @@ def verify_workflow_bundle(bundle_path: Path | str) -> dict:
     # Verify parent
     try:
         pk_bytes = bytes.fromhex(parent.attestation["operator_public_key"])
-        pk = Ed25519PublicKey.from_public_bytes(pk_bytes)
+        pk = load_ed25519_public_key(pk_bytes, "operator public key")
         payload = _signed_payload(parent.execution, parent.provenance)
         sig = bytes.fromhex(parent.attestation["signature"])
         pk.verify(sig, payload)
@@ -2784,7 +2935,7 @@ def verify_workflow_bundle(bundle_path: Path | str) -> dict:
         child_result = {"step": step_name, "ok": False, "message": ""}
         try:
             c_pk_bytes = bytes.fromhex(child.attestation["operator_public_key"])
-            c_pk = Ed25519PublicKey.from_public_bytes(c_pk_bytes)
+            c_pk = load_ed25519_public_key(c_pk_bytes, "operator public key")
             c_payload = _signed_payload(child.execution, child.provenance)
             c_sig = bytes.fromhex(child.attestation["signature"])
             c_pk.verify(c_sig, c_payload)

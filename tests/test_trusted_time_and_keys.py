@@ -466,9 +466,15 @@ class TestRotation:
         rs.append(chain.rotate_key(k2, reason="compromise", compromised_after_seq=2))
         rs.append(_tool(chain.signer, 5))
         report = verify_chain(rs)
+        assert not report["ok"]  # fail closed by default (red-team F6)
+        assert report["compromised_seqs"] == [[3, 4]]
+        assert any("declared compromised" in e for e in report["errors"])
+        report = verify_chain(rs, allow_compromised=True)
         assert report["ok"]
         assert report["compromised_seqs"] == [[3, 4]]
         assert any("declared compromised" in w for w in report["warnings"])
+        # Only the receipts after the compromised range: nothing to distrust.
+        assert verify_chain(rs[4:], operator_public_key=k1.public_key_hex)["ok"]
 
     def test_rotation_argument_checks(self):
         k1 = OperatorKey.generate()
@@ -583,8 +589,23 @@ class TestChainTrustedTime:
                               tsa_trust_anchors=[tsa.root], window=self.WINDOW)
         assert report["ok"], report["errors"]
         assert report["checkpoint"]["timestamps"][0]["gen_time"] == "2026-10-01T16:31:00Z"
-        assert report["window"]["end_basis"] == "published_checkpoint"
+        # The last receipt's own clock is past the window end.
+        assert report["window"]["end_basis"] == "signer_clock"
         assert report["window"]["start_basis"] == "genesis"
+
+    def test_restamped_stale_checkpoint_does_not_close_window(self, tsa):
+        """Red-team F5: a TSA token over an OLD checkpoint, obtained after
+        the window, proves the checkpoint existed then, not that it was the
+        head. Receipts 4..5 hidden from the verifier must not yield complete."""
+        chain, rs = _timed_chain(OperatorKey.generate(), self.TIMES[:3] + ["2026-10-01T15:00:00Z"])
+        stale = chain.checkpoint(3)
+        late = tsa.token(data=checkpoint_body(stale), gen_time=_gt("2026-10-21T00:00:00Z"))
+        report = verify_chain(rs[:3], checkpoint=stale, checkpoint_timestamps=[late],
+                              tsa_trust_anchors=[tsa.root], window=self.WINDOW)
+        assert report["ok"], report["errors"]
+        assert report["window"]["end_basis"] == "checkpoint_time"
+        assert not report["window"]["complete"]
+        assert any("operator honesty" in w for w in report["warnings"])
 
     def test_timestamp_without_anchors_or_over_other_data(self, tsa):
         chain, rs = _timed_chain(OperatorKey.generate(), self.TIMES)
@@ -692,3 +713,43 @@ class TestCli:
         assert chain_mod.main(["timestamp-verify", "--checkpoint", str(tmp_path / "cp.txt"),
                                "--timestamp", str(tmp_path / "cp.tsr"),
                                "--tsa-root", str(tmp_path / "other.pem")]) == 1
+
+
+class TestHostileTokens:
+    """Red-team F7: malformed tokens must be TimestampError, never a crash."""
+
+    def _without_ess_certs(self, tsa, data, ess):
+        tok = cms.ContentInfo.load(tsa.token(data=data, ess=ess))
+        name = "signing_certificate_v2" if ess == "v2" else "signing_certificate"
+        for a in tok["content"]["signer_infos"][0]["signed_attrs"]:
+            if a["type"].native == name:
+                a["values"][0]["certs"] = []
+        return tok.dump(force=True)
+
+    def test_empty_ess_certs(self, tsa):
+        chain, rs = _timed_chain(OperatorKey.generate(), ["2026-10-01T13:00:00Z"])
+        note = chain.checkpoint()
+        for ess in ("v2", "v1"):
+            token = self._without_ess_certs(tsa, checkpoint_body(note), ess)
+            with pytest.raises(TimestampError, match="lists no certificate"):
+                verify_timestamp_token(token, data=checkpoint_body(note), trust_anchors=[tsa.root])
+            report = verify_chain(rs, checkpoint=note, checkpoint_timestamps=[token],
+                                  tsa_trust_anchors=[tsa.root])
+            assert not report["ok"]
+            assert any("lists no certificate" in e for e in report["errors"])
+
+    def test_truncated_and_mutated_tokens(self, tsa):
+        import random
+
+        data = b"hello"
+        good = tsa.token(data=data)
+        rng = random.Random(3)
+        candidates = [b"", b"\x30\x00", good[:10], good[:-1], b"\x00" * 50]
+        for _ in range(150):
+            i = rng.randrange(len(good))
+            candidates.append(good[:i] + bytes([rng.randrange(256)]) + good[i + 1:])
+        for token in candidates:
+            try:
+                verify_timestamp_token(token, data=data, trust_anchors=[tsa.root])
+            except TimestampError:
+                pass

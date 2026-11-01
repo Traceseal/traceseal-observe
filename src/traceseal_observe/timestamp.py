@@ -2,12 +2,14 @@
 
 A TraceSeal signature carries the operator's own clock claim. A timestamp
 token from an independent Time-Stamping Authority (TSA) adds a third party's
-signed statement that a given hash existed at a given time.
+signed statement that a given hash existed by a given time.
 
 Timestamping a chain checkpoint is the efficient pattern. One token pins
-every receipt up to that checkpoint, and it turns the "nothing missing
-between 2pm and 4pm" claim from a signer clock claim into evidence that
-rests on the TSA (see RECEIPT-CHAINS.md §1.4 and TRUSTED-TIME.md).
+every receipt up to that checkpoint: they had all been recorded by genTime.
+A token taken BEFORE a window opens proves nothing from after the window
+start is hidden before the segment. A token can't prove the tail of a
+window is complete: it shows the checkpoint existed by genTime, not that it
+was the newest (see RECEIPT-CHAINS.md §1.4 and TRUSTED-TIME.md).
 
 EU eIDAS: a *qualified* electronic time stamp is an RFC 3161 token from a
 qualified trust service provider (QTSP) listed on an EU Member State
@@ -382,6 +384,36 @@ def verify_timestamp_token(
     tsa_subject, tsa_certificate_sha256, etsi_best_practice_policy,
     etsi_qualified_statement, accuracy_seconds}.
     """
+    _asn1()  # a missing optional dependency is reported as such
+    try:
+        return _verify_timestamp_token(
+            token_der,
+            data=data,
+            digest=digest,
+            trust_anchors=trust_anchors,
+            intermediates=intermediates,
+            nonce=nonce,
+            required_policy=required_policy,
+        )
+    except TimestampError:
+        raise
+    except Exception as exc:
+        # Hostile ASN.1 shapes (empty SEQUENCEs, absent optional fields,
+        # wrong CHOICE arms) must fail verification, never escape as
+        # IndexError/KeyError/TypeError to a caller that promised not to raise.
+        raise TimestampError(f"timestamp token is malformed ({type(exc).__name__})") from None
+
+
+def _verify_timestamp_token(
+    token_der,
+    *,
+    data,
+    digest,
+    trust_anchors,
+    intermediates,
+    nonce,
+    required_policy,
+) -> dict[str, Any]:
     _algos, cms, _core, _tsp = _asn1()
     anchors = list(trust_anchors)
     if not anchors:
@@ -452,13 +484,19 @@ def verify_timestamp_token(
     leaf_der = leaf.public_bytes(_der())
     names = {a["type"].native for a in attrs}
     if "signing_certificate_v2" in names:
-        ess = _signed_attr(attrs, "signing_certificate_v2")["certs"][0]
+        certs = _signed_attr(attrs, "signing_certificate_v2")["certs"]
+        if len(certs) < 1:
+            raise TimestampError("ESS signing-certificate-v2 lists no certificate")
+        ess = certs[0]
         algo = ess["hash_algorithm"]["algorithm"].native
         if algo not in _HASHES:
             raise TimestampError(f"unsupported ESS hash {algo}")
         bound = _HASHES[algo][0](leaf_der).digest()
     elif "signing_certificate" in names:
-        ess = _signed_attr(attrs, "signing_certificate")["certs"][0]
+        certs = _signed_attr(attrs, "signing_certificate")["certs"]
+        if len(certs) < 1:
+            raise TimestampError("ESS signing-certificate lists no certificate")
+        ess = certs[0]
         bound = hashlib.sha1(leaf_der).digest()
     else:
         raise TimestampError("token lacks the ESS signing-certificate attribute")

@@ -83,10 +83,20 @@ the witnesses they require and ignore other signature lines.
 
 Given a set of receipts, a verifier:
 
-1. Verifies each receipt's v1 signature and the fields in §1.2.
+1. Verifies each receipt's v1 signature and the fields in §1.2. Operator,
+   rotation, checkpoint and witness keys that are small-order or
+   non-canonical Ed25519 encodings are rejected: under such a key (for
+   example the identity `01 00…00`) signatures can be made without any
+   private key, so they bind nothing.
 2. Requires one `chain_id` and one operator public key across the set.
-3. Groups by `chain_seq`. Two *different* receipts at one position are a
-   **fork** (equivocation): INVALID. Identical copies are deduplicated.
+3. Groups by `chain_seq`. Two receipts at one position whose **signed
+   payloads** (the canonical `{execution, provenance}` bytes) differ are a
+   **fork** (equivocation): INVALID. Copies of one signed payload that
+   differ only in the unsigned attestation (`attested_at`, fingerprint
+   form, a re-signature) are duplicates, not a fork: anyone holding a
+   receipt can make such copies. The chained copy is the one whose
+   `receipt_hash` the next receipt's `chain_prev_hash` (or the checkpoint)
+   names.
 4. For each pair of consecutive positions present, requires
    `chain_prev_hash` to equal the earlier `receipt_hash`. Missing positions
    are reported as **gaps**, and a set with gaps is not complete.
@@ -108,21 +118,26 @@ Given a set of receipts, a verifier:
    | start | `genesis` | the segment starts at `chain_seq` 1 |
    | start | `trusted_time` | a *start checkpoint* of size `M ≥ first_seq − 1`, with a TSA token or witness cosignature dated at or before `start`, shown consistent with the main checkpoint by a consistency proof. Receipts 1..M existed before the window opened, so anything created later has a higher `chain_seq`. This rests on the TSA or witness, not on the operator. |
    | start | `signer_clock` | the first receipt's `chained_at` is before `start` |
-   | end | `published_checkpoint` | the segment ends at the head of an anchored checkpoint carrying a TSA token or witness cosignature dated at or after `end` |
+   | end | `consistency_witness` | the segment ends at the head of an anchored checkpoint cosigned, at or after `end`, by a witness the verifier names as enforcing consistency (`consistency_witness_vkeys`, `--consistency-witness-vkey`). Such a witness never cosigns a checkpoint that does not extend the newest one it has seen, so a stale checkpoint can't be cosigned late once a newer one was shown to it. It still rests on the operator having submitted its checkpoints to the witness; the report says so in `window.end_note`. |
    | end | `signer_clock` | the last receipt's `chained_at` is after `end` |
+   | end | `checkpoint_time` | the segment ends at the head of an anchored checkpoint with a TSA token (or a cosignature from a witness not named as enforcing consistency) dated at or after `end`. **Does not complete the window** (`covers_end: false`), and the report warns that the end edge rests on operator honesty. |
 
-   A window is `complete` when both edges have a basis and there are no
+   A window is `complete` when the start edge has a basis, the end edge
+   has a `consistency_witness` or `signer_clock` basis, and there are no
    gaps or errors.
 
-   **The end edge is weaker than it looks.** A TSA or witness time is an
-   *upper* bound: it proves the checkpoint existed by then, not that it was
-   the newest checkpoint then. Both end bases assume the operator was honest
-   *at the time*, i.e. it put the current time in `chained_at` and
-   timestamped or witnessed its current checkpoint promptly. That is the
-   threat model chains are built for: logs that are altered *after the
-   fact*, once someone wants something to disappear. An operator dishonest
-   from the start can leave actions out of the chain entirely, and no log
-   format can detect that.
+   **Why a TSA token can't close the end edge.** A TSA or witness time is
+   an *upper* bound: it proves the checkpoint existed by then, not that it
+   was the newest checkpoint then. An operator can take an OLD checkpoint
+   (say size 3) to a TSA weeks later; the token is genuine, yet receipts
+   4 and 5, created inside the window, are hidden. Only a witness that
+   refuses to cosign anything but an extension of what it has seen turns a
+   time into a statement about the head. `signer_clock` assumes the
+   operator was honest *at the time*, i.e. it put the current time in
+   `chained_at`. That is the threat model chains are built for: logs that
+   are altered *after the fact*. An operator dishonest from the start can
+   leave actions out of the chain entirely, and no log format can detect
+   that.
 
 A **consistency proof** (RFC 9162 §2.1.4) shows that a checkpoint of size
 `N` extends an earlier checkpoint of size `M`. A witness checks this before
@@ -166,13 +181,20 @@ key**, with these fields:
 
 Verifiers start from the key that signed the first supplied receipt (or
 the `operator_public_key` they already trust). They accept a different key
-only right after a valid rotation, and treat any other key change as an
-error. A key change hidden inside a gap is a warning, because the rotation
-can't be checked.
+only right after a valid rotation signed by the current chain key, and
+treat any other key change as an error. A key change across a gap is an
+**error** too, not merely a gap (`--allow-gaps` doesn't suppress it): the
+rotation that would justify it is missing, and otherwise anyone could
+append receipts signed by their own key after a gap. A key that did not
+arrive through a verified rotation never becomes the chain key, and can't
+sign checkpoints for the chain.
 
 `previous_key_compromised_after_seq = X` declares receipts `X+1 .. k−1`
 (where `k` is the rotation's `chain_seq`) untrustworthy. They are listed in
-`compromised_seqs`. The declaration is signed by the compromised key, so an
+`compromised_seqs`. If any supplied receipt falls in that range the
+verification fails (`ok: false`), unless the caller opts out with
+`allow_compromised=True` (`--allow-compromised`), which turns it into a
+warning. The declaration is signed by the compromised key, so an
 attacker holding that key could sign a rotation too. Two different
 rotations at one position are then a fork. The defence is checkpoints that
 reached third parties before the compromise.
@@ -212,9 +234,11 @@ shows up as a gap, which is the honest result.
 ```bash
 traceseal-chain verify receipts/*.json --checkpoint checkpoint.txt
 traceseal-chain verify receipts/*.json --checkpoint cp.txt \
-    --inclusion-proof proof.json --witness-vkey '<witness vkey>' \
+    --inclusion-proof proof.json --consistency-witness-vkey '<witness vkey>' \
     --window-start 2026-10-01T14:00:00Z --window-end 2026-10-01T16:00:00Z
 ```
+
+Receipt and proof files with duplicate JSON keys are rejected.
 
 The exit code is 0 only if the chain is complete and, when a window is
 given, the window is covered. Trusted-time evidence:
