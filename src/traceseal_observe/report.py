@@ -701,7 +701,7 @@ def _read_reviewer_keys(path: str | None) -> dict[str, Any] | None:
         return None
     from traceseal_observe.oversight import normalize_reviewer_keys
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = _load_json(Path(path).read_bytes())
     except (OSError, ValueError) as exc:
         raise ValueError(f"--reviewer-keys: {exc}") from exc
     normalize_reviewer_keys(data)  # validate early
@@ -928,6 +928,17 @@ def _pack_receipts(contents: dict[str, bytes], receipt_files: list[str],
     return out
 
 
+def _load_json(data: bytes) -> Any:
+    """Parse JSON from a pack or option file. Hostile input (bad UTF-8,
+    invalid JSON, absurd nesting) raises ValueError and nothing else."""
+    try:
+        return json.loads(data.decode("utf-8"))
+    except RecursionError:
+        raise ValueError("JSON is nested too deeply") from None
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"not UTF-8 ({exc.reason})") from None
+
+
 def _receipt_from_bytes(data: bytes, label: str) -> Receipt:
     """Parse a receipt; raises ValueError (never anything else) if it is not one."""
     from traceseal_observe import loads_receipt_json
@@ -948,7 +959,26 @@ def _fp(public_key: str) -> str:
     return public_key[:16] + "…"
 
 
-def verify_pack(
+def verify_pack(directory: Path | str, expected_keys: Iterable[str] | str | None, **kwargs: Any
+                ) -> dict[str, Any]:
+    """See _verify_pack. Never raises on hostile pack content: any
+    unexpected error becomes a reported problem and a failed result."""
+    pins_given = expected_keys is not None
+    if not pins_given and not kwargs.get("trust_signer_in_pack"):
+        return _verify_pack(directory, expected_keys, **kwargs)  # raises ValueError (usage)
+    if pins_given:
+        _normalise_keys(expected_keys, "expected_keys")  # usage errors still raise
+    try:
+        return _verify_pack(directory, expected_keys, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - fail closed on anything unexpected
+        return {"ok": False, "pack_result": None, "auditor_result": None, "auditor_findings": [],
+                "analysis_options": None, "signed": False, "pinned": False, "signer": None,
+                "files": 0, "receipts": 0, "warnings": [],
+                "problems": [f"verification failed on malformed pack content "
+                             f"({type(exc).__name__}: {exc})"]}
+
+
+def _verify_pack(
     directory: Path | str,
     expected_keys: Iterable[str] | str | None,
     *,
@@ -1014,8 +1044,8 @@ def verify_pack(
     # -- manifest ---------------------------------------------------------------
     try:
         manifest_bytes = _safe_read(root, "manifest.json")
-        manifest = json.loads(manifest_bytes.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
+        manifest = _load_json(manifest_bytes)
+    except ValueError as exc:
         problems.append(f"manifest unreadable: {exc}")
         return result
     listed = manifest.get("files") if isinstance(manifest, dict) else None
@@ -1096,8 +1126,9 @@ def verify_pack(
         problems.append("report.json missing or not covered by the manifest")
     else:
         try:
-            report = json.loads(contents["report.json"].decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+            report = _load_json(contents["report.json"])
+        except ValueError as exc:
+            problems.append(f"report.json unreadable: {exc}")
             report = None
         if not isinstance(report, dict):
             problems.append("report.json is not a JSON object")

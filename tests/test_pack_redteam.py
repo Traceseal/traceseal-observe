@@ -766,3 +766,17 @@ def test_deeply_nested_receipt_file_is_a_failed_receipt_not_a_crash(tmp_path):
     assert not s["ok"] and s["signature_failures"]
     r = verify_pack(tmp_path / "pack", [key.public_key_hex])
     assert any("nested too deeply" in p for p in r["problems"])
+
+
+def test_deeply_nested_report_json_does_not_crash_verify(tmp_path):
+    from traceseal_observe.report import verify_pack
+
+    key = OperatorKey.generate()
+    paths = _write(tmp_path, [_tool(key, "t", {})])
+    build_pack(tmp_path / "pack", paths, operator_key=key, operator_keys=[key.public_key_hex])
+    pack = tmp_path / "pack"
+    (pack / "report.json").write_text("[" * 20000 + "]" * 20000)
+    _remanifest(pack)
+    (pack / "pack.receipt.json").unlink()   # unsigned: must still not crash
+    r = verify_pack(pack, [key.public_key_hex])
+    assert not r["ok"] and any("nested too deeply" in p for p in r["problems"])

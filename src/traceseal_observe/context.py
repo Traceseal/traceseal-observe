@@ -315,7 +315,7 @@ def _arguments_hash(arguments: Any) -> str:
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments) if arguments.strip() else {}
-        except ValueError:
+        except (ValueError, RecursionError):
             return sha256_of(arguments)
     return sha256_of(arguments)
 

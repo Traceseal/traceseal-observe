@@ -232,7 +232,10 @@ def fetch_directory(domain: str, *, timeout: float = 10.0) -> dict[str, Any]:
         raise DirectoryError(f"cannot fetch {url}: {type(exc).__name__}") from None
     if len(data) > _MAX_BYTES:
         raise DirectoryError("directory is too large")
-    document = json.loads(data)
+    try:
+        document = json.loads(data)
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise DirectoryError(f"directory at {url} is not valid JSON ({type(exc).__name__})") from None
     return verify_directory(document, domain=domain)
 
 
@@ -355,8 +358,9 @@ def main(argv: list[str] | None = None) -> int:
             report = verify_directory(json.loads(Path(args.file).read_text("utf-8")), domain=args.domain)
         else:
             report = fetch_directory(args.domain)
-    except (OSError, ValueError) as exc:
-        print(f"[FAIL] {exc}", file=sys.stderr)
+    except (OSError, ValueError, RecursionError) as exc:
+        print(f"[FAIL] {exc if not isinstance(exc, RecursionError) else 'JSON is nested too deeply'}",
+              file=sys.stderr)
         return 1
     print(f"[OK] {report['domain']} lists {len(report['keys'])} key(s), issued {report['issued_at']}")
     bad = 0
