@@ -15,7 +15,7 @@ your customer) can verify it on their own machine, without access to yours.
 > independently."*
 
 The EU AI Act (record-keeping, human oversight, log retention and incident
-reporting for high-risk systems, from December 2027), GDPR, NIS2, DORA and
+reporting for high-risk systems, from December 2027 / August 2028), GDPR, NIS2, DORA and
 the procurement questionnaires that follow them all ask versions of this
 question. "Trust our logs" doesn't answer it. Signed, chained,
 independently timestamped receipts give you evidence you can hand over.
@@ -62,13 +62,13 @@ No API keys exchanged, no access to your systems, no shared infrastructure.
 | **Streaming** | streamed responses hashed chunk by chunk; sync and async | [RECEIPT-CHAINS §2](RECEIPT-CHAINS.md) |
 | **Completeness** | hash-chained receipts, RFC 6962 checkpoints in C2SP format, inclusion and consistency proofs; gaps, forks and truncation detected | [RECEIPT-CHAINS](RECEIPT-CHAINS.md) |
 | **Trusted time** | RFC 3161 / eIDAS timestamps on checkpoints; provable time windows | [TRUSTED-TIME](TRUSTED-TIME.md) |
-| **Who, for whom, why** | signed agent identity, principal (privacy-preserving), tenant, session, W3C trace ids, authorisation scopes and expiry, causal links from model request to tool action | [AGENT-CONTEXT](AGENT-CONTEXT.md) |
+| **Who, for whom, why** | signed agent identity, principal (pseudonymised), tenant, session, W3C trace ids, authorisation scopes and expiry, causal links from model request to tool action | [AGENT-CONTEXT](AGENT-CONTEXT.md) |
 | **Human oversight** | approve / reject / modify / stop / resume receipts, reviewer countersignatures, review timing; verifier enforces required approvals | [HUMAN-OVERSIGHT](HUMAN-OVERSIGHT.md) |
 | **Policy decisions** | every guardrail or filter decision, bound to the policy version | [HUMAN-OVERSIGHT §2](HUMAN-OVERSIGHT.md) |
 | **Evidence vault** | encrypted payload escrow under the receipt hashes; crypto-shredding with signed erasure receipts; retention floors, legal holds; HPKE disclosure to auditors (post-quantum option) | [EVIDENCE-VAULT](EVIDENCE-VAULT.md) |
-| **Incidents** | incident receipts with statutory deadlines (AI Act Art. 73, GDPR Art. 33, NIS2 Art. 23) and late-report detection | [EVIDENCE-PACKS](EVIDENCE-PACKS.md) |
-| **Evidence packs** | one command verifies everything, maps it to obligations, writes a signed, self-checking pack | [EVIDENCE-PACKS](EVIDENCE-PACKS.md) |
-| **Zero-code capture** | an HTTP transport for any SDK that receipts every request, and can block undeclared destinations | [CAPTURE](CAPTURE.md) |
+| **Incidents** | incident receipts with statutory deadlines (AI Act Art. 73, GDPR Art. 33, NIS2 Art. 23, DORA Art. 19) and first-notification timing, as recorded by the operator | [EVIDENCE-PACKS](EVIDENCE-PACKS.md) |
+| **Evidence packs** | one command verifies the receipts, maps the findings to obligations, and writes a signed pack that `verify-pack` re-derives against a pinned operator key | [EVIDENCE-PACKS](EVIDENCE-PACKS.md) |
+| **Drop-in capture** | an HTTP transport for any SDK that receipts every request, and can block undeclared destinations | [CAPTURE](CAPTURE.md) |
 | **OpenTelemetry** | GenAI semantic-convention attributes and receipt hashes on your existing traces | [CAPTURE](CAPTURE.md) |
 | **Production keys** | KMS/HSM signers, chained key rotation, compromise handling, published operator key directory | [KEY-MANAGEMENT](KEY-MANAGEMENT.md) |
 | **Model provenance** | Open Registry resolution, cross-registry identity, publisher attestations, bindings and key history | [below](#model-provenance-open-registry) |
@@ -173,17 +173,22 @@ where you are in scope.
 | GDPR Art. 15 / 17: access, erasure | controllers | principal lookups, crypto-shredding with erasure receipts |
 | GDPR Art. 30, 33, 34: records, breach notification | controllers (processors notify them) | data-flow receipts (input only), incident deadlines |
 | NIS2 Art. 23 | essential and important entities | incident receipts and timelines |
-| DORA Art. 19 | financial entities | incident receipts, 24-hour outer limit |
+| DORA Art. 19 | financial entities | incident receipts; initial-notification deadline from classification (`classified_at`), otherwise unconfirmed |
 | ISO/IEC 42001, NIST AI RMF (voluntary) | adopters | event logging, monitoring, incident response evidence |
 
 "Evidence" means relevant records exist and pass verification, not that
 the obligation is met. Pseudonymised data (principal commitments, hashes
-of guessable values) is still personal data under GDPR.
+of guessable values) remains personal data for anyone who holds the pepper
+or can guess the input; treat receipts as personal data.
 
 ## Privacy
 
-Receipts contain **hashes, not values**. Principals are keyed commitments
-(pseudonymised, not anonymised), never raw user ids. Data-flow receipts carry **counts** of PII-shaped
+Payloads are recorded as **hashes, not values**. Some metadata is in clear
+text: tool and model names, sanitised endpoints (no credentials, query or
+fragment), error *types*, tenant and session ids, incident titles.
+Principals are keyed commitments (pseudonymised, not anonymised); the same
+commitment appears on every receipt for that user, so their receipts can be
+linked. Data-flow receipts carry **counts** of PII-shaped
 patterns: emails, phone numbers (US, UK, international), cards, IBANs,
 IPv4 addresses, US SSNs, credentials. Payloads you need to keep live
 encrypted in the evidence vault, erasable per user or tenant.
@@ -199,8 +204,8 @@ sharing them with an auditor.
 - With a chain: no receipt was removed, inserted or replaced, up to the
   newest checkpoint someone else holds.
 - With a timestamp: the receipts existed by the TSA's time.
-- With a reviewer countersignature: the reviewer, not just the operator,
-  made that decision.
+- With a reviewer countersignature verified against a reviewer key you
+  trust: the holder of that reviewer key signed the decision.
 
 **Don't prove:**
 - That the provider really returned what the operator recorded, or that
