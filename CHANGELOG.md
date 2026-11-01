@@ -5,7 +5,7 @@ All notable changes to `traceseal-observe`. Format follows
 keeps the `RECEIPT-SPEC.md` v1.0 envelope: receipts from earlier versions
 verify unchanged, and new receipts verify with any v1 verifier.
 
-## [1.5.0]: unreleased
+## [1.5.0] — 2026-11-01
 
 ### Added
 - **Receipt chains** (`chain.py`, `traceseal-chain`). Every operational
